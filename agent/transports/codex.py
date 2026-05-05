@@ -89,18 +89,34 @@ class ResponsesApiTransport(ProviderTransport):
         _effort_clamp = {"minimal": "low"}
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
+        stateful_responses = bool(params.get("stateful_responses", False))
+        stateful_input = params.get("stateful_input")
+        previous_response_id = params.get("previous_response_id")
+        input_items = (
+            stateful_input
+            if stateful_responses and isinstance(stateful_input, list)
+            else _chat_messages_to_responses_input(payload_messages)
+        )
+
         kwargs = {
             "model": model,
             "instructions": instructions,
-            "input": _chat_messages_to_responses_input(payload_messages),
+            "input": input_items,
             "tools": _responses_tools(tools),
             "tool_choice": "auto",
-            "parallel_tool_calls": True,
-            "store": False,
+            "parallel_tool_calls": not stateful_responses,
+            "store": stateful_responses,
         }
 
         session_id = params.get("session_id")
-        if not is_github_responses and session_id:
+        if (
+            stateful_responses
+            and isinstance(previous_response_id, str)
+            and previous_response_id.strip()
+        ):
+            kwargs["previous_response_id"] = previous_response_id.strip()
+
+        if not is_github_responses and session_id and not stateful_responses:
             kwargs["prompt_cache_key"] = session_id
 
         if reasoning_enabled and is_xai_responses:
@@ -180,6 +196,8 @@ class ResponsesApiTransport(ProviderTransport):
             provider_data["codex_message_items"] = msg.codex_message_items
         if msg and hasattr(msg, "reasoning_details") and msg.reasoning_details:
             provider_data["reasoning_details"] = msg.reasoning_details
+        if msg and hasattr(msg, "responses_response_id") and msg.responses_response_id:
+            provider_data["responses_response_id"] = msg.responses_response_id
 
         return NormalizedResponse(
             content=msg.content if msg else None,

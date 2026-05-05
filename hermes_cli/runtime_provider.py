@@ -176,6 +176,37 @@ def _parse_api_mode(raw: Any) -> Optional[str]:
     return None
 
 
+def _parse_optional_bool(raw: Any) -> Optional[bool]:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _configured_responses_stateful(
+    model_cfg: Dict[str, Any],
+    provider: Optional[str],
+    configured_provider: Optional[str] = None,
+) -> Optional[bool]:
+    value = _parse_optional_bool(model_cfg.get("responses_stateful"))
+    if value is None:
+        return None
+    provider_name = (provider or "").strip().lower()
+    configured_name = configured_provider
+    if configured_name is None:
+        configured_name = str(model_cfg.get("provider") or "").strip().lower()
+    if not _provider_supports_explicit_api_mode(provider_name, configured_name):
+        return None
+    return value
+
+
 def _resolve_runtime_from_pool_entry(
     *,
     provider: str,
@@ -285,7 +316,7 @@ def _resolve_runtime_from_pool_entry(
     if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
         base_url = re.sub(r"/v1/?$", "", base_url)
 
-    return {
+    result = {
         "provider": provider,
         "api_mode": api_mode,
         "base_url": base_url,
@@ -294,6 +325,10 @@ def _resolve_runtime_from_pool_entry(
         "credential_pool": pool,
         "requested_provider": requested_provider,
     }
+    responses_stateful = _configured_responses_stateful(model_cfg, provider)
+    if responses_stateful is not None:
+        result["responses_stateful"] = responses_stateful
+    return result
 
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
@@ -319,6 +354,7 @@ def _try_resolve_from_custom_pool(
     base_url: str,
     provider_label: str,
     api_mode_override: Optional[str] = None,
+    responses_stateful: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
     """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
     pool_key = get_custom_provider_pool_key(base_url)
@@ -334,7 +370,7 @@ def _try_resolve_from_custom_pool(
         pool_api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         if not pool_api_key:
             return None
-        return {
+        result = {
             "provider": provider_label,
             "api_mode": api_mode_override or _detect_api_mode_for_url(base_url) or "chat_completions",
             "base_url": base_url,
@@ -342,6 +378,9 @@ def _try_resolve_from_custom_pool(
             "source": f"pool:{pool_key}",
             "credential_pool": pool,
         }
+        if responses_stateful is not None:
+            result["responses_stateful"] = responses_stateful
+        return result
     except Exception:
         return None
 
@@ -401,6 +440,9 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
                     if api_mode:
                         result["api_mode"] = api_mode
+                    responses_stateful = _parse_optional_bool(entry.get("responses_stateful"))
+                    if responses_stateful is not None:
+                        result["responses_stateful"] = responses_stateful
                     return result
             # Also check the 'name' field if present
             display_name = entry.get("name", "")
@@ -419,6 +461,9 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         api_mode = _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
                         if api_mode:
                             result["api_mode"] = api_mode
+                        responses_stateful = _parse_optional_bool(entry.get("responses_stateful"))
+                        if responses_stateful is not None:
+                            result["responses_stateful"] = responses_stateful
                         return result
 
     # Fall back to custom_providers: list (legacy format)
@@ -462,6 +507,9 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         api_mode = _parse_api_mode(entry.get("api_mode"))
         if api_mode:
             result["api_mode"] = api_mode
+        responses_stateful = _parse_optional_bool(entry.get("responses_stateful"))
+        if responses_stateful is not None:
+            result["responses_stateful"] = responses_stateful
         model_name = str(entry.get("model", "") or "").strip()
         if model_name:
             result["model"] = model_name
@@ -512,7 +560,12 @@ def _resolve_named_custom_runtime(
         return None
 
     # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"))
+    pool_result = _try_resolve_from_custom_pool(
+        base_url,
+        "custom",
+        custom_provider.get("api_mode"),
+        custom_provider.get("responses_stateful"),
+    )
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
@@ -543,6 +596,8 @@ def _resolve_named_custom_runtime(
     # provider name differs from the actual model string the API expects.
     if custom_provider.get("model"):
         result["model"] = custom_provider["model"]
+    if "responses_stateful" in custom_provider:
+        result["responses_stateful"] = custom_provider["responses_stateful"]
     return result
 
 
@@ -631,8 +686,12 @@ def _resolve_openrouter_runtime(
 
     # For custom endpoints, check if a credential pool exists
     if effective_provider == "custom" and base_url:
+        responses_stateful = _configured_responses_stateful(model_cfg, "custom", cfg_provider)
         pool_result = _try_resolve_from_custom_pool(
-            base_url, effective_provider, _parse_api_mode(model_cfg.get("api_mode")),
+            base_url,
+            effective_provider,
+            _parse_api_mode(model_cfg.get("api_mode")),
+            responses_stateful,
         )
         if pool_result:
             return pool_result
@@ -640,7 +699,7 @@ def _resolve_openrouter_runtime(
     if effective_provider == "custom" and not api_key and not _is_openrouter_url:
         api_key = "no-key-required"
 
-    return {
+    result = {
         "provider": effective_provider,
         "api_mode": _parse_api_mode(model_cfg.get("api_mode"))
         or _detect_api_mode_for_url(base_url)
@@ -649,6 +708,10 @@ def _resolve_openrouter_runtime(
         "api_key": api_key,
         "source": source,
     }
+    responses_stateful = _configured_responses_stateful(model_cfg, effective_provider, cfg_provider)
+    if responses_stateful is not None:
+        result["responses_stateful"] = responses_stateful
+    return result
 
 
 def _resolve_azure_foundry_runtime(

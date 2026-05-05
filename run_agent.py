@@ -149,8 +149,12 @@ from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
+    _chat_messages_to_responses_input as _codex_chat_messages_to_responses_input,
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
     _deterministic_call_id as _codex_deterministic_call_id,
+    _normalize_codex_response as _codex_normalize_codex_response,
+    _preflight_codex_api_kwargs as _codex_preflight_codex_api_kwargs,
+    _responses_tools as _codex_responses_tools,
     _split_responses_tool_id as _codex_split_responses_tool_id,
     _summarize_user_message_for_log,
 )
@@ -890,6 +894,7 @@ class AIAgent:
         api_key: str = None,
         provider: str = None,
         api_mode: str = None,
+        responses_stateful: bool = False,
         acp_command: str = None,
         acp_args: list[str] | None = None,
         command: str = None,
@@ -956,6 +961,7 @@ class AIAgent:
             api_key (str): API key for authentication (optional, uses env var if not provided)
             provider (str): Provider identifier (optional; used for telemetry/routing hints)
             api_mode (str): API mode override: "chat_completions" or "codex_responses"
+            responses_stateful (bool): Enable server-side Responses chaining for compatible custom/local providers.
             model (str): Model name to use (default: "anthropic/claude-opus-4.6")
             max_iterations (int): Maximum number of tool calling iterations (default: 90)
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
@@ -1031,6 +1037,9 @@ class AIAgent:
         self.provider = provider_name or ""
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
+        self.responses_stateful = bool(responses_stateful)
+        self._responses_previous_response_id: Optional[str] = None
+        self._responses_blocked_response_id: Optional[str] = None
         if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
             self.api_mode = api_mode
         elif self.provider == "openai-codex":
@@ -2130,6 +2139,7 @@ class AIAgent:
             "provider": self.provider,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "responses_stateful": self.responses_stateful,
             "api_key": getattr(self, "api_key", ""),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
@@ -2189,6 +2199,7 @@ class AIAgent:
         # Context engine reset (works for both built-in compressor and plugins)
         if hasattr(self, "context_compressor") and self.context_compressor:
             self.context_compressor.on_session_reset()
+        self._clear_responses_stateful_chain(reason="reset_session_state")
 
     def _ensure_lmstudio_runtime_loaded(self, config_context_length: Optional[int] = None) -> None:
         """
@@ -2223,7 +2234,15 @@ class AIAgent:
         except Exception as err:
             logger.debug("LM Studio preload skipped: %s", err)
 
-    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
+    def switch_model(
+        self,
+        new_model,
+        new_provider,
+        api_key='',
+        base_url='',
+        api_mode='',
+        responses_stateful: Optional[bool] = None,
+    ):
         """Switch the model/provider in-place for a live agent.
 
         Called by the /model command handlers (CLI and gateway) after
@@ -2267,6 +2286,9 @@ class AIAgent:
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(self, "_transport_cache"):
             self._transport_cache.clear()
+        if responses_stateful is not None:
+            self.responses_stateful = bool(responses_stateful)
+        self._clear_responses_stateful_chain(reason="switch_model")
         if api_key:
             self.api_key = api_key
 
@@ -2361,6 +2383,7 @@ class AIAgent:
             "provider": self.provider,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "responses_stateful": self.responses_stateful,
             "api_key": getattr(self, "api_key", ""),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
@@ -2532,7 +2555,7 @@ class AIAgent:
             detail = detail[:217].rstrip() + "..."
         self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}")
 
-    def _current_main_runtime(self) -> Dict[str, str]:
+    def _current_main_runtime(self) -> Dict[str, Any]:
         """Return the live main runtime for session-scoped auxiliary routing."""
         return {
             "model": getattr(self, "model", "") or "",
@@ -2540,6 +2563,7 @@ class AIAgent:
             "base_url": getattr(self, "base_url", "") or "",
             "api_key": getattr(self, "api_key", "") or "",
             "api_mode": getattr(self, "api_mode", "") or "",
+            "responses_stateful": bool(getattr(self, "responses_stateful", False)),
         }
 
     def _check_compression_model_feasibility(self) -> None:
@@ -3128,24 +3152,30 @@ class AIAgent:
         messages: List[Dict[str, Any]],
     ) -> bool:
         """Detect a planning/ack message that should continue instead of ending the turn."""
-        if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
-            return False
-
-        assistant_text = self._strip_think_blocks(assistant_content or "").strip().lower()
+        assistant_visible = self._strip_think_blocks(assistant_content or "").strip()
+        assistant_text = assistant_visible.lower()
         if not assistant_text:
             return False
         if len(assistant_text) > 1200:
             return False
 
         has_future_ack = bool(
-            re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
+            re.search(
+                r"\b(i['’]ll|i will|i['’]m going to|i am going to|"
+                r"i['’]d|i would|let me|i can do that|i can help with that)\b"
+                r"|here['’]s what i['’]d",
+                assistant_text,
+            )
         )
-        if not has_future_ack:
-            return False
 
         action_markers = (
             "look into",
             "look at",
+            "investigat",
+            "examine",
+            "survey",
+            "discover",
+            "probe",
             "inspect",
             "scan",
             "check",
@@ -3160,6 +3190,13 @@ class AIAgent:
             "debug",
             "search",
             "find",
+            "write",
+            "save",
+            "update",
+            "edit",
+            "create",
+            "load",
+            "append",
             "walkthrough",
             "report back",
             "summarize",
@@ -3175,22 +3212,53 @@ class AIAgent:
             "project",
             "folder",
             "filesystem",
+            "file",
             "file tree",
             "files",
             "path",
+            "document",
+            "config",
+            "session",
+            "log",
         )
 
         user_text = (user_message or "").strip().lower()
-        user_targets_workspace = (
-            any(marker in user_text for marker in workspace_markers)
-            or "~/" in user_text
-            or "/" in user_text
+        file_ref_pattern = re.compile(
+            r"(?:^|[\s`'\"])(?:~?/|\.{1,2}/|[\w.-]+\."
+            r"(?:md|txt|json|ya?ml|toml|py|js|ts|tsx|jsx|sh|csv|html|css|"
+            r"rs|go|java|kt|swift|sql|db|sqlite|log))"
+            r"(?:$|[\s`'\".,:;!?])"
         )
+
+        def _targets_workspace(text: str) -> bool:
+            return (
+                any(marker in text for marker in workspace_markers)
+                or "~/" in text
+                or "/" in text
+                or bool(file_ref_pattern.search(text))
+            )
+
+        user_targets_workspace = _targets_workspace(user_text)
         assistant_mentions_action = any(marker in assistant_text for marker in action_markers)
-        assistant_targets_workspace = any(
-            marker in assistant_text for marker in workspace_markers
+        assistant_targets_workspace = _targets_workspace(assistant_text)
+        dangling_intro = assistant_visible.rstrip().endswith(":") and (
+            has_future_ack or assistant_mentions_action
         )
-        return (user_targets_workspace or assistant_targets_workspace) and assistant_mentions_action
+        recent_tool_context = any(
+            isinstance(msg, dict) and msg.get("role") == "tool"
+            for msg in messages[-4:]
+        )
+
+        if not (has_future_ack or dangling_intro):
+            return False
+
+        if recent_tool_context and dangling_intro and assistant_mentions_action:
+            return True
+
+        return (
+            (user_targets_workspace or assistant_targets_workspace)
+            and assistant_mentions_action
+        )
 
 
     def _extract_reasoning(self, assistant_message) -> Optional[str]:
@@ -3499,6 +3567,31 @@ class AIAgent:
                 actions.append(f"{label} updated")
         return actions
 
+    @staticmethod
+    def _background_review_history_for_sidecar(messages: List[Dict]) -> List[Dict]:
+        """Copy inherited history without foreground Responses chain state.
+
+        Background review agents may run on a sidecar wrapper. The inherited
+        conversation can contain response/item IDs created by the foreground
+        wrapper, but those IDs are not valid in the sidecar response store. Drop
+        them so the sidecar starts its own local stateful chain cleanly.
+        """
+
+        scrubbed: List[Dict] = []
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            clean = copy.deepcopy(msg)
+            if clean.get("role") == "assistant":
+                for key in (
+                    "responses_response_id",
+                    "codex_message_items",
+                    "codex_reasoning_items",
+                ):
+                    clean.pop(key, None)
+            scrubbed.append(clean)
+        return scrubbed
+
     def _spawn_background_review(
         self,
         messages_snapshot: List[Dict],
@@ -3544,25 +3637,45 @@ class AIAgent:
                 with open(os.devnull, "w") as _devnull, \
                      contextlib.redirect_stdout(_devnull), \
                      contextlib.redirect_stderr(_devnull):
-                    # Inherit the parent agent's live runtime (provider, model,
-                    # base_url, api_key, api_mode) so the fork uses the exact
-                    # same credentials the main turn is using.  Without this,
-                    # AIAgent.__init__ re-runs auto-resolution from env vars,
-                    # which fails for OAuth-only providers, session-scoped
-                    # creds, or credential-pool setups where the resolver can't
-                    # reconstruct auth from scratch -- producing the spurious
-                    # "No LLM provider configured" warning at end of turn.
+                    # Inherit the parent runtime by default, but move automatic
+                    # background review to a configured sidecar runtime when one
+                    # exists.  The inherited conversation is scrubbed below so
+                    # any stateful Responses chain starts inside that sidecar,
+                    # not from foreground response IDs.
                     _parent_runtime = self._current_main_runtime()
+                    _review_model = self.model
+                    _review_runtime = dict(_parent_runtime)
+                    _review_credential_pool = getattr(self, "_credential_pool", None)
+                    try:
+                        from hermes_cli.background_runtime import (
+                            BackgroundRuntimeError,
+                            resolve_background_runtime,
+                        )
+
+                        _resolved = resolve_background_runtime(
+                            "background_review",
+                            parent_model=self.model,
+                            parent_runtime=_parent_runtime,
+                        )
+                        if _resolved is not None:
+                            _review_model, _review_runtime = _resolved
+                            _review_credential_pool = _review_runtime.get("credential_pool")
+                    except BackgroundRuntimeError as exc:
+                        logger.warning("Background review skipped: %s", exc)
+                        return
+                    except Exception:
+                        logger.debug("Background review sidecar routing failed", exc_info=True)
                     review_agent = AIAgent(
-                        model=self.model,
+                        model=_review_model,
                         max_iterations=8,
                         quiet_mode=True,
                         platform=self.platform,
-                        provider=self.provider,
-                        api_mode=_parent_runtime.get("api_mode") or None,
-                        base_url=_parent_runtime.get("base_url") or None,
-                        api_key=_parent_runtime.get("api_key") or None,
-                        credential_pool=getattr(self, "_credential_pool", None),
+                        provider=_review_runtime.get("provider") or self.provider,
+                        api_mode=_review_runtime.get("api_mode") or None,
+                        base_url=_review_runtime.get("base_url") or None,
+                        api_key=_review_runtime.get("api_key") or None,
+                        responses_stateful=bool(_review_runtime.get("responses_stateful", False)),
+                        credential_pool=_review_credential_pool,
                         parent_session_id=self.session_id,
                         enabled_toolsets=["memory", "skills"],
                     )
@@ -3576,7 +3689,7 @@ class AIAgent:
 
                     review_agent.run_conversation(
                         user_message=prompt,
-                        conversation_history=messages_snapshot,
+                        conversation_history=self._background_review_history_for_sidecar(messages_snapshot),
                     )
 
                 # Scan the review agent's messages for successful tool actions
@@ -5339,6 +5452,130 @@ class AIAgent:
         """Build a valid Responses `function_call.id` (must start with `fc_`)."""
         return _codex_derive_responses_function_call_id(call_id, response_item_id)
 
+    def _responses_stateful_enabled(self) -> bool:
+        return (
+            self.api_mode == "codex_responses"
+            and bool(getattr(self, "responses_stateful", False))
+            and self.provider != "openai-codex"
+        )
+
+    def _clear_responses_stateful_chain(
+        self,
+        *,
+        reason: str = "",
+        blocked_response_id: Optional[str] = None,
+    ) -> None:
+        blocked = (
+            blocked_response_id.strip()
+            if isinstance(blocked_response_id, str) and blocked_response_id.strip()
+            else None
+        )
+        current = getattr(self, "_responses_previous_response_id", None)
+        if blocked is None and isinstance(current, str) and current.strip():
+            blocked = current.strip()
+        had_state = bool(blocked or current)
+        if blocked:
+            self._responses_blocked_response_id = blocked
+        self._responses_previous_response_id = None
+        if reason and blocked:
+            logger.info("Cleared stateful Responses chain (%s): %s", reason, blocked)
+        elif reason and had_state:
+            logger.info("Cleared stateful Responses chain (%s)", reason)
+
+    def _remember_responses_response_id(self, response_id: Any) -> None:
+        if not isinstance(response_id, str) or not response_id.strip():
+            return
+        self._responses_previous_response_id = response_id.strip()
+        self._responses_blocked_response_id = None
+
+    def _get_responses_previous_response_id(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
+        blocked = getattr(self, "_responses_blocked_response_id", None)
+        current = getattr(self, "_responses_previous_response_id", None)
+        if isinstance(current, str):
+            current = current.strip() or None
+        else:
+            current = None
+        if current and current != blocked:
+            return current
+
+        for msg in reversed(messages or []):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            candidate = msg.get("responses_response_id")
+            if not isinstance(candidate, str):
+                continue
+            candidate = candidate.strip()
+            if candidate and candidate != blocked:
+                self._responses_previous_response_id = candidate
+                return candidate
+        return None
+
+    @staticmethod
+    def _find_responses_anchor_index(
+        messages: List[Dict[str, Any]],
+        response_id: str,
+    ) -> Optional[int]:
+        target = response_id.strip()
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            candidate = msg.get("responses_response_id")
+            if isinstance(candidate, str) and candidate.strip() == target:
+                return idx
+        return None
+
+    def _build_stateful_responses_input(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        previous_response_id = self._get_responses_previous_response_id(messages)
+        if not previous_response_id:
+            return self._chat_messages_to_responses_input(messages), None
+
+        anchor_idx = self._find_responses_anchor_index(messages, previous_response_id)
+        if anchor_idx is None:
+            self._clear_responses_stateful_chain(
+                reason="missing_local_anchor",
+                blocked_response_id=previous_response_id,
+            )
+            return self._chat_messages_to_responses_input(messages), None
+
+        delta_messages = messages[anchor_idx + 1:]
+        return self._chat_messages_to_responses_input(delta_messages), previous_response_id
+
+    def _should_reset_stateful_responses_after_error(self, exc: Exception) -> bool:
+        if not self._responses_stateful_enabled():
+            return False
+        message = str(exc or "").lower()
+        if not message:
+            return False
+        if "previous_response_id" in message and ("not found" in message or "unknown" in message or "404" in message):
+            return True
+        if "previous response" in message and "not found" in message:
+            return True
+        return False
+
+    def _chat_messages_to_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return _codex_chat_messages_to_responses_input(messages)
+
+    def _responses_tools(self, tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
+        return _codex_responses_tools(tools if tools is not None else self.tools)
+
+    def _preflight_codex_api_kwargs(
+        self,
+        api_kwargs: Any,
+        *,
+        allow_stream: bool = False,
+    ) -> Dict[str, Any]:
+        return _codex_preflight_codex_api_kwargs(api_kwargs, allow_stream=allow_stream)
+
+    def _normalize_codex_response(self, response: Any) -> tuple[Any, str]:
+        return _codex_normalize_codex_response(response)
+
     def _thread_identity(self) -> str:
         thread = threading.current_thread()
         return f"{thread.name}:{thread.ident}"
@@ -5743,6 +5980,67 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    @staticmethod
+    def _merge_codex_stream_done_items(final_response: Any, done_items: list) -> None:
+        """Patch streamed final responses with completed output_item.done data.
+
+        Some OpenAI-compatible Responses stream implementations expose
+        response.output from the earlier output_item.added events, leaving
+        message items stuck at status=in_progress even after the terminal
+        response.completed event.  The output_item.done payload has the same
+        item id with completed status and final content; merge it back before
+        normalization decides whether the turn is incomplete.
+        """
+        if not done_items:
+            return
+        output = getattr(final_response, "output", None)
+        if not isinstance(output, list) or not output:
+            return
+
+        def _item_id(item: Any) -> Optional[str]:
+            if isinstance(item, dict):
+                value = item.get("id")
+            else:
+                value = getattr(item, "id", None)
+            return value if isinstance(value, str) and value else None
+
+        done_by_id: Dict[str, Any] = {}
+        for item in done_items:
+            item_id = _item_id(item)
+            if item_id:
+                done_by_id[item_id] = item
+
+        merged = []
+        used_ids: set[str] = set()
+        changed = False
+        for index, item in enumerate(output):
+            item_id = _item_id(item)
+            replacement = done_by_id.get(item_id) if item_id else None
+            if replacement is None and index < len(done_items):
+                replacement = done_items[index]
+            if replacement is not None:
+                replacement_id = _item_id(replacement)
+                if replacement_id:
+                    used_ids.add(replacement_id)
+                merged.append(replacement)
+                if replacement is not item:
+                    changed = True
+            else:
+                merged.append(item)
+
+        existing_ids = {_item_id(item) for item in merged}
+        for item in done_items:
+            item_id = _item_id(item)
+            if item_id and item_id in used_ids:
+                continue
+            if item_id and item_id in existing_ids:
+                continue
+            merged.append(item)
+            changed = True
+
+        if changed:
+            final_response.output = merged
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
@@ -5813,6 +6111,9 @@ class AIAgent:
                     # but get_final_response() can return an empty output list.
                     # Backfill from collected items or synthesize from deltas.
                     _out = getattr(final_response, "output", None)
+                    if isinstance(_out, list) and _out and collected_output_items:
+                        self._merge_codex_stream_done_items(final_response, collected_output_items)
+                        _out = getattr(final_response, "output", None)
                     if isinstance(_out, list) and not _out:
                         if collected_output_items:
                             final_response.output = list(collected_output_items)
@@ -5915,6 +6216,12 @@ class AIAgent:
                 if terminal_response is not None:
                     # Backfill empty output from collected stream events
                     _out = getattr(terminal_response, "output", None)
+                    if isinstance(_out, list) and _out and collected_output_items:
+                        self._merge_codex_stream_done_items(
+                            terminal_response,
+                            collected_output_items,
+                        )
+                        _out = getattr(terminal_response, "output", None)
                     if isinstance(_out, list) and not _out:
                         if collected_output_items:
                             terminal_response.output = list(collected_output_items)
@@ -6678,21 +6985,18 @@ class AIAgent:
                 if _provider_timeout_cfg is not None
                 else float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
             )
-            # Read timeout: config wins here too.  Otherwise use
-            # HERMES_STREAM_READ_TIMEOUT (default 120s) for cloud providers.
+            # Read timeout: config wins here too. Otherwise honor an explicit
+            # HERMES_STREAM_READ_TIMEOUT; with no override, keep local endpoints
+            # lenient while failing remote stalled streams briskly.
             if _provider_timeout_cfg is not None:
                 _stream_read_timeout = _provider_timeout_cfg
             else:
-                _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
-                # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
-                # prefill on large contexts before producing the first token.
-                # Auto-increase the httpx read timeout unless the user explicitly
-                # overrode HERMES_STREAM_READ_TIMEOUT.
-                if _stream_read_timeout == 120.0 and self.base_url and is_local_endpoint(self.base_url):
-                    _stream_read_timeout = _base_timeout
-                    logger.debug(
-                        "Local provider detected (%s) — stream read timeout raised to %.0fs",
-                        self.base_url, _stream_read_timeout,
+                _stream_read_timeout_env = os.getenv("HERMES_STREAM_READ_TIMEOUT")
+                if _stream_read_timeout_env is not None:
+                    _stream_read_timeout = float(_stream_read_timeout_env)
+                else:
+                    _stream_read_timeout = (
+                        300.0 if is_local_endpoint(getattr(self, "base_url", "") or "") else 60.0
                     )
             stream_kwargs = {
                 **api_kwargs,
@@ -7503,6 +7807,8 @@ class AIAgent:
             self.api_mode = fb_api_mode
             if hasattr(self, "_transport_cache"):
                 self._transport_cache.clear()
+            self.responses_stateful = bool(fb.get("responses_stateful", False))
+            self._clear_responses_stateful_chain(reason="activate_fallback")
             self._fallback_activated = True
 
             # Honor per-provider / per-model request_timeout_seconds for the
@@ -7626,6 +7932,8 @@ class AIAgent:
             self.api_mode = rt["api_mode"]
             if hasattr(self, "_transport_cache"):
                 self._transport_cache.clear()
+            self.responses_stateful = bool(rt.get("responses_stateful", False))
+            self._clear_responses_stateful_chain(reason="restore_primary_runtime")
             self.api_key = rt["api_key"]
             self._client_kwargs = dict(rt["client_kwargs"])
             self._use_prompt_caching = rt["use_prompt_caching"]
@@ -8252,6 +8560,11 @@ class AIAgent:
             )
             is_xai_responses = self.provider == "xai" or self._base_url_hostname == "api.x.ai"
             _msgs_for_codex = self._prepare_messages_for_non_vision_model(api_messages)
+            stateful_responses = self._responses_stateful_enabled()
+            stateful_input = None
+            previous_response_id = None
+            if stateful_responses:
+                stateful_input, previous_response_id = self._build_stateful_responses_input(_msgs_for_codex)
             return _ct.build_kwargs(
                 model=self.model,
                 messages=_msgs_for_codex,
@@ -8264,6 +8577,9 @@ class AIAgent:
                 is_codex_backend=is_codex_backend,
                 is_xai_responses=is_xai_responses,
                 github_reasoning_extra=self._github_models_reasoning_extra_body() if is_github_responses else None,
+                stateful_responses=stateful_responses,
+                stateful_input=stateful_input,
+                previous_response_id=previous_response_id,
             )
 
         # ── chat_completions (default) ─────────────────────────────────────
@@ -8625,6 +8941,12 @@ class AIAgent:
         codex_message_items = getattr(assistant_message, "codex_message_items", None)
         if codex_message_items:
             msg["codex_message_items"] = codex_message_items
+
+        responses_response_id = getattr(assistant_message, "responses_response_id", None)
+        if isinstance(responses_response_id, str) and responses_response_id.strip():
+            normalized_response_id = responses_response_id.strip()
+            msg["responses_response_id"] = normalized_response_id
+            self._remember_responses_response_id(normalized_response_id)
 
         if assistant_message.tool_calls:
             tool_calls = []
@@ -9967,7 +10289,7 @@ class AIAgent:
             for msg in messages:
                 api_msg = msg.copy()
                 self._copy_reasoning_content_for_api(msg, api_msg)
-                for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
+                for internal_field in ("reasoning", "finish_reason", "_thinking_prefill", "responses_response_id"):
                     api_msg.pop(internal_field, None)
                 if _needs_sanitize:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
@@ -10245,6 +10567,8 @@ class AIAgent:
 
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
+        if not conversation_history:
+            self._clear_responses_stateful_chain(reason="fresh_conversation")
 
         # Hydrate todo store from conversation history (gateway creates a fresh
         # AIAgent per message, so the in-memory store is empty -- we need to
@@ -11896,6 +12220,18 @@ class AIAgent:
                         )
                         continue
 
+                    if self._should_reset_stateful_responses_after_error(api_error):
+                        self._clear_responses_stateful_chain(
+                            reason="previous_response_id_rejected",
+                            blocked_response_id=getattr(self, "_responses_previous_response_id", None),
+                        )
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            logger.info(
+                                "Retrying Responses request without previous_response_id after server rejection"
+                            )
+                            continue
+
                     retry_count += 1
                     elapsed_time = time.time() - api_start_time
                     self._touch_activity(
@@ -13170,9 +13506,20 @@ class AIAgent:
                             #   tool(result) → assistant("(empty)") → user(nudge)
                             # Without this, we'd have tool → user which most
                             # APIs reject as an invalid sequence.
-                            _nudge_msg = self._build_assistant_message(assistant_message, finish_reason)
-                            _nudge_msg["content"] = "(empty)"
-                            messages.append(_nudge_msg)
+                            empty_assistant_msg = self._build_assistant_message(
+                                assistant_message,
+                                finish_reason,
+                            )
+                            empty_assistant_msg["content"] = "(empty)"
+                            messages.append(empty_assistant_msg)
+                            synthetic_response_id = empty_assistant_msg.get(
+                                "responses_response_id"
+                            )
+                            if isinstance(synthetic_response_id, str):
+                                self._clear_responses_stateful_chain(
+                                    reason="synthetic_empty_assistant",
+                                    blocked_response_id=synthetic_response_id,
+                                )
                             messages.append({
                                 "role": "user",
                                 "content": (
@@ -13181,6 +13528,10 @@ class AIAgent:
                                     "results above and continue with the task."
                                 ),
                             })
+                            if api_call_count > 0:
+                                api_call_count -= 1
+                                self._api_call_count = api_call_count
+                            self.iteration_budget.refund()
                             continue
 
                         # ── Thinking-only prefill continuation ──────────
@@ -13333,8 +13684,9 @@ class AIAgent:
                         continue_msg = {
                             "role": "user",
                             "content": (
-                                "[System: Continue now. Execute the required tool calls and only "
-                                "send your final answer after completing the task.]"
+                                "[System: Continue now. Execute the required tool calls, or write "
+                                "the promised content directly if no tool is needed. Only send your "
+                                "final answer after completing the task.]"
                             ),
                         }
                         messages.append(continue_msg)

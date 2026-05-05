@@ -1529,7 +1529,7 @@ _AUTO_PROVIDER_LABELS = {
     "_resolve_api_key_provider": "api-key",
 }
 
-_MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode")
+_MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "responses_stateful")
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, str]:
@@ -1539,12 +1539,80 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     normalized: Dict[str, str] = {}
     for field in _MAIN_RUNTIME_FIELDS:
         value = main_runtime.get(field)
+        if field == "responses_stateful":
+            if isinstance(value, bool):
+                normalized[field] = "true" if value else "false"
+            elif isinstance(value, (int, float)):
+                normalized[field] = "true" if bool(value) else "false"
+            elif isinstance(value, str) and value.strip():
+                normalized[field] = value.strip().lower()
+            continue
         if isinstance(value, str) and value.strip():
             normalized[field] = value.strip()
     provider = normalized.get("provider")
     if provider:
         normalized["provider"] = provider.lower()
     return normalized
+
+
+def _resolve_active_main_runtime() -> Dict[str, str]:
+    """Return the configured main runtime fingerprint for cache identity.
+
+    Auxiliary callers often do not pass a live ``main_runtime`` snapshot.  If
+    those calls are cached only by provider/model, a long-running Hermes process
+    can keep using a stale chat-completions client after the configured main
+    runtime switches to Responses mode.  Read the lightweight config/env fields
+    lazily so the cache key tracks API mode/base URL changes without invoking
+    credential-pool resolution or provider fallbacks.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    except Exception as exc:
+        logger.debug("Auxiliary client: active runtime config read failed: %s", exc)
+        model_cfg = {}
+
+    runtime: Dict[str, str] = {}
+    if isinstance(model_cfg, str) and model_cfg.strip():
+        runtime["model"] = model_cfg.strip()
+    elif isinstance(model_cfg, dict):
+        field_map = {
+            "provider": "provider",
+            "default": "model",
+            "base_url": "base_url",
+            "api_key": "api_key",
+            "api_mode": "api_mode",
+            "responses_stateful": "responses_stateful",
+        }
+        for source, target in field_map.items():
+            value = model_cfg.get(source)
+            if target == "responses_stateful":
+                if isinstance(value, bool):
+                    runtime[target] = "true" if value else "false"
+                elif isinstance(value, (int, float)):
+                    runtime[target] = "true" if bool(value) else "false"
+                elif isinstance(value, str) and value.strip():
+                    runtime[target] = value.strip().lower()
+            elif isinstance(value, str) and value.strip():
+                runtime[target] = value.strip()
+
+    if not runtime.get("base_url"):
+        env_base = os.getenv("OPENAI_BASE_URL", "").strip()
+        if env_base:
+            runtime["base_url"] = env_base.rstrip("/")
+    if not runtime.get("api_key"):
+        env_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if env_key:
+            runtime["api_key"] = env_key
+
+    provider = runtime.get("provider")
+    if provider:
+        runtime["provider"] = provider.lower()
+    if any(runtime.get(field) for field in _MAIN_RUNTIME_FIELDS):
+        return runtime
+    return {}
 
 
 def _get_provider_chain() -> List[tuple]:
@@ -2716,7 +2784,11 @@ def _client_cache_key(
     is_vision: bool = False,
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
-    runtime_key = tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
+    runtime_key = (
+        tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS)
+        if provider in ("auto", "custom")
+        else ()
+    )
     return (provider, async_mode, base_url or "", api_key or "", api_mode or "", runtime_key, is_vision)
 
 
@@ -2939,13 +3011,15 @@ def _get_cached_client(
         except RuntimeError:
             pass
     runtime = _normalize_main_runtime(main_runtime)
+    if provider in ("auto", "custom") and not runtime:
+        runtime = _resolve_active_main_runtime()
     cache_key = _client_cache_key(
         provider,
         async_mode=async_mode,
         base_url=base_url,
         api_key=api_key,
         api_mode=api_mode,
-        main_runtime=main_runtime,
+        main_runtime=runtime,
         is_vision=is_vision,
     )
     with _client_cache_lock:
@@ -3045,6 +3119,30 @@ def _resolve_task_provider_model(
             return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
         if cfg_provider and cfg_provider != "auto":
             return cfg_provider, resolved_model, None, None, resolved_api_mode
+
+        try:
+            from hermes_cli.background_runtime import (
+                BackgroundRuntimeError,
+                resolve_background_runtime,
+            )
+
+            sidecar = resolve_background_runtime(
+                f"auxiliary:{task}",
+                parent_model=resolved_model,
+            )
+            if sidecar is not None:
+                sidecar_model, sidecar_runtime = sidecar
+                return (
+                    sidecar_runtime.get("provider") or "custom",
+                    resolved_model or sidecar_model,
+                    sidecar_runtime.get("base_url"),
+                    sidecar_runtime.get("api_key"),
+                    sidecar_runtime.get("api_mode"),
+                )
+        except BackgroundRuntimeError:
+            raise
+        except Exception:
+            logger.debug("Auxiliary sidecar routing failed for %s", task, exc_info=True)
 
         return "auto", resolved_model, None, None, resolved_api_mode
 

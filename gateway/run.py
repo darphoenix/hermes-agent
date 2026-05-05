@@ -513,10 +513,43 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
         "api_mode": runtime.get("api_mode"),
+        "responses_stateful": runtime.get("responses_stateful", False),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
     }
+
+
+def _resolve_background_agent_runtime(
+    task: str,
+    model: str,
+    runtime_kwargs: dict,
+    *,
+    user_config: Optional[dict] = None,
+    force_stateless: bool = False,
+) -> tuple[str, dict]:
+    """Route an automatic/background gateway call to the configured sidecar."""
+
+    try:
+        from hermes_cli.background_runtime import (
+            BackgroundRuntimeError,
+            resolve_background_runtime,
+        )
+
+        resolved = resolve_background_runtime(
+            task,
+            parent_model=model,
+            parent_runtime=runtime_kwargs,
+            config=user_config,
+            force_stateless=force_stateless,
+        )
+        if resolved is not None:
+            return resolved
+    except BackgroundRuntimeError:
+        raise
+    except Exception:
+        logger.debug("Gateway sidecar routing failed for %s", task, exc_info=True)
+    return model, runtime_kwargs
 
 
 def _try_resolve_fallback_provider() -> dict | None:
@@ -716,6 +749,22 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     elif isinstance(model_cfg, dict):
         return model_cfg.get("default") or model_cfg.get("model") or ""
     return ""
+
+
+def _resolve_gateway_max_tokens(config: dict | None = None) -> Optional[int]:
+    """Read the configured per-response output cap from config.yaml."""
+    cfg = config if config is not None else _load_gateway_config()
+    model_cfg = cfg.get("model", {})
+    if not isinstance(model_cfg, dict):
+        return None
+    raw = model_cfg.get("max_tokens")
+    if raw is None:
+        raw = model_cfg.get("max_output_tokens")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -1283,6 +1332,7 @@ class GatewayRunner:
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
+                "max_tokens": override.get("max_tokens") or _resolve_gateway_max_tokens(user_config),
             }
             if override_runtime.get("api_key"):
                 logger.debug(
@@ -1305,6 +1355,9 @@ class GatewayRunner:
             )
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
+        max_tokens = _resolve_gateway_max_tokens(user_config)
+        if max_tokens is not None:
+            runtime_kwargs["max_tokens"] = max_tokens
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -1343,9 +1396,11 @@ class GatewayRunner:
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
             "api_mode": runtime_kwargs.get("api_mode"),
+            "responses_stateful": runtime_kwargs.get("responses_stateful", False),
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
+            "max_tokens": runtime_kwargs.get("max_tokens"),
         }
         route = {
             "model": model,
@@ -1357,6 +1412,7 @@ class GatewayRunner:
                 runtime["api_mode"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                runtime["max_tokens"],
             ),
         }
 
@@ -1423,16 +1479,23 @@ class GatewayRunner:
             await self.stop()
         elif not self.adapters and self._failed_platforms:
             # All platforms are down and queued for background reconnection.
-            # If the error is retryable, exit with failure so systemd Restart=on-failure
-            # can restart the process. Otherwise stay alive and keep retrying in background.
+            # On systemd, exiting lets Restart=on-failure revive the process.
+            # On macOS launchd, retryable exits can be throttled/pended, so keep
+            # the gateway alive and let the background reconnect loop continue.
             if adapter.fatal_error_retryable:
-                self._exit_reason = adapter.fatal_error_message or "All messaging platforms failed with retryable errors"
-                self._exit_with_failure = True
-                logger.error(
-                    "All messaging platforms failed with retryable errors. "
-                    "Shutting down gateway for service restart (systemd will retry)."
-                )
-                await self.stop()
+                if sys.platform == "darwin":
+                    logger.warning(
+                        "All messaging platforms failed with retryable errors. "
+                        "Keeping gateway alive for background reconnection on macOS launchd."
+                    )
+                else:
+                    self._exit_reason = adapter.fatal_error_message or "All messaging platforms failed with retryable errors"
+                    self._exit_with_failure = True
+                    logger.error(
+                        "All messaging platforms failed with retryable errors. "
+                        "Shutting down gateway for service restart (systemd will retry)."
+                    )
+                    await self.stop()
             else:
                 logger.warning(
                     "No connected messaging platforms remain, but %d platform(s) queued for reconnection",
@@ -5171,6 +5234,17 @@ class GatewayRunner:
                             session_key=session_key,
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
+                        try:
+                            _hyg_model, _hyg_runtime = _resolve_background_agent_runtime(
+                                "gateway_hygiene",
+                                _hyg_model,
+                                _hyg_runtime,
+                                user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
+                                force_stateless=True,
+                            )
+                        except Exception as exc:
+                            logger.warning("Gateway hygiene compression skipped: %s", exc)
+                            _hyg_runtime = {}
                         if _hyg_runtime.get("api_key"):
                             _hyg_msgs = [
                                 {"role": m.get("role"), "content": m.get("content")}
@@ -6527,6 +6601,7 @@ class GatewayRunner:
                                     api_key=result.api_key,
                                     base_url=result.base_url,
                                     api_mode=result.api_mode,
+                                    responses_stateful=result.responses_stateful,
                                 )
                             except Exception as exc:
                                 logger.warning("Picker model switch failed for cached agent: %s", exc)
@@ -6545,6 +6620,7 @@ class GatewayRunner:
                             "api_key": result.api_key,
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
+                            "responses_stateful": result.responses_stateful,
                         }
 
                         # Evict cached agent so the next turn creates a fresh
@@ -6664,6 +6740,7 @@ class GatewayRunner:
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    responses_stateful=result.responses_stateful,
                 )
             except Exception as exc:
                 logger.warning("In-place model switch failed for cached agent: %s", exc)
@@ -6685,6 +6762,7 @@ class GatewayRunner:
             "api_key": result.api_key,
             "base_url": result.base_url,
             "api_mode": result.api_mode,
+            "responses_stateful": result.responses_stateful,
         }
 
         # Evict cached agent so the next turn creates a fresh agent from the
@@ -7467,6 +7545,12 @@ class GatewayRunner:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
+                user_config=user_config,
+            )
+            model, runtime_kwargs = _resolve_background_agent_runtime(
+                "gateway_background",
+                model,
+                runtime_kwargs,
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
@@ -9926,6 +10010,8 @@ class GatewayRunner:
                 runtime.get("base_url", ""),
                 runtime.get("provider", ""),
                 runtime.get("api_mode", ""),
+                bool(runtime.get("responses_stateful", False)),
+                runtime.get("max_tokens"),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.
@@ -9952,7 +10038,7 @@ class GatewayRunner:
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode"):
+        for key in ("provider", "api_key", "base_url", "api_mode", "responses_stateful", "max_tokens"):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val

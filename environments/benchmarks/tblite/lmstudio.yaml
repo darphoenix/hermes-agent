@@ -1,0 +1,34 @@
+# TBLite Evaluation -- LM Studio Local Config
+#
+# Runs tasks locally against LM Studio's OpenAI-compatible endpoint.
+# No Docker required -- uses local terminal backend.
+#
+# Usage:
+#   python environments/benchmarks/tblite/tblite_env.py evaluate \
+#       --config environments/benchmarks/tblite/lmstudio.yaml
+
+env:
+  enabled_toolsets: ["terminal", "file"]
+  max_agent_turns: 60
+  max_token_length: 32000
+  agent_temperature: 0.8
+  terminal_backend: "docker"
+  terminal_timeout: 300
+  tool_pool_size: 1
+  dataset_name: "NousResearch/openthoughts-tblite"
+  test_timeout: 600
+  task_timeout: 1200
+  eval_concurrency: 1
+  max_concurrent_tasks: 1
+  tokenizer_name: "NousResearch/Hermes-3-Llama-3.1-8B"
+  use_wandb: false
+  wandb_name: "openthoughts-tblite-lmstudio"
+  ensure_scores_are_not_same: false
+  data_dir_to_save_evals: "environments/benchmarks/evals/openthoughts-tblite-lmstudio"
+
+openai:
+  base_url: "http://localhost:1234/v1"
+  model_name: "gemma-4-31b-it"
+  server_type: "openai"
+  health_check: false
+  api_key: "lm-studio"

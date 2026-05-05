@@ -321,6 +321,15 @@ def _normalize_role(r: Optional[str]) -> str:
     return "leaf"
 
 
+def _optional_bool(value: Any) -> Optional[bool]:
+    """Parse an optional config boolean while preserving "unset" as None."""
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return bool(is_truthy_value(value))
+
+
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
@@ -845,6 +854,7 @@ def _build_child_agent(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
+    override_responses_stateful: Optional[bool] = None,
     # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -984,6 +994,12 @@ def _build_child_agent(
     effective_base_url = override_base_url or parent_agent.base_url
     effective_api_key = override_api_key or parent_api_key
     effective_api_mode = override_api_mode or getattr(parent_agent, "api_mode", None)
+    if override_responses_stateful is None:
+        effective_responses_stateful = bool(
+            getattr(parent_agent, "responses_stateful", False)
+        )
+    else:
+        effective_responses_stateful = bool(override_responses_stateful)
     effective_acp_command = override_acp_command or getattr(
         parent_agent, "acp_command", None
     )
@@ -1032,6 +1048,7 @@ def _build_child_agent(
         model=effective_model,
         provider=effective_provider,
         api_mode=effective_api_mode,
+        responses_stateful=effective_responses_stateful,
         acp_command=effective_acp_command,
         acp_args=effective_acp_args,
         max_iterations=max_iterations,
@@ -1955,6 +1972,7 @@ def delegate_task(
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
+                override_responses_stateful=creds.get("responses_stateful"),
                 override_acp_command=t.get("acp_command")
                 or acp_command
                 or creds.get("command"),
@@ -2245,6 +2263,8 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
+    configured_api_mode = str(cfg.get("api_mode") or "").strip() or None
+    configured_responses_stateful = _optional_bool(cfg.get("responses_stateful"))
 
     if configured_base_url:
         api_key = configured_api_key or os.getenv("OPENAI_API_KEY", "").strip()
@@ -2256,17 +2276,21 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
         base_lower = configured_base_url.lower()
         provider = "custom"
-        api_mode = "chat_completions"
+        api_mode = configured_api_mode or "chat_completions"
         if (
-            base_url_hostname(configured_base_url) == "chatgpt.com"
+            configured_api_mode is None
+            and base_url_hostname(configured_base_url) == "chatgpt.com"
             and "/backend-api/codex" in base_lower
         ):
             provider = "openai-codex"
             api_mode = "codex_responses"
-        elif base_url_hostname(configured_base_url) == "api.anthropic.com":
+        elif (
+            configured_api_mode is None
+            and base_url_hostname(configured_base_url) == "api.anthropic.com"
+        ):
             provider = "anthropic"
             api_mode = "anthropic_messages"
-        elif "api.kimi.com/coding" in base_lower:
+        elif configured_api_mode is None and "api.kimi.com/coding" in base_lower:
             provider = "custom"
             api_mode = "anthropic_messages"
 
@@ -2276,6 +2300,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "responses_stateful": configured_responses_stateful,
         }
 
     if not configured_provider:
@@ -2286,6 +2311,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": None,
             "api_key": None,
             "api_mode": None,
+            "responses_stateful": configured_responses_stateful,
         }
 
     # Provider is configured — resolve full credentials
@@ -2313,7 +2339,8 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "provider": runtime.get("provider"),
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
-        "api_mode": runtime.get("api_mode"),
+        "api_mode": configured_api_mode or runtime.get("api_mode"),
+        "responses_stateful": configured_responses_stateful,
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
     }

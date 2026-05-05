@@ -190,7 +190,8 @@ class TestRunBackgroundTask:
             user_name="testuser",
         )
 
-        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": None}):
+        with patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": None}):
             await runner._run_background_task("test prompt", source, "bg_test")
 
         # Should have sent an error message

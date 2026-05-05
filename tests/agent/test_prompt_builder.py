@@ -1044,6 +1044,9 @@ class TestToolUseEnforcementGuidance:
     def test_enforcement_models_includes_grok(self):
         assert "grok" in TOOL_USE_ENFORCEMENT_MODELS
 
+    def test_enforcement_models_includes_qwen(self):
+        assert "qwen" in TOOL_USE_ENFORCEMENT_MODELS
+
     def test_enforcement_models_is_tuple(self):
         assert isinstance(TOOL_USE_ENFORCEMENT_MODELS, tuple)
 
@@ -1086,6 +1089,5 @@ class TestOpenAIModelExecutionGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
 

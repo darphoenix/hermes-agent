@@ -1,0 +1,29 @@
+# TBLite Evaluation -- MLX OpenAI Wrapper (Qwen 3.6)
+#
+# Runs tasks locally against a one-off mlx-openai-wrapper instance.
+
+env:
+  enabled_toolsets: ["terminal", "file"]
+  max_agent_turns: 60
+  max_token_length: 32000
+  agent_temperature: 0.6
+  terminal_backend: "docker"
+  terminal_timeout: 300
+  tool_pool_size: 1
+  dataset_name: "NousResearch/openthoughts-tblite"
+  test_timeout: 600
+  task_timeout: 1200
+  eval_concurrency: 1
+  max_concurrent_tasks: 1
+  tokenizer_name: "NousResearch/Hermes-3-Llama-3.1-8B"
+  use_wandb: false
+  wandb_name: "openthoughts-tblite-qwen36-wrapper"
+  ensure_scores_are_not_same: false
+  data_dir_to_save_evals: "environments/benchmarks/evals/openthoughts-tblite-qwen36-wrapper"
+
+openai:
+  base_url: "http://localhost:1237/v1"
+  model_name: "/Users/karolis/.lmstudio/models/dealignai/Qwen3.6-27B-JANG_4M-CRACK"
+  server_type: "openai"
+  health_check: false
+  api_key: "mlx-key"

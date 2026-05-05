@@ -982,6 +982,12 @@ class TestToolUseEnforcementConfig:
         prompt = agent._build_system_prompt()
         assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
 
+    def test_auto_injects_for_qwen(self):
+        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
+        agent = self._make_agent(model="Qwen3.6-27B-JANG_4M-CRACK", tool_use_enforcement="auto")
+        prompt = agent._build_system_prompt()
+        assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
+
     def test_auto_skips_for_claude(self):
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
         agent = self._make_agent(model="anthropic/claude-sonnet-4", tool_use_enforcement="auto")
@@ -4328,6 +4334,39 @@ class TestStreamingApiCall:
 
         call_kwargs = agent.client.chat.completions.create.call_args
         assert call_kwargs[1].get("stream") is True or call_kwargs.kwargs.get("stream") is True
+
+    def test_local_endpoint_uses_longer_default_stream_read_timeout(self, agent, monkeypatch):
+        monkeypatch.delenv("HERMES_STREAM_READ_TIMEOUT", raising=False)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        chunks = [_make_chunk(content="x"), _make_chunk(finish_reason="stop")]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        agent._interruptible_streaming_api_call({"messages": [], "model": "test"})
+
+        timeout = agent.client.chat.completions.create.call_args.kwargs["timeout"]
+        assert timeout.read == 300.0
+
+    def test_non_local_endpoint_keeps_standard_stream_read_timeout(self, agent, monkeypatch):
+        monkeypatch.delenv("HERMES_STREAM_READ_TIMEOUT", raising=False)
+        agent.base_url = "https://openrouter.ai/api/v1"
+        chunks = [_make_chunk(content="x"), _make_chunk(finish_reason="stop")]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        agent._interruptible_streaming_api_call({"messages": [], "model": "test"})
+
+        timeout = agent.client.chat.completions.create.call_args.kwargs["timeout"]
+        assert timeout.read == 60.0
+
+    def test_explicit_stream_read_timeout_env_overrides_local_default(self, agent, monkeypatch):
+        monkeypatch.setenv("HERMES_STREAM_READ_TIMEOUT", "123")
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        chunks = [_make_chunk(content="x"), _make_chunk(finish_reason="stop")]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        agent._interruptible_streaming_api_call({"messages": [], "model": "test"})
+
+        timeout = agent.client.chat.completions.create.call_args.kwargs["timeout"]
+        assert timeout.read == 123.0
 
     def test_api_exception_propagates_no_non_streaming_fallback(self, agent):
         """When streaming fails before any deltas, error propagates to the main retry loop."""

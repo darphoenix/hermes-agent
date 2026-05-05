@@ -1030,6 +1030,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             base_url=runtime.get("base_url"),
             provider=runtime.get("provider"),
             api_mode=runtime.get("api_mode"),
+            responses_stateful=runtime.get("responses_stateful", False),
             acp_command=runtime.get("command"),
             acp_args=runtime.get("args"),
             max_iterations=max_iterations,

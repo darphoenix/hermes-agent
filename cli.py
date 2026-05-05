@@ -2025,6 +2025,7 @@ class HermesCLI:
         self._provider_source: Optional[str] = None
         self.provider = self.requested_provider
         self.api_mode = "chat_completions"
+        self.responses_stateful = False
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
         self.base_url = (
@@ -3274,6 +3275,7 @@ class HermesCLI:
         base_url = runtime.get("base_url")
         resolved_provider = runtime.get("provider", "openrouter")
         resolved_api_mode = runtime.get("api_mode", self.api_mode)
+        resolved_responses_stateful = bool(runtime.get("responses_stateful", False))
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
@@ -3304,11 +3306,13 @@ class HermesCLI:
         routing_changed = (
             resolved_provider != self.provider
             or resolved_api_mode != self.api_mode
+            or resolved_responses_stateful != getattr(self, "responses_stateful", False)
             or resolved_acp_command != self.acp_command
             or resolved_acp_args != self.acp_args
         )
         self.provider = resolved_provider
         self.api_mode = resolved_api_mode
+        self.responses_stateful = resolved_responses_stateful
         self.acp_command = resolved_acp_command
         self.acp_args = resolved_acp_args
         self._credential_pool = resolved_credential_pool
@@ -3375,6 +3379,7 @@ class HermesCLI:
             "base_url": self.base_url,
             "provider": self.provider,
             "api_mode": self.api_mode,
+            "responses_stateful": getattr(self, "responses_stateful", False),
             "command": self.acp_command,
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
@@ -3387,6 +3392,7 @@ class HermesCLI:
                 runtime["provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
+                bool(runtime["responses_stateful"]),
                 runtime["command"],
                 tuple(runtime["args"]),
             ),
@@ -3487,6 +3493,7 @@ class HermesCLI:
                 "base_url": self.base_url,
                 "provider": self.provider,
                 "api_mode": self.api_mode,
+                "responses_stateful": getattr(self, "responses_stateful", False),
                 "command": self.acp_command,
                 "args": list(self.acp_args or []),
                 "credential_pool": getattr(self, "_credential_pool", None),
@@ -3498,6 +3505,7 @@ class HermesCLI:
                 base_url=runtime.get("base_url"),
                 provider=runtime.get("provider"),
                 api_mode=runtime.get("api_mode"),
+                responses_stateful=runtime.get("responses_stateful", False),
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
@@ -3546,6 +3554,7 @@ class HermesCLI:
                 runtime.get("provider"),
                 runtime.get("base_url"),
                 runtime.get("api_mode"),
+                bool(runtime.get("responses_stateful", False)),
                 runtime.get("command"),
                 tuple(runtime.get("args") or ()),
             )
@@ -5377,6 +5386,8 @@ class HermesCLI:
             self._explicit_base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
+        if result.responses_stateful is not None:
+            self.responses_stateful = result.responses_stateful
 
         if self.agent is not None:
             try:
@@ -5386,6 +5397,7 @@ class HermesCLI:
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    responses_stateful=result.responses_stateful,
                 )
             except Exception as exc:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
@@ -5600,6 +5612,8 @@ class HermesCLI:
             self._explicit_base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
+        if result.responses_stateful is not None:
+            self.responses_stateful = result.responses_stateful
 
         # Apply to running agent (in-place swap)
         if self.agent is not None:
@@ -5610,6 +5624,7 @@ class HermesCLI:
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    responses_stateful=result.responses_stateful,
                 )
             except Exception as exc:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
@@ -6584,11 +6599,43 @@ class HermesCLI:
             _cprint("  (>_<) Cannot start background task: no valid credentials.")
             return
 
+        turn_route = self._resolve_turn_agent_config(prompt)
+        try:
+            from hermes_cli.background_runtime import (
+                BackgroundRuntimeError,
+                resolve_background_runtime,
+            )
+
+            sidecar_route = resolve_background_runtime(
+                "cli_background",
+                parent_model=turn_route["model"],
+                parent_runtime=turn_route["runtime"],
+            )
+            if sidecar_route is not None:
+                sidecar_model, sidecar_runtime = sidecar_route
+                turn_route = {
+                    "model": sidecar_model,
+                    "runtime": sidecar_runtime,
+                    "signature": (
+                        sidecar_model,
+                        sidecar_runtime.get("provider"),
+                        sidecar_runtime.get("base_url"),
+                        sidecar_runtime.get("api_mode"),
+                        bool(sidecar_runtime.get("responses_stateful", False)),
+                        sidecar_runtime.get("command"),
+                        tuple(sidecar_runtime.get("args") or []),
+                    ),
+                    "request_overrides": None,
+                }
+        except BackgroundRuntimeError as exc:
+            _cprint(f"  (>_<) Cannot start background task: {exc}")
+            return
+        except Exception as exc:
+            logger.debug("CLI background sidecar routing failed: %s", exc, exc_info=True)
+
         _cprint(f"  🔄 Background task #{task_num} started: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
         _cprint(f"  Task ID: {task_id}")
         _cprint("  You can continue chatting — results will appear when done.\n")
-
-        turn_route = self._resolve_turn_agent_config(prompt)
 
         def run_background():
             set_sudo_password_callback(self._sudo_password_callback)
@@ -6604,6 +6651,7 @@ class HermesCLI:
                     base_url=turn_route["runtime"].get("base_url"),
                     provider=turn_route["runtime"].get("provider"),
                     api_mode=turn_route["runtime"].get("api_mode"),
+                    responses_stateful=turn_route["runtime"].get("responses_stateful", False),
                     acp_command=turn_route["runtime"].get("command"),
                     acp_args=turn_route["runtime"].get("args"),
                     max_iterations=self.max_turns,
@@ -6710,7 +6758,6 @@ class HermesCLI:
         thread = threading.Thread(target=run_background, daemon=True, name=f"bg-task-{task_id}")
         self._background_tasks[task_id] = thread
         thread.start()
-
     @staticmethod
     def _try_launch_chrome_debug(port: int, system: str) -> bool:
         """Try to launch Chrome/Chromium with remote debugging enabled.

@@ -380,6 +380,33 @@ class DockerEnvironment(BaseEnvironment):
             if not bind_host_cwd and not workspace_explicitly_mounted:
                 self._workspace_dir = str(sandbox / "workspace")
                 os.makedirs(self._workspace_dir, exist_ok=True)
+                # Seed host workspace from image so bind-mount doesn't shadow
+                # benchmark task data already present under /workspace.
+                if not os.listdir(self._workspace_dir):
+                    _docker = find_docker() or "docker"
+                    seed_name = f"_seed-{task_id[:12]}"
+                    try:
+                        subprocess.run(
+                            [_docker, "create", "--name", seed_name, image],
+                            capture_output=True,
+                            text=True,
+                            timeout=60,
+                        )
+                        subprocess.run(
+                            [_docker, "cp", f"{seed_name}:/workspace/.", self._workspace_dir],
+                            capture_output=True,
+                            text=True,
+                            timeout=60,
+                        )
+                    except Exception as e:
+                        logger.debug("Workspace seed from image failed (ok if empty): %s", e)
+                    finally:
+                        subprocess.run(
+                            [_docker, "rm", "-f", seed_name],
+                            capture_output=True,
+                            text=True,
+                            timeout=15,
+                        )
                 writable_args.extend([
                     "-v", f"{self._workspace_dir}:/workspace",
                 ])

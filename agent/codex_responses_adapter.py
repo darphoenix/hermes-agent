@@ -668,23 +668,29 @@ def _preflight_codex_api_kwargs(
             )
 
     store = api_kwargs.get("store", False)
-    if store is not False:
-        raise ValueError("Codex Responses contract requires 'store' to be false.")
+    if not isinstance(store, bool):
+        raise ValueError("Codex Responses request 'store' must be a boolean when provided.")
 
     allowed_keys = {
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
-        "extra_headers",
+        "previous_response_id", "extra_headers",
     }
     normalized: Dict[str, Any] = {
         "model": model,
         "instructions": instructions,
         "input": normalized_input,
-        "store": False,
+        "store": store,
     }
     if normalized_tools is not None:
         normalized["tools"] = normalized_tools
+
+    previous_response_id = api_kwargs.get("previous_response_id")
+    if previous_response_id is not None:
+        if not isinstance(previous_response_id, str) or not previous_response_id.strip():
+            raise ValueError("Codex Responses 'previous_response_id' must be a non-empty string.")
+        normalized["previous_response_id"] = previous_response_id.strip()
 
     # Pass through reasoning config
     reasoning = api_kwargs.get("reasoning")
@@ -838,7 +844,16 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
         else:
             item_status = None
 
-        if item_status in {"queued", "in_progress", "incomplete"}:
+        # Some Responses stream SDK paths preserve the initial
+        # response.output_item.added payload (status=in_progress) even after a
+        # terminal response.completed event.  The top-level response status is
+        # authoritative in that case; otherwise Hermes will inject a needless
+        # continuation after a finished answer.
+        effective_item_status = item_status
+        if response_status == "completed" and item_status in {"queued", "in_progress", "incomplete"}:
+            effective_item_status = "completed"
+
+        if effective_item_status in {"queued", "in_progress", "incomplete"}:
             has_incomplete_items = True
 
         if item_type == "message":
@@ -856,7 +871,7 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
                 raw_message_item: Dict[str, Any] = {
                     "type": "message",
                     "role": "assistant",
-                    "status": _normalize_responses_message_status(item_status),
+                    "status": _normalize_responses_message_status(effective_item_status),
                     "content": [{"type": "output_text", "text": message_text}],
                 }
                 item_id = getattr(item, "id", None)
@@ -889,7 +904,7 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
                     raw_item["summary"] = raw_summary
                 reasoning_items_raw.append(raw_item)
         elif item_type == "function_call":
-            if item_status in {"queued", "in_progress", "incomplete"}:
+            if effective_item_status in {"queued", "in_progress", "incomplete"}:
                 continue
             fn_name = getattr(item, "name", "") or ""
             arguments = getattr(item, "arguments", "{}")
@@ -912,6 +927,8 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
                 function=SimpleNamespace(name=fn_name, arguments=arguments),
             ))
         elif item_type == "custom_tool_call":
+            if effective_item_status in {"queued", "in_progress", "incomplete"}:
+                continue
             fn_name = getattr(item, "name", "") or ""
             arguments = getattr(item, "input", "{}")
             if not isinstance(arguments, str):
@@ -978,6 +995,7 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
         reasoning_details=None,
         codex_reasoning_items=reasoning_items_raw or None,
         codex_message_items=message_items_raw or None,
+        responses_response_id=getattr(response, "id", None),
     )
 
     if tool_calls:

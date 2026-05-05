@@ -6,6 +6,7 @@ rather than leaving zombie processes or telling users to manually restart
 when launchd will auto-respawn.
 """
 
+import plistlib
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
@@ -130,6 +131,15 @@ class TestLaunchdPlistReplace:
     def test_plist_contains_replace_flag(self):
         plist = gateway_cli.generate_launchd_plist()
         assert "--replace" in plist
+
+    def test_plist_uses_unconditional_keepalive_with_throttle(self):
+        plist = gateway_cli.generate_launchd_plist()
+        parsed = plistlib.loads(plist.encode("utf-8"))
+
+        assert parsed["KeepAlive"] is True
+        assert parsed["ThrottleInterval"] == 30
+        assert parsed["StartInterval"] == 30
+        assert "SuccessfulExit" not in plist
 
     def test_plist_program_arguments_order(self):
         """--replace comes after 'run' in the ProgramArguments."""

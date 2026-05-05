@@ -768,6 +768,27 @@ def _resolve_review_model(cfg: Dict[str, Any]) -> tuple[str, str]:
     return _main_provider, _main_model
 
 
+def _has_explicit_curator_runtime(cfg: Dict[str, Any]) -> bool:
+    """Return True when auxiliary.curator or legacy curator config is explicit.
+
+    Explicit per-task auxiliary settings should win over the shared sidecar
+    route, matching the normal auxiliary client precedence.
+    """
+    _aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+    _cur_task = _aux.get("curator", {}) if isinstance(_aux.get("curator"), dict) else {}
+    _task_provider = str(_cur_task.get("provider") or "").strip()
+    _task_model = str(_cur_task.get("model") or "").strip()
+    _task_base_url = str(_cur_task.get("base_url") or "").strip()
+    if _task_base_url:
+        return True
+    if _task_provider and _task_provider != "auto" and _task_model:
+        return True
+
+    _cur = cfg.get("curator", {}) if isinstance(cfg.get("curator"), dict) else {}
+    _legacy = _cur.get("auxiliary", {}) if isinstance(_cur.get("auxiliary"), dict) else {}
+    return bool(_legacy.get("provider") and _legacy.get("model"))
+
+
 def _run_llm_review(prompt: str) -> Dict[str, Any]:
     """Spawn an AIAgent fork to run the curator review prompt.
 
@@ -811,6 +832,8 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     _api_key = None
     _base_url = None
     _api_mode = None
+    _responses_stateful = False
+    _credential_pool = None
     _resolved_provider = None
     _model_name = ""
     try:
@@ -821,10 +844,35 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         _rp = resolve_runtime_provider(
             requested=_provider, target_model=_model_name
         )
-        _api_key = _rp.get("api_key")
-        _base_url = _rp.get("base_url")
-        _api_mode = _rp.get("api_mode")
-        _resolved_provider = _rp.get("provider") or _provider
+        _runtime = dict(_rp)
+
+        if not _has_explicit_curator_runtime(_cfg):
+            try:
+                from hermes_cli.background_runtime import (
+                    BackgroundRuntimeError,
+                    resolve_background_runtime,
+                )
+
+                _sidecar = resolve_background_runtime(
+                    "auxiliary:curator",
+                    parent_model=_model_name,
+                    parent_runtime=_rp,
+                    config=_cfg,
+                    force_stateless=True,
+                )
+                if _sidecar is not None:
+                    _model_name, _runtime = _sidecar
+            except BackgroundRuntimeError as e:
+                result_meta["error"] = f"background runtime error: {e}"
+                result_meta["summary"] = result_meta["error"]
+                return result_meta
+
+        _api_key = _runtime.get("api_key")
+        _base_url = _runtime.get("base_url")
+        _api_mode = _runtime.get("api_mode")
+        _resolved_provider = _runtime.get("provider") or _provider
+        _responses_stateful = bool(_runtime.get("responses_stateful", False))
+        _credential_pool = _runtime.get("credential_pool")
     except Exception as e:
         logger.debug("Curator provider resolution failed: %s", e, exc_info=True)
 
@@ -839,6 +887,8 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             api_key=_api_key,
             base_url=_base_url,
             api_mode=_api_mode,
+            responses_stateful=_responses_stateful,
+            credential_pool=_credential_pool,
             # Umbrella-building over a large skill collection is worth a
             # high iteration ceiling — the pass typically takes 50-100
             # API calls against hundreds of candidate skills. The

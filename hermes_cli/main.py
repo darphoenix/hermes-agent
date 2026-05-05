@@ -7999,6 +7999,93 @@ def main():
     chat_parser.set_defaults(func=cmd_chat)
 
     # =========================================================================
+    # tui command
+    # =========================================================================
+    tui_parser = subparsers.add_parser(
+        "tui",
+        help="Launch the modern TUI",
+        description="Start Hermes Agent in the modern terminal UI. Equivalent to `hermes --tui`.",
+    )
+    tui_parser.add_argument(
+        "-m",
+        "--model",
+        default=None,
+        help="Model override for this invocation",
+    )
+    tui_parser.add_argument(
+        "--provider",
+        default=None,
+        help="Inference provider override for this invocation",
+    )
+    tui_parser.add_argument(
+        "-t",
+        "--toolsets",
+        default=None,
+        help="Comma-separated toolsets to enable",
+    )
+    tui_parser.add_argument(
+        "--resume",
+        "-r",
+        metavar="SESSION",
+        default=None,
+        help="Resume a previous session by ID or title",
+    )
+    tui_parser.add_argument(
+        "--continue",
+        "-c",
+        dest="continue_last",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="SESSION_NAME",
+        help="Resume a session by name, or the most recent if no name given",
+    )
+    tui_parser.add_argument(
+        "--dev",
+        dest="tui_dev",
+        action="store_true",
+        default=False,
+        help="Run TypeScript sources via tsx (skip dist build)",
+    )
+    tui_parser.add_argument(
+        "--yolo",
+        action="store_true",
+        default=False,
+        help="Bypass all dangerous command approval prompts (use at your own risk)",
+    )
+    tui_parser.add_argument(
+        "--accept-hooks",
+        action="store_true",
+        default=False,
+        help="Auto-approve any unseen shell hooks declared in config.yaml",
+    )
+    tui_parser.add_argument(
+        "--ignore-user-config",
+        action="store_true",
+        default=False,
+        help="Ignore ~/.hermes/config.yaml and fall back to built-in defaults",
+    )
+    tui_parser.add_argument(
+        "--ignore-rules",
+        action="store_true",
+        default=False,
+        help="Skip auto-injection of AGENTS.md, SOUL.md, .cursorrules, memory, and preloaded skills",
+    )
+    tui_parser.set_defaults(
+        func=cmd_chat,
+        tui=True,
+        query=None,
+        image=None,
+        verbose=False,
+        quiet=False,
+        source=None,
+        worktree=False,
+        checkpoints=False,
+        pass_session_id=False,
+        max_turns=None,
+    )
+
+    # =========================================================================
     # model command
     # =========================================================================
     model_parser = subparsers.add_parser(
@@ -10180,7 +10267,7 @@ Examples:
     # trigger consent prompts for hooks the user is still inspecting.
     # Groups with mixed admin/CRUD vs. agent-running entries narrow via
     # the nested subcommand (dest varies by parser).
-    _AGENT_COMMANDS = {None, "chat", "acp", "rl"}
+    _AGENT_COMMANDS = {None, "chat", "tui", "acp", "rl"}
     _AGENT_SUBCOMMANDS = {
         "cron":    ("cron_command",    {"run", "tick"}),
         "gateway": ("gateway_command", {"run"}),

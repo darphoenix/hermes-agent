@@ -1,0 +1,23 @@
+FROM ubuntu:22.04
+
+# Pre-install common test dependencies so test.sh scripts
+# don't need network access at runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    git \
+    python3 \
+    python3-pip \
+    python3-venv \
+    acl \
+    sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (Python package manager)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Pre-install pytest so test.sh doesn't need to
+RUN uv pip install --system pytest
+
+WORKDIR /app

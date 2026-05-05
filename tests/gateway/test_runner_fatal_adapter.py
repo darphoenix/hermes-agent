@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.run import GatewayRunner
@@ -67,8 +68,7 @@ async def test_runner_requests_clean_exit_for_nonretryable_startup_conflict(monk
 
 @pytest.mark.asyncio
 async def test_runner_queues_retryable_runtime_fatal_for_reconnection(monkeypatch, tmp_path):
-    """Retryable runtime fatal errors queue the platform for reconnection
-    instead of shutting down the gateway."""
+    """Linux/systemd exits on retryable runtime fatal errors so the service restarts."""
     config = GatewayConfig(
         platforms={
             Platform.WHATSAPP: PlatformConfig(enabled=True, token="token")
@@ -86,11 +86,43 @@ async def test_runner_queues_retryable_runtime_fatal_for_reconnection(monkeypatc
     runner.adapters = {Platform.WHATSAPP: adapter}
     runner.delivery_router.adapters = runner.adapters
     runner.stop = AsyncMock()
+    monkeypatch.setattr(gateway_run.sys, "platform", "linux")
 
     await runner._handle_adapter_fatal_error(adapter)
 
     # Should shut down with failure — systemd Restart=on-failure will restart
     runner.stop.assert_awaited_once()
     assert runner._exit_with_failure is True
+    assert Platform.WHATSAPP in runner._failed_platforms
+    assert runner._failed_platforms[Platform.WHATSAPP]["attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_macos_gateway_alive_for_retryable_runtime_fatal(monkeypatch, tmp_path):
+    """macOS launchd can leave retryable exits pended; keep the process alive
+    so Hermes' own reconnect loop can recover."""
+    config = GatewayConfig(
+        platforms={
+            Platform.WHATSAPP: PlatformConfig(enabled=True, token="token")
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    adapter = _RuntimeRetryableAdapter()
+    adapter._set_fatal_error(
+        "whatsapp_bridge_exited",
+        "WhatsApp bridge process exited unexpectedly (code 1).",
+        retryable=True,
+    )
+
+    runner.adapters = {Platform.WHATSAPP: adapter}
+    runner.delivery_router.adapters = runner.adapters
+    runner.stop = AsyncMock()
+    monkeypatch.setattr(gateway_run.sys, "platform", "darwin")
+
+    await runner._handle_adapter_fatal_error(adapter)
+
+    runner.stop.assert_not_awaited()
+    assert runner._exit_with_failure is False
     assert Platform.WHATSAPP in runner._failed_platforms
     assert runner._failed_platforms[Platform.WHATSAPP]["attempts"] == 0

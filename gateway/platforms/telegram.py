@@ -1080,6 +1080,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
                     for chunk in chunks
                 ]
+                logger.info(
+                    "[%s] Split response into %d Telegram chunks "
+                    "(raw_chars=%d formatted_utf16=%d chunk_utf16=%s)",
+                    self.name,
+                    len(chunks),
+                    len(content),
+                    utf16_len(formatted),
+                    [utf16_len(chunk) for chunk in chunks],
+                )
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)

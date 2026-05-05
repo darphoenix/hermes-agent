@@ -79,6 +79,28 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
     return agent
 
 
+def _build_stateful_custom_agent(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+
+    agent = run_agent.AIAgent(
+        model="local-qwopus",
+        provider="custom",
+        api_mode="codex_responses",
+        responses_stateful=True,
+        base_url="http://127.0.0.1:1236/v1",
+        api_key="no-key-required",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cleanup_task_resources = lambda task_id: None
+    agent._persist_session = lambda messages, history=None: None
+    agent._save_trajectory = lambda messages, user_message, completed: None
+    agent._save_session_log = lambda messages: None
+    return agent
+
+
 def _codex_message_response(text: str):
     return SimpleNamespace(
         output=[
@@ -398,6 +420,71 @@ def test_build_api_kwargs_copilot_responses_omits_reasoning_for_non_reasoning_mo
     assert "prompt_cache_key" not in kwargs
 
 
+def test_build_api_kwargs_stateful_custom_initial_request(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ]
+    )
+
+    assert kwargs["store"] is True
+    assert kwargs["parallel_tool_calls"] is False
+    assert "previous_response_id" not in kwargs
+    assert "prompt_cache_key" not in kwargs
+    assert kwargs["input"] == [{"role": "user", "content": "Ping"}]
+
+
+def test_build_api_kwargs_stateful_custom_followup_uses_previous_response_id(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._responses_previous_response_id = "resp_prev"
+
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "First"},
+            {"role": "assistant", "content": "Ack", "responses_response_id": "resp_prev"},
+            {"role": "user", "content": "Next"},
+        ]
+    )
+
+    assert kwargs["store"] is True
+    assert kwargs["parallel_tool_calls"] is False
+    assert kwargs["previous_response_id"] == "resp_prev"
+    assert kwargs["input"] == [{"role": "user", "content": "Next"}]
+
+
+def test_preflight_codex_api_kwargs_allows_stateful_fields_when_enabled(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+
+    result = agent._preflight_codex_api_kwargs(
+        {
+            "model": "local-qwopus",
+            "instructions": "You are Hermes.",
+            "input": [{"role": "user", "content": "Next"}],
+            "store": True,
+            "previous_response_id": "resp_prev",
+        }
+    )
+
+    assert result["store"] is True
+    assert result["previous_response_id"] == "resp_prev"
+
+
+def test_normalize_codex_response_persists_stateful_response_id(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    response = _codex_message_response("hi")
+    response.id = "resp_123"
+
+    assistant_message, finish_reason = agent._normalize_codex_response(response)
+    msg = agent._build_assistant_message(assistant_message, finish_reason)
+
+    assert msg["responses_response_id"] == "resp_123"
+    assert agent._responses_previous_response_id == "resp_123"
+
+
 def test_run_codex_stream_retries_when_completed_event_missing(monkeypatch):
     agent = _build_agent(monkeypatch)
     calls = {"stream": 0}
@@ -704,7 +791,7 @@ def test_run_conversation_codex_tool_round_trip(monkeypatch):
     responses = [_codex_tool_call_response(), _codex_message_response("done")]
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id):
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
         for call in assistant_message.tool_calls:
             messages.append(
                 {
@@ -872,7 +959,7 @@ def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):
 
     monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
 
-    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id):
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
         for call in assistant_message.tool_calls:
             messages.append(
                 {
@@ -968,6 +1055,58 @@ def test_normalize_codex_response_preserves_message_status_for_replay(monkeypatc
     assert finish_reason == "incomplete"
     assert assistant_message.codex_message_items[0]["id"] == "msg_partial"
     assert assistant_message.codex_message_items[0]["status"] == "in_progress"
+
+
+def test_normalize_codex_response_completed_status_overrides_stale_stream_item_status(monkeypatch):
+    """A terminal completed response should not be continued just because the
+    SDK left the message item at its earlier output_item.added status."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                id="msg_done",
+                status="in_progress",
+                content=[SimpleNamespace(type="output_text", text="Done. Everything is saved.")],
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=4, output_tokens=2, total_tokens=6),
+        status="completed",
+        model="gpt-5-codex",
+    )
+
+    assistant_message, finish_reason = _normalize_codex_response(response)
+
+    assert finish_reason == "stop"
+    assert assistant_message.content == "Done. Everything is saved."
+    assert assistant_message.codex_message_items[0]["status"] == "completed"
+
+
+def test_codex_stream_done_items_replace_stale_added_items(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    final_response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                id="msg_done",
+                status="in_progress",
+                content=[],
+            )
+        ]
+    )
+    done_item = SimpleNamespace(
+        type="message",
+        id="msg_done",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="Done.")],
+    )
+
+    agent._merge_codex_stream_done_items(final_response, [done_item])
+
+    assert final_response.output[0].status == "completed"
+    assert final_response.output[0].content[0].text == "Done."
 
 
 def test_normalize_codex_response_detects_leaked_tool_call_text(monkeypatch):
@@ -1366,6 +1505,150 @@ def test_run_conversation_codex_continues_after_ack_for_directory_listing_prompt
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
 
 
+def test_run_conversation_codex_continues_after_investigate_ack(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_ack_message_response(
+            "Great question. Let me investigate what's actually on this machine."
+        ),
+        _codex_tool_call_response(),
+        _codex_message_response("Machine survey complete."),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation(
+        "Look at the Mac you are running on and trending GitHub repos; "
+        "what else could I run here?"
+    )
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Machine survey complete."
+    assert any(
+        msg.get("role") == "assistant"
+        and msg.get("finish_reason") == "incomplete"
+        and "Let me investigate" in (msg.get("content") or "")
+        for msg in result["messages"]
+    )
+    assert any(
+        msg.get("role") == "user"
+        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
+        for msg in result["messages"]
+    )
+    assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
+
+
+def test_run_conversation_codex_continues_file_ack_with_prior_tool_history(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_ack_message_response(
+            "Let me check what's already in soul.md first:"
+        ),
+        _codex_tool_call_response(),
+        _codex_message_response("Soul file checked."),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    history = [
+        {"role": "user", "content": "old task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_old",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_old", "content": '{"ok":true}'},
+        {"role": "assistant", "content": "Old task done."},
+    ]
+
+    result = agent.run_conversation(
+        "There is a soul.md file, do you want to save anything into it?",
+        conversation_history=history,
+    )
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Soul file checked."
+    assert any(
+        msg.get("role") == "assistant"
+        and msg.get("finish_reason") == "incomplete"
+        and "soul.md" in (msg.get("content") or "")
+        for msg in result["messages"]
+    )
+    assert any(
+        msg.get("role") == "user"
+        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
+        for msg in result["messages"]
+    )
+
+
+def test_run_conversation_codex_continues_after_post_tool_dangling_intro(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_tool_call_response(),
+        _codex_ack_message_response(
+            "Got it. It's currently empty. Here's what I'd write into my soul:"
+        ),
+        _codex_message_response("Soul content written."),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"content":"# empty","truncated":false}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("Did u read it?")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Soul content written."
+    assert any(
+        msg.get("role") == "assistant"
+        and msg.get("finish_reason") == "incomplete"
+        and "Here's what I'd write" in (msg.get("content") or "")
+        for msg in result["messages"]
+    )
+    assert any(
+        msg.get("role") == "user"
+        and "promised content directly" in (msg.get("content") or "")
+        for msg in result["messages"]
+    )
+
+
 def test_dump_api_request_debug_uses_responses_url(monkeypatch, tmp_path):
     """Debug dumps should show /responses URL when in codex_responses mode."""
     import json
@@ -1492,6 +1775,111 @@ def test_run_conversation_codex_continues_after_reasoning_only_response(monkeypa
         and msg.get("codex_reasoning_items") is not None
         for msg in result["messages"]
     )
+
+
+def test_stateful_empty_after_tools_replays_synthetic_empty_delta(monkeypatch):
+    """Post-tool empty nudge must preserve Hermes' synthetic local transcript."""
+    agent = _build_stateful_custom_agent(monkeypatch)
+
+    tool_response = _codex_tool_call_response()
+    tool_response.id = "resp_tool"
+    empty_response = SimpleNamespace(
+        id="resp_empty",
+        output=[
+            SimpleNamespace(
+                type="reasoning",
+                summary=[SimpleNamespace(type="summary_text", text="Thinking...")],
+                status="completed",
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=50, output_tokens=100, total_tokens=150),
+        status="completed",
+        model="local-qwopus",
+    )
+    final_response = _codex_message_response("done")
+    final_response.id = "resp_final"
+    responses = [tool_response, empty_response, final_response]
+    requests = []
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("run a command")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "done"
+    empty_messages = [
+        msg for msg in result["messages"]
+        if msg.get("role") == "assistant" and msg.get("content") == "(empty)"
+    ]
+    assert len(empty_messages) == 1
+    assert empty_messages[0].get("responses_response_id") == "resp_empty"
+    assert not empty_messages[0].get("tool_calls")
+    assert requests[1].get("previous_response_id") == "resp_tool"
+    assert requests[2].get("previous_response_id") == "resp_tool"
+    assert requests[2]["input"][0]["type"] == "function_call_output"
+    assert requests[2]["input"][1] == {"role": "assistant", "content": "(empty)"}
+    assert requests[2]["input"][2]["role"] == "user"
+
+
+def test_post_tool_empty_nudge_does_not_consume_iteration_budget(monkeypatch):
+    """A recovery nudge after tool output should not make the final turn look over budget."""
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent.max_iterations = 3
+
+    tool_response = _codex_tool_call_response()
+    tool_response.id = "resp_tool"
+    empty_response = SimpleNamespace(
+        id="resp_empty",
+        output=[],
+        usage=SimpleNamespace(input_tokens=50, output_tokens=0, total_tokens=50),
+        status="completed",
+        model="local-qwopus",
+    )
+    final_response = _codex_message_response("done")
+    final_response.id = "resp_final"
+    responses = [tool_response, empty_response, final_response]
+    requests = []
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("run a command")
+
+    assert len(requests) == 3
+    assert result["completed"] is True
+    assert result["api_calls"] == 2
+    assert result["final_response"] == "done"
 
 
 def test_run_conversation_codex_preserves_encrypted_reasoning_in_interim(monkeypatch):

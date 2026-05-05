@@ -42,6 +42,7 @@ def _make_mock_parent(depth=0):
     parent.api_key="***"
     parent.provider = "openrouter"
     parent.api_mode = "chat_completions"
+    parent.responses_stateful = False
     parent.model = "anthropic/claude-sonnet-4"
     parent.platform = "cli"
     parent.providers_allowed = None
@@ -801,6 +802,22 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_key"], "local-key")
         self.assertEqual(creds["api_mode"], "chat_completions")
 
+    def test_direct_endpoint_can_force_codex_responses_stateful(self):
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "local-qwen",
+            "base_url": "http://127.0.0.1:1237/v1",
+            "api_key": "local-key",
+            "api_mode": "codex_responses",
+            "responses_stateful": True,
+        }
+        creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["provider"], "custom")
+        self.assertEqual(creds["base_url"], "http://127.0.0.1:1237/v1")
+        self.assertEqual(creds["api_key"], "local-key")
+        self.assertEqual(creds["api_mode"], "codex_responses")
+        self.assertTrue(creds["responses_stateful"])
+
     def test_direct_endpoint_falls_back_to_openai_api_key_env(self):
         parent = _make_mock_parent(depth=0)
         cfg = {
@@ -972,6 +989,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             "base_url": "http://localhost:1234/v1",
             "api_key": "local-key",
             "api_mode": "chat_completions",
+            "responses_stateful": None,
         }
         parent = _make_mock_parent(depth=0)
 
@@ -990,6 +1008,44 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["base_url"], "http://localhost:1234/v1")
             self.assertEqual(kwargs["api_key"], "local-key")
             self.assertEqual(kwargs["api_mode"], "chat_completions")
+            self.assertFalse(kwargs["responses_stateful"])
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_direct_endpoint_stateful_responses_reach_child_agent(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "local-qwen",
+            "base_url": "http://127.0.0.1:1237/v1",
+            "api_key": "local-key",
+            "api_mode": "codex_responses",
+            "responses_stateful": True,
+        }
+        mock_creds.return_value = {
+            "model": "local-qwen",
+            "provider": "custom",
+            "base_url": "http://127.0.0.1:1237/v1",
+            "api_key": "local-key",
+            "api_mode": "codex_responses",
+            "responses_stateful": True,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Stateful endpoint test", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["model"], "local-qwen")
+            self.assertEqual(kwargs["provider"], "custom")
+            self.assertEqual(kwargs["base_url"], "http://127.0.0.1:1237/v1")
+            self.assertEqual(kwargs["api_mode"], "codex_responses")
+            self.assertTrue(kwargs["responses_stateful"])
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -1002,8 +1058,10 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             "base_url": None,
             "api_key": None,
             "api_mode": None,
+            "responses_stateful": None,
         }
         parent = _make_mock_parent(depth=0)
+        parent.responses_stateful = True
 
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
@@ -1018,6 +1076,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["model"], parent.model)
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["base_url"], parent.base_url)
+            self.assertTrue(kwargs["responses_stateful"])
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")

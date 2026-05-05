@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import re
+import html
 import asyncio
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx
@@ -1071,6 +1072,73 @@ async def _parallel_extract(urls: List[str]) -> List[Dict[str, Any]]:
     return results
 
 
+def _duckduckgo_search(query: str, limit: int = 5) -> dict:
+    """
+    Search DuckDuckGo via curl + HTML parsing.
+    No API key needed. No Docker. No external dependencies beyond curl.
+    
+    Returns dict matching the web_search_tool format.
+    """
+    import subprocess
+    import urllib.parse
+    
+    user_agent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    url = f'https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}'
+    
+    try:
+        result = subprocess.run(
+            ['curl', '-s', url,
+             '-H', f'User-Agent: {user_agent}',
+             '-H', 'Accept: text/html,application/xhtml+xml',
+             '-H', 'Accept-Language: en-US,en;q=0.9'],
+            capture_output=True, text=True, timeout=15
+        )
+        
+        if result.returncode != 0:
+            return {'success': False, 'error': f'curl failed: {result.stderr}'}
+        
+        content = result.stdout
+        
+        # Check for CAPTCHA
+        if 'challenge' in content.lower() or 'verify' in content.lower():
+            return {'success': False, 'error': 'CAPTCHA detected'}
+        
+        # Extract results
+        results = []
+        blocks = re.findall(
+            r'<h2 class="result__title">\s*<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]*)</a>.*?<a class="result__snippet"[^>]*>(.*?)</a>',
+            content, re.DOTALL
+        )
+        
+        for i, (ddg_url, title, snippet) in enumerate(blocks[:limit]):
+            # Clean URL
+            clean_url = re.sub(r'//duckduckgo\.com/l/\?uddg=', '', ddg_url)
+            clean_url = html.unescape(clean_url)
+            clean_url = urllib.parse.unquote(clean_url)
+            clean_url = re.sub(r'&rut=[^&"]*$', '', clean_url)
+            
+            # Clean snippet
+            snippet = re.sub(r'<[^>]+>', '', snippet)
+            snippet = html.unescape(snippet).strip()[:200]
+            
+            results.append({
+                'title': html.unescape(title.strip()),
+                'url': clean_url,
+                'description': snippet,
+                'position': i + 1
+            })
+        
+        return {
+            'success': True,
+            'data': {'web': results}
+        }
+        
+    except subprocess.TimeoutExpired:
+        return {'success': False, 'error': 'Search timed out'}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
 def web_search_tool(query: str, limit: int = 5) -> str:
     """
     Search the web for information using available search API backend.
@@ -1163,37 +1231,49 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             _debug.save()
             return result_json
 
-        logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
+        # Check if any backend is actually available
+        if _is_backend_available(backend):
+            logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
 
-        response = _get_firecrawl_client().search(
-            query=query,
-            limit=limit
-        )
+            response = _get_firecrawl_client().search(
+                query=query,
+                limit=limit
+            )
 
-        web_results = _extract_web_search_results(response)
-        results_count = len(web_results)
-        logger.info("Found %d search results", results_count)
-        
-        # Build response with just search metadata (URLs, titles, descriptions)
-        response_data = {
-            "success": True,
-            "data": {
-                "web": web_results
+            web_results = _extract_web_search_results(response)
+            results_count = len(web_results)
+            logger.info("Found %d search results", results_count)
+            
+            # Build response with just search metadata (URLs, titles, descriptions)
+            response_data = {
+                "success": True,
+                "data": {
+                    "web": web_results
+                }
             }
-        }
+            
+            # Capture debug information
+            debug_call_data["results_count"] = results_count
+            
+            # Convert to JSON
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            
+            debug_call_data["final_response_size"] = len(result_json)
+            
+            # Log debug information
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            
+            return result_json
         
-        # Capture debug information
-        debug_call_data["results_count"] = results_count
-        
-        # Convert to JSON
+        # Fallback to DuckDuckGo when no API key is configured
+        logger.info("No search API key configured, falling back to DuckDuckGo: '%s' (limit: %d)", query, limit)
+        response_data = _duckduckgo_search(query, limit)
+        debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-        
         debug_call_data["final_response_size"] = len(result_json)
-        
-        # Log debug information
         _debug.log_call("web_search_tool", debug_call_data)
         _debug.save()
-        
         return result_json
         
     except Exception as e:
@@ -1965,11 +2045,18 @@ def check_firecrawl_api_key() -> bool:
 
 
 def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available."""
+    """Check whether the configured web backend is available.
+    
+    Returns True if any backend is configured, OR if DuckDuckGo fallback
+    is available (which it always is, since it's curl-based).
+    """
     configured = _load_web_config().get("backend", "").lower().strip()
     if configured in ("exa", "parallel", "firecrawl", "tavily"):
         return _is_backend_available(configured)
-    return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
+    if any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily")):
+        return True
+    # DuckDuckGo fallback is always available (curl-based, no API key needed)
+    return True
 
 
 def check_auxiliary_model() -> bool:

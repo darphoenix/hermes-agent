@@ -265,17 +265,20 @@ class HermesAgentLoop:
             # hermes-agent's standalone parsers. This handles the case where
             # ManagedServer's ToolCallTranslator couldn't parse because vLLM
             # isn't installed.
+            # Also check reasoning_content for tool calls (thinking-mode models
+            # may put tool calls there with empty content).
+            _fallback_text = assistant_msg.content or reasoning or ""
             if (
                 not assistant_msg.tool_calls
-                and assistant_msg.content
+                and _fallback_text
                 and self.tool_schemas
-                and "<tool_call>" in (assistant_msg.content or "")
+                and "<tool_call>" in _fallback_text
             ):
                 try:
                     from environments.tool_call_parsers import get_parser
                     fallback_parser = get_parser("hermes")
                     parsed_content, parsed_calls = fallback_parser.parse(
-                        assistant_msg.content
+                        _fallback_text
                     )
                     if parsed_calls:
                         assistant_msg.tool_calls = parsed_calls
@@ -293,7 +296,7 @@ class HermesAgentLoop:
                 # (OpenAI API) or dicts (vLLM ToolCallTranslator).
                 def _tc_to_dict(tc):
                     if isinstance(tc, dict):
-                        return {
+                        tc_dict = {
                             "id": tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
                             "type": "function",
                             "function": {
@@ -301,7 +304,14 @@ class HermesAgentLoop:
                                 "arguments": tc.get("function", {}).get("arguments", tc.get("arguments", "{}")),
                             },
                         }
-                    return {
+                        call_id = tc.get("call_id")
+                        if isinstance(call_id, str) and call_id.strip():
+                            tc_dict["call_id"] = call_id.strip()
+                        response_item_id = tc.get("response_item_id")
+                        if isinstance(response_item_id, str) and response_item_id.strip():
+                            tc_dict["response_item_id"] = response_item_id.strip()
+                        return tc_dict
+                    tc_dict = {
                         "id": tc.id,
                         "type": "function",
                         "function": {
@@ -309,6 +319,13 @@ class HermesAgentLoop:
                             "arguments": tc.function.arguments,
                         },
                     }
+                    call_id = getattr(tc, "call_id", None)
+                    if isinstance(call_id, str) and call_id.strip():
+                        tc_dict["call_id"] = call_id.strip()
+                    response_item_id = getattr(tc, "response_item_id", None)
+                    if isinstance(response_item_id, str) and response_item_id.strip():
+                        tc_dict["response_item_id"] = response_item_id.strip()
+                    return tc_dict
 
                 # Build the assistant message dict for conversation history
                 msg_dict: Dict[str, Any] = {
@@ -322,6 +339,14 @@ class HermesAgentLoop:
                 # for history vs. the latest turn based on this field)
                 if reasoning:
                     msg_dict["reasoning_content"] = reasoning
+
+                responses_response_id = getattr(assistant_msg, "responses_response_id", None)
+                if isinstance(responses_response_id, str) and responses_response_id.strip():
+                    msg_dict["responses_response_id"] = responses_response_id.strip()
+
+                codex_reasoning_items = getattr(assistant_msg, "codex_reasoning_items", None)
+                if isinstance(codex_reasoning_items, list) and codex_reasoning_items:
+                    msg_dict["codex_reasoning_items"] = codex_reasoning_items
 
                 messages.append(msg_dict)
 
@@ -494,6 +519,12 @@ class HermesAgentLoop:
                 }
                 if reasoning:
                     msg_dict["reasoning_content"] = reasoning
+                responses_response_id = getattr(assistant_msg, "responses_response_id", None)
+                if isinstance(responses_response_id, str) and responses_response_id.strip():
+                    msg_dict["responses_response_id"] = responses_response_id.strip()
+                codex_reasoning_items = getattr(assistant_msg, "codex_reasoning_items", None)
+                if isinstance(codex_reasoning_items, list) and codex_reasoning_items:
+                    msg_dict["codex_reasoning_items"] = codex_reasoning_items
                 messages.append(msg_dict)
 
                 turn_elapsed = _time.monotonic() - turn_start

@@ -14,6 +14,7 @@ def _bare_agent() -> AIAgent:
     agent.base_url = ""
     agent.api_key = ""
     agent.api_mode = ""
+    agent.responses_stateful = False
     agent.session_id = "test-session"
     agent._parent_session_id = ""
     agent._credential_pool = None
@@ -127,3 +128,127 @@ def test_background_review_installs_auto_deny_approval_callback(monkeypatch):
         "Background review leaked its approval callback into the worker "
         "thread's TLS slot; a recycled thread-id could reuse it."
     )
+
+
+def test_background_review_uses_configured_sidecar_runtime(monkeypatch):
+    events = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            events.append(("init", kwargs))
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            events.append(("run_conversation", kwargs))
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    import hermes_cli.background_runtime as background_runtime
+
+    monkeypatch.setattr(
+        background_runtime,
+        "get_background_runtime_config",
+        lambda config=None: {
+            "enabled": True,
+            "provider": "custom",
+            "model": "sidecar-model",
+            "base_url": "http://127.0.0.1:1237/v1",
+            "api_key": "side-key",
+            "api_mode": "codex_responses",
+            "responses_stateful": False,
+            "responses_stateful_for": {"background_review": True},
+            "use_for": {"background_review": True},
+        },
+    )
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    agent.provider = "custom"
+    agent.base_url = "http://127.0.0.1:1236/v1"
+    agent.api_key = "main-key"
+    agent.api_mode = "codex_responses"
+    agent.responses_stateful = True
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    init_kwargs = events[0][1]
+    assert init_kwargs["model"] == "sidecar-model"
+    assert init_kwargs["base_url"] == "http://127.0.0.1:1237/v1"
+    assert init_kwargs["api_key"] == "side-key"
+    assert init_kwargs["responses_stateful"] is True
+
+
+def test_background_review_scrubs_foreground_responses_state(monkeypatch):
+    events = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            events.append(("init", kwargs))
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            events.append(("run_conversation", kwargs))
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    import hermes_cli.background_runtime as background_runtime
+
+    monkeypatch.setattr(
+        background_runtime,
+        "get_background_runtime_config",
+        lambda config=None: {
+            "enabled": True,
+            "provider": "custom",
+            "model": "sidecar-model",
+            "base_url": "http://127.0.0.1:1237/v1",
+            "api_key": "side-key",
+            "api_mode": "codex_responses",
+            "responses_stateful_for": {"background_review": True},
+            "use_for": {"background_review": True},
+        },
+    )
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    agent.provider = "custom"
+    agent.base_url = "http://127.0.0.1:1236/v1"
+    agent.api_key = "main-key"
+    agent.api_mode = "codex_responses"
+    agent.responses_stateful = True
+    inherited = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": "hi",
+            "responses_response_id": "resp_main",
+            "codex_message_items": [{"id": "msg_main", "type": "message"}],
+            "codex_reasoning_items": [{"id": "rs_main", "encrypted_content": "..."}],
+        },
+    ]
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=inherited,
+        review_memory=True,
+    )
+
+    run_kwargs = [payload for name, payload in events if name == "run_conversation"][0]
+    assistant_history = run_kwargs["conversation_history"][1]
+    assert "responses_response_id" not in assistant_history
+    assert "codex_message_items" not in assistant_history
+    assert "codex_reasoning_items" not in assistant_history
+    assert inherited[1]["responses_response_id"] == "resp_main"

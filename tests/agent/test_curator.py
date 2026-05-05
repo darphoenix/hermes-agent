@@ -606,6 +606,132 @@ def test_review_model_handles_missing_sections(curator_env):
     assert curator._resolve_review_model({}) == ("auto", "")
 
 
+def test_run_llm_review_routes_auto_curator_to_background_runtime(curator_env, monkeypatch):
+    """Auto curator reviews should use the sidecar when auxiliary:curator is enabled."""
+    import sys
+    import types
+
+    import agent.curator as curator
+    import hermes_cli.config as config_mod
+    import hermes_cli.runtime_provider as runtime_mod
+
+    curator = importlib.reload(curator)
+    captured = {}
+
+    class FakeAIAgent:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+            self._session_messages = []
+
+        def run_conversation(self, user_message):
+            captured["prompt"] = user_message
+            return {"final_response": "done"}
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setitem(sys.modules, "run_agent", types.SimpleNamespace(AIAgent=FakeAIAgent))
+
+    cfg = {
+        "model": {
+            "provider": "custom",
+            "default": "/models/main",
+        },
+        "auxiliary": {"curator": {"provider": "auto", "model": ""}},
+        "background_runtime": {
+            "enabled": True,
+            "provider": "custom",
+            "model": "/models/sidecar",
+            "base_url": "http://127.0.0.1:1237/v1",
+            "api_key": "side-key",
+            "api_mode": "codex_responses",
+            "responses_stateful": True,
+            "use_for": {
+                "auxiliary": False,
+                "auxiliary:curator": True,
+            },
+        },
+    }
+    monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        runtime_mod,
+        "resolve_runtime_provider",
+        lambda *, requested, target_model: {
+            "provider": "custom",
+            "base_url": "http://127.0.0.1:1236/v1",
+            "api_key": "main-key",
+            "api_mode": "codex_responses",
+            "responses_stateful": True,
+        },
+    )
+
+    result = curator._run_llm_review("review prompt")
+
+    assert result["summary"] == "done"
+    assert result["model"] == "/models/sidecar"
+    assert result["provider"] == "custom"
+    assert captured["kwargs"]["model"] == "/models/sidecar"
+    assert captured["kwargs"]["base_url"] == "http://127.0.0.1:1237/v1"
+    assert captured["kwargs"]["api_key"] == "side-key"
+    assert captured["kwargs"]["responses_stateful"] is False
+    assert captured["prompt"] == "review prompt"
+    assert captured["closed"] is True
+
+
+def test_run_llm_review_fails_closed_when_curator_sidecar_is_broken(
+    curator_env, monkeypatch
+):
+    import sys
+    import types
+
+    import agent.curator as curator
+    import hermes_cli.config as config_mod
+    import hermes_cli.runtime_provider as runtime_mod
+
+    curator = importlib.reload(curator)
+    constructed = {"value": False}
+
+    class FakeAIAgent:
+        def __init__(self, **kwargs):
+            constructed["value"] = True
+
+    monkeypatch.setitem(sys.modules, "run_agent", types.SimpleNamespace(AIAgent=FakeAIAgent))
+
+    cfg = {
+        "model": {
+            "provider": "custom",
+            "default": "/models/main",
+        },
+        "background_runtime": {
+            "enabled": True,
+            "provider": "custom",
+            "model": "/models/sidecar",
+            "base_url": "",
+            "api_key": "side-key",
+            "use_for": {
+                "auxiliary": False,
+                "auxiliary:curator": True,
+            },
+        },
+    }
+    monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        runtime_mod,
+        "resolve_runtime_provider",
+        lambda *, requested, target_model: {
+            "provider": "custom",
+            "base_url": "http://127.0.0.1:1236/v1",
+            "api_key": "main-key",
+        },
+    )
+
+    result = curator._run_llm_review("review prompt")
+
+    assert "background runtime error" in result["error"]
+    assert result["summary"] == result["error"]
+    assert constructed["value"] is False
+
+
 def test_curator_slot_is_canonical_aux_task():
     """Curator must be a first-class slot in every aux-task registry.
 
