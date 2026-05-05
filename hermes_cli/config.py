@@ -457,6 +457,17 @@ DEFAULT_CONFIG = {
         # remains available as a tool regardless of this setting — the routing
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
+        # Conscience sidecar mode:
+        #   off                — disabled
+        #   shadow             — audit and persist artifacts without changing replies
+        #   observe            — surface conscience critique in the reply
+        #   enforce_stop_gate  — block premature final answers internally
+        #   enforce_observe    — block and surface critique
+        "conscience_mode": "shadow",
+        "conscience_provider": "openai-codex",
+        "conscience_model": "gpt-5.4",
+        "conscience_reasoning_effort": "medium",
+        "disabled_toolsets": [],
     },
     
     "terminal": {

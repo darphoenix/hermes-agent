@@ -4254,6 +4254,8 @@ class GatewayRunner:
                     return await self._handle_help_command(event)
                 if _cmd_def_inner.name == "commands":
                     return await self._handle_commands_command(event)
+                if _cmd_def_inner.name == "conscience":
+                    return await self._handle_conscience_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
                 if _cmd_def_inner.name == "update":
@@ -4447,6 +4449,9 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "conscience":
+            return await self._handle_conscience_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -6425,6 +6430,16 @@ class GatewayRunner:
         except Exception:
             pass
         return "\n".join(lines)
+
+    async def _handle_conscience_command(self, event: MessageEvent) -> str:
+        """Handle /conscience command."""
+        from agent.conscience_status import build_conscience_status_summary, format_conscience_status_text
+
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        artifact_dir = str(_hermes_home / "conscience" / session_entry.session_id)
+        summary = build_conscience_status_summary(artifact_dir=artifact_dir)
+        return format_conscience_status_text(summary)
 
     async def _handle_commands_command(self, event: MessageEvent) -> str:
         """Handle /commands [page] - paginated list of all commands and skills."""

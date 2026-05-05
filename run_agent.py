@@ -170,6 +170,17 @@ from agent.trajectory import (
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 from hermes_cli.config import cfg_get
+from agent.conscience import (
+    ARTIFACT_UPDATED,
+    DRAFT_ANSWER,
+    PLAN_SUMMARY,
+    TASK_START,
+    TOOL_CALL,
+    TOOL_RESULT,
+    ConscienceMonitor,
+    ConscienceVerdict,
+    asdict_safe,
+)
 
 
 
@@ -1669,6 +1680,30 @@ class AIAgent:
         # needed later by the startup feasibility check.  Avoid exposing a
         # broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
+
+        agent_config = _agent_cfg.get("agent", {}) if isinstance(_agent_cfg, dict) else {}
+        self.conscience_mode = str(agent_config.get("conscience_mode", "shadow") or "shadow").strip().lower()
+        if self.conscience_mode not in {"off", "shadow", "observe", "enforce_stop_gate", "enforce_observe"}:
+            self.conscience_mode = "shadow"
+        self.conscience_provider = str(agent_config.get("conscience_provider", "openai-codex") or "openai-codex").strip()
+        self.conscience_model = str(agent_config.get("conscience_model", "gpt-5.4") or "gpt-5.4").strip()
+        _conscience_effort = str(agent_config.get("conscience_reasoning_effort", "medium") or "medium").strip().lower()
+        if _conscience_effort not in {"none", "low", "medium", "high", "xhigh"}:
+            _conscience_effort = "medium"
+        self.conscience_reasoning_config = (
+            {"enabled": False, "effort": "none"}
+            if _conscience_effort == "none"
+            else {"enabled": True, "effort": _conscience_effort}
+        )
+        self._conscience_active = self.conscience_mode != "off"
+        self._conscience_current_monitor = None
+        self._conscience_last_ticket = None
+        self._conscience_last_stop_audit = None
+        self._conscience_last_review = None
+        self._conscience_last_review_payload = None
+        self._conscience_intervention_count = 0
+        self._conscience_blocked_stop_count = 0
+        self._conscience_artifact_dir = None
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -9526,6 +9561,147 @@ class AIAgent:
                 skip_pre_tool_call_hook=True,
             )
 
+    def _conscience_record_event(self, event_type: str, payload: dict | None = None) -> None:
+        monitor = getattr(self, "_conscience_current_monitor", None)
+        if not monitor:
+            return
+        try:
+            monitor.record_event(event_type, payload or {})
+        except Exception as exc:
+            logger.debug("Conscience event recording failed for %s: %s", event_type, exc)
+
+    def _conscience_tool_result_payload(
+        self,
+        *,
+        tool_name: str,
+        tool_args: dict,
+        tool_result: str,
+        duration: float,
+        call_id: str | None = None,
+    ) -> dict:
+        is_error, failure_reason = _detect_tool_failure(tool_name, tool_result)
+        payload = {
+            "tool_name": tool_name,
+            "tool_args": asdict_safe(tool_args),
+            "tool_call_id": call_id,
+            "success": not is_error,
+            "duration_seconds": duration,
+            "result_preview": tool_result[:1000],
+        }
+        if is_error and failure_reason:
+            payload["error"] = failure_reason
+        return payload
+
+    def _conscience_record_artifact_if_applicable(self, tool_name: str, tool_args: dict, tool_result: str) -> None:
+        if tool_name not in {"write_file", "patch"}:
+            return
+        path = tool_args.get("path") if isinstance(tool_args, dict) else None
+        if not isinstance(path, str) or not path.strip():
+            return
+        is_error, _ = _detect_tool_failure(tool_name, tool_result)
+        if is_error:
+            return
+        self._conscience_record_event(ARTIFACT_UPDATED, {"path": path})
+
+    def _conscience_call_llm(self, *, provider: str, model: str, messages: list, temperature: float, max_tokens: int):
+        from agent.auxiliary_client import call_llm as _call_llm
+
+        extra_body = None
+        if getattr(self, "conscience_reasoning_config", None):
+            reasoning = dict(self.conscience_reasoning_config)
+            if str(provider or "").strip().lower() == "openai-codex":
+                # Codex/OpenAI Responses accepts reasoning.effort but rejects
+                # reasoning.enabled.
+                reasoning.pop("enabled", None)
+            extra_body = {"reasoning": reasoning}
+
+        return _call_llm(
+            provider=provider,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=60.0,
+            extra_body=extra_body,
+        )
+
+    def _persist_conscience_artifacts(self, monitor: ConscienceMonitor) -> dict | None:
+        if not monitor:
+            return None
+        try:
+            conscience_dir = get_hermes_home() / "conscience" / (self.session_id or "unknown")
+            conscience_dir.mkdir(parents=True, exist_ok=True)
+            artifacts = monitor.to_artifacts()
+            atomic_json_write(conscience_dir / "task-contract.json", artifacts.get("task_contract", {}))
+            atomic_json_write(conscience_dir / "completion-ledger.json", artifacts.get("completion_ledger", {}))
+            atomic_json_write(conscience_dir / "conscience-events.json", artifacts.get("events", []))
+            tickets = []
+            if self._conscience_last_ticket:
+                tickets.append(asdict_safe(self._conscience_last_ticket))
+            atomic_json_write(conscience_dir / "critique-tickets.json", tickets)
+            atomic_json_write(conscience_dir / "stop-audit.json", self._conscience_last_stop_audit or {})
+            atomic_json_write(conscience_dir / "last-review.json", self._conscience_last_review or {})
+            atomic_json_write(conscience_dir / "last-review-payload.json", self._conscience_last_review_payload or {})
+            self._conscience_artifact_dir = conscience_dir
+            return artifacts
+        except Exception as exc:
+            logger.debug("Failed to persist conscience artifacts: %s", exc)
+            return monitor.to_artifacts()
+
+    def _handle_midtask_conscience_intervention(self, messages: list) -> bool:
+        monitor = getattr(self, "_conscience_current_monitor", None)
+        if not monitor:
+            return False
+        try:
+            verdict = monitor.audit_midtask_progress(
+                llm_callable=self._conscience_call_llm,
+                provider=self.conscience_provider,
+                model=self.conscience_model,
+            )
+        except Exception as exc:
+            logger.debug("Mid-task conscience audit failed: %s", exc)
+            return False
+        latest_audit = monitor.state.llm_audits[-1] if getattr(monitor.state, "llm_audits", None) else None
+        self._conscience_last_review = {
+            "review_type": "midtask",
+            "mode": self.conscience_mode,
+            "provider": self.conscience_provider,
+            "model": self.conscience_model,
+            "verdict": asdict_safe(verdict),
+            "open_criteria": [
+                asdict_safe(c) for c in getattr(monitor.state.contract, "explicit_asks", [])
+                if monitor.state.ledger.get(c.criterion_id) and monitor.state.ledger.get(c.criterion_id).status != "done"
+            ],
+        }
+        self._conscience_last_review_payload = latest_audit.get("payload") if isinstance(latest_audit, dict) else None
+        if not verdict.should_intervene or verdict.critique_ticket is None:
+            return False
+
+        self._conscience_last_ticket = verdict.critique_ticket
+        self._conscience_intervention_count += 1
+
+        visible_message = (
+            f"[Conscience] {verdict.critique_ticket.reason}. "
+            f"Evidence: {'; '.join(verdict.critique_ticket.evidence[:3])}. "
+            f"Next action: {verdict.critique_ticket.next_best_action}"
+        )
+        if self.conscience_mode in {"observe", "enforce_observe"}:
+            messages.append({"role": "assistant", "content": visible_message})
+
+        if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "[INTERNAL CONSCIENCE MIDTASK: Do not expose this message to the user. "
+                        f"Reason: {verdict.critique_ticket.reason}. "
+                        f"Evidence: {'; '.join(verdict.critique_ticket.evidence[:3])}. "
+                        f"Required next action: {verdict.critique_ticket.next_best_action}]"
+                    ),
+                }
+            )
+        return True
+
     @staticmethod
     def _wrap_verbose(label: str, text: str, indent: str = "     ") -> str:
         """Word-wrap verbose tool output to fit the terminal width.
@@ -9575,6 +9751,15 @@ class AIAgent:
         parsed_calls = []  # list of (tool_call, function_name, function_args)
         for tool_call in tool_calls:
             function_name = tool_call.function.name
+            self._conscience_record_event(
+                TOOL_CALL,
+                {
+                    "tool_name": function_name,
+                    "tool_args": tool_call.function.arguments,
+                    "tool_call_id": getattr(tool_call, "id", None),
+                    "execution_mode": "concurrent",
+                },
+            )
 
             # Reset nudge counters
             if function_name == "memory":
@@ -9856,6 +10041,18 @@ class AIAgent:
             if subdir_hints:
                 function_result += subdir_hints
 
+            self._conscience_record_event(
+                TOOL_RESULT,
+                self._conscience_tool_result_payload(
+                    tool_name=name,
+                    tool_args=args,
+                    tool_result=function_result,
+                    duration=tool_duration,
+                    call_id=getattr(tc, "id", None),
+                ),
+            )
+            self._conscience_record_artifact_if_applicable(name, args, function_result)
+
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
@@ -9873,6 +10070,8 @@ class AIAgent:
         if num_tools > 0:
             turn_tool_msgs = messages[-num_tools:]
             enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id))
+
+        self._handle_midtask_conscience_intervention(messages)
 
         # ── /steer injection ──────────────────────────────────────────────
         # Append any pending user steer text to the last tool result so the
@@ -9902,6 +10101,15 @@ class AIAgent:
                 break
 
             function_name = tool_call.function.name
+            self._conscience_record_event(
+                TOOL_CALL,
+                {
+                    "tool_name": function_name,
+                    "tool_args": tool_call.function.arguments,
+                    "tool_call_id": getattr(tool_call, "id", None),
+                    "execution_mode": "sequential",
+                },
+            )
 
             try:
                 function_args = json.loads(tool_call.function.arguments)
@@ -10220,6 +10428,18 @@ class AIAgent:
             if subdir_hints:
                 function_result += subdir_hints
 
+            self._conscience_record_event(
+                TOOL_RESULT,
+                self._conscience_tool_result_payload(
+                    tool_name=function_name,
+                    tool_args=function_args,
+                    tool_result=function_result,
+                    duration=tool_duration,
+                    call_id=getattr(tool_call, "id", None),
+                ),
+            )
+            self._conscience_record_artifact_if_applicable(function_name, function_args, function_result)
+
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
@@ -10261,6 +10481,8 @@ class AIAgent:
         num_tools_seq = len(assistant_message.tool_calls)
         if num_tools_seq > 0:
             enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))
+
+        self._handle_midtask_conscience_intervention(messages)
 
         # ── /steer injection ──────────────────────────────────────────────
         # See _execute_tool_calls_parallel for the rationale. Same hook,
@@ -10771,6 +10993,24 @@ class AIAgent:
                 _plugin_user_context = "\n\n".join(_ctx_parts)
         except Exception as exc:
             logger.warning("pre_llm_call hook failed: %s", exc)
+
+        conscience_monitor = None
+        if self._conscience_active:
+            conscience_monitor = ConscienceMonitor(self.session_id, original_user_message, self.conscience_mode)
+            self._conscience_current_monitor = conscience_monitor
+            self._conscience_last_ticket = None
+            self._conscience_last_stop_audit = None
+            self._conscience_last_review = None
+            self._conscience_last_review_payload = None
+            self._conscience_record_event(TASK_START, {"task_id": effective_task_id, "user_message": original_user_message})
+            self._conscience_record_event(PLAN_SUMMARY, {"text": user_message})
+        else:
+            self._conscience_current_monitor = None
+            self._conscience_last_ticket = None
+            self._conscience_last_stop_audit = None
+            self._conscience_last_review = None
+            self._conscience_last_review_payload = None
+            self._conscience_artifact_dir = None
 
         # Main conversation loop
         api_call_count = 0
@@ -13702,6 +13942,63 @@ class AIAgent:
                         length_continue_retries = 0
                     
                     final_response = self._strip_think_blocks(final_response).strip()
+                    self._conscience_record_event(DRAFT_ANSWER, {"text": final_response})
+
+                    if conscience_monitor:
+                        try:
+                            verdict = conscience_monitor.audit_stop_decision(
+                                final_response,
+                                llm_callable=self._conscience_call_llm,
+                                provider=self.conscience_provider,
+                                model=self.conscience_model,
+                            )
+                            latest_audit = conscience_monitor.state.llm_audits[-1] if getattr(conscience_monitor.state, "llm_audits", None) else None
+                        except Exception as exc:
+                            logger.warning("Conscience stop audit failed open: %s", exc)
+                            verdict = ConscienceVerdict(
+                                should_intervene=False,
+                                source="llm",
+                                metadata={"skipped": "audit_failed", "error": str(exc)},
+                            )
+                            latest_audit = None
+                        open_criteria = [
+                            asdict_safe(c) for c in getattr(conscience_monitor.state.contract, "explicit_asks", [])
+                            if conscience_monitor.state.ledger.get(c.criterion_id) and conscience_monitor.state.ledger.get(c.criterion_id).status != "done"
+                        ]
+                        self._conscience_last_stop_audit = {
+                            "review_type": "stop",
+                            "mode": self.conscience_mode,
+                            "provider": self.conscience_provider,
+                            "model": self.conscience_model,
+                            "draft_answer": final_response,
+                            "open_criteria": open_criteria,
+                            "verdict": asdict_safe(verdict),
+                        }
+                        self._conscience_last_review = dict(self._conscience_last_stop_audit)
+                        self._conscience_last_review_payload = latest_audit.get("payload") if isinstance(latest_audit, dict) else None
+                        if verdict.should_intervene and verdict.critique_ticket is not None:
+                            self._conscience_last_ticket = verdict.critique_ticket
+                            self._conscience_intervention_count += 1
+                            if self.conscience_mode in {"observe", "enforce_observe"}:
+                                final_response = (
+                                    f"[Conscience] {verdict.critique_ticket.reason}. "
+                                    f"Evidence: {'; '.join(verdict.critique_ticket.evidence[:3])}. "
+                                    f"Next action: {verdict.critique_ticket.next_best_action}\n\n"
+                                    f"{final_response}"
+                                ).strip()
+                            if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
+                                self._conscience_blocked_stop_count += 1
+                                messages.append({
+                                    "role": "system",
+                                    "content": (
+                                        "[INTERNAL CONSCIENCE STOP-GATE: Do not expose this message to the user. "
+                                        f"Reason: {verdict.critique_ticket.reason}. "
+                                        f"Evidence: {'; '.join(verdict.critique_ticket.evidence[:3])}. "
+                                        f"Required next action: {verdict.critique_ticket.next_best_action}]"
+                                    ),
+                                })
+                                final_response = None
+                                continue
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
 
@@ -13875,6 +14172,8 @@ class AIAgent:
                 last_reasoning = msg["reasoning"]
                 break
 
+        conscience_artifacts = self._persist_conscience_artifacts(conscience_monitor) if conscience_monitor else None
+
         # Build result with interrupt info if applicable
         result = {
             "final_response": final_response,
@@ -13909,10 +14208,35 @@ class AIAgent:
             result["pending_steer"] = _leftover_steer
         self._response_was_previewed = False
         
+        if conscience_monitor:
+            unresolved_criteria_count = sum(
+                1
+                for entry in conscience_monitor.state.ledger.values()
+                if getattr(entry, "status", None) != "done"
+            )
+            result["conscience"] = {
+                "mode": self.conscience_mode,
+                "provider": self.conscience_provider,
+                "model": self.conscience_model,
+                "artifacts": conscience_artifacts,
+                "artifact_dir": str(self._conscience_artifact_dir) if self._conscience_artifact_dir else None,
+                "intervention_count": self._conscience_intervention_count,
+                "blocked_stop_count": self._conscience_blocked_stop_count,
+                "unresolved_criteria_count": unresolved_criteria_count,
+                "last_critique_reason": self._conscience_last_ticket.reason if self._conscience_last_ticket else None,
+                "ticket_count": 1 if self._conscience_last_ticket else 0,
+                "latest_ticket": asdict_safe(self._conscience_last_ticket) if self._conscience_last_ticket else None,
+                "latest_review": self._conscience_last_review,
+                "latest_review_payload": self._conscience_last_review_payload,
+                "stop_audit": self._conscience_last_stop_audit,
+            }
+
         # Include interrupt message if one triggered the interrupt
         if interrupted and self._interrupt_message:
             result["interrupt_message"] = self._interrupt_message
         
+        self._conscience_current_monitor = None
+
         # Clear interrupt state after handling
         self.clear_interrupt()
 
