@@ -335,6 +335,190 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "extra_body" not in kwargs
 
 
+def test_build_api_kwargs_codex_preserves_internal_system_directives(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "But who else sells NV Diamond?"},
+            {
+                "role": "system",
+                "content": (
+                    "[INTERNAL CONSCIENCE STOP-GATE: Do not expose this message to the user. "
+                    "You are in a loop. Use web_search now.]"
+                ),
+            },
+        ]
+    )
+
+    assert kwargs["instructions"] == "You are Hermes."
+    assert kwargs["input"][0] == {"role": "user", "content": "But who else sells NV Diamond?"}
+    assert kwargs["input"][1]["role"] == "user"
+    assert kwargs["input"][1]["content"].startswith("[INTERNAL DIRECTIVE: do not expose")
+    assert "You are in a loop. Use web_search now." in kwargs["input"][1]["content"]
+
+
+def test_build_api_kwargs_consumes_conscience_tool_narrowing(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.tools.append({
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    })
+    agent.valid_tool_names.add("web_search")
+    agent._conscience_next_tool_names = {"terminal"}
+
+    narrowed = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ]
+    )
+    assert [tool["name"] for tool in narrowed["tools"]] == ["terminal"]
+
+    restored = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping again"},
+        ]
+    )
+    assert len(restored["tools"]) > 1
+
+
+def test_conscience_tool_narrowing_uses_only_explicit_recommended_tools(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.tools.append({
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    })
+    agent.valid_tool_names.add("web_search")
+
+    agent._prepare_conscience_tool_narrowing(
+        run_agent.CritiqueTicket(
+            verdict="repair",
+            reason="needs_current_source",
+            next_best_action="Use the web to verify it.",
+            recommended_tools=["web_search", "not_loaded"],
+        )
+    )
+    narrowed = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ]
+    )
+    assert [tool["name"] for tool in narrowed["tools"]] == ["web_search"]
+
+    agent._prepare_conscience_tool_narrowing(
+        run_agent.CritiqueTicket(
+            verdict="repair",
+            reason="terminal would help",
+            next_best_action="Run a shell command.",
+            recommended_tools=None,
+        )
+    )
+    restored = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping again"},
+        ]
+    )
+    assert sorted(tool["name"] for tool in restored["tools"]) == ["terminal", "web_search"]
+
+
+def test_conscience_repair_narrowing_persists_for_current_turn_with_cold_temperature(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent.tools.append({
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    })
+    agent.valid_tool_names.add("web_search")
+    agent.conscience_repair_temperature = 0.2
+    agent.conscience_tool_narrowing_turns = 2
+
+    agent._prepare_conscience_tool_narrowing(
+        run_agent.CritiqueTicket(
+            verdict="repair",
+            reason="needs_current_source",
+            next_best_action="Use the web to verify it.",
+            recommended_tools=["web_search"],
+        )
+    )
+
+    first = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ]
+    )
+    assert [tool["name"] for tool in first["tools"]] == ["web_search"]
+    assert first["temperature"] == 0.2
+
+    second = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping again"},
+        ]
+    )
+    assert [tool["name"] for tool in second["tools"]] == ["web_search"]
+    assert second["temperature"] == 0.2
+
+    third = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Still same repair turn"},
+        ]
+    )
+    assert [tool["name"] for tool in third["tools"]] == ["web_search"]
+    assert third["temperature"] == 0.2
+
+    agent._prepare_conscience_tool_narrowing(
+        run_agent.CritiqueTicket(
+            verdict="repair",
+            reason="synthesis_needed",
+            next_best_action="Answer from the evidence already gathered.",
+            recommended_tools=[],
+        )
+    )
+    no_tools = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Synthesize now"},
+        ]
+    )
+    assert no_tools["tools"] == []
+    assert no_tools["tool_choice"] == "none"
+    assert no_tools["temperature"] == 0.2
+
+    agent._prepare_conscience_tool_narrowing(
+        run_agent.CritiqueTicket(
+            verdict="repair",
+            reason="clear narrowing",
+            next_best_action="Return to normal.",
+            recommended_tools=None,
+        )
+    )
+    restored = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Repair no longer needs tools"},
+        ]
+    )
+    assert sorted(tool["name"] for tool in restored["tools"]) == ["terminal", "web_search"]
+    assert "temperature" not in restored
+
+
 def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):
     """'minimal' reasoning effort is clamped to 'low' on the Responses API.
 

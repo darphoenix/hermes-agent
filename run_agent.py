@@ -168,7 +168,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
-from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
+from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, is_truthy_value, normalize_proxy_url
 from hermes_cli.config import cfg_get
 from agent.conscience import (
     ARTIFACT_UPDATED,
@@ -179,6 +179,7 @@ from agent.conscience import (
     TOOL_RESULT,
     ConscienceMonitor,
     ConscienceVerdict,
+    CritiqueTicket,
     asdict_safe,
 )
 
@@ -1687,6 +1688,30 @@ class AIAgent:
             self.conscience_mode = "shadow"
         self.conscience_provider = str(agent_config.get("conscience_provider", "openai-codex") or "openai-codex").strip()
         self.conscience_model = str(agent_config.get("conscience_model", "gpt-5.4") or "gpt-5.4").strip()
+        self.conscience_chat_messages = is_truthy_value(
+            agent_config.get("conscience_chat_messages"),
+            default=False,
+        )
+        self.conscience_stateful = is_truthy_value(
+            agent_config.get("conscience_stateful"),
+            default=True,
+        )
+        _repair_temp_raw = agent_config.get("conscience_repair_temperature", 0.2)
+        if isinstance(_repair_temp_raw, str) and _repair_temp_raw.strip().lower() in {"", "none", "off", "false"}:
+            self.conscience_repair_temperature = None
+        else:
+            try:
+                self.conscience_repair_temperature = float(_repair_temp_raw)
+            except Exception:
+                self.conscience_repair_temperature = 0.2
+            if self.conscience_repair_temperature < 0:
+                self.conscience_repair_temperature = None
+        try:
+            self.conscience_tool_narrowing_turns = int(agent_config.get("conscience_tool_narrowing_turns", 4) or 0)
+        except Exception:
+            self.conscience_tool_narrowing_turns = 4
+        if self.conscience_tool_narrowing_turns < 0:
+            self.conscience_tool_narrowing_turns = 0
         _conscience_effort = str(agent_config.get("conscience_reasoning_effort", "medium") or "medium").strip().lower()
         if _conscience_effort not in {"none", "low", "medium", "high", "xhigh"}:
             _conscience_effort = "medium"
@@ -1701,9 +1726,14 @@ class AIAgent:
         self._conscience_last_stop_audit = None
         self._conscience_last_review = None
         self._conscience_last_review_payload = None
+        self._conscience_last_useful_final_response = None
         self._conscience_intervention_count = 0
         self._conscience_blocked_stop_count = 0
         self._conscience_artifact_dir = None
+        self._conscience_next_tool_names = None
+        self._conscience_repair_tool_names = None
+        self._conscience_repair_turns_remaining = 0
+        self._conscience_repair_override_active = False
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -2601,6 +2631,21 @@ class AIAgent:
             "responses_stateful": bool(getattr(self, "responses_stateful", False)),
         }
 
+    def _should_register_foreground_activity(self) -> bool:
+        """Return True when this turn should throttle optional sidecar work."""
+
+        if getattr(self, "_subagent_id", None) or getattr(self, "_delegate_depth", 0) > 0:
+            return False
+        if getattr(self, "_memory_write_origin", None) == "background_review":
+            return False
+        if getattr(self, "_memory_write_context", None) == "background_review":
+            return False
+        if str(getattr(self, "platform", "") or "").lower() == "curator":
+            return False
+        if getattr(self, "quiet_mode", False) and not getattr(self, "gateway_session_key", None):
+            return False
+        return True
+
     def _check_compression_model_feasibility(self) -> None:
         """Warn at session start if the auxiliary compression model's context
         window is smaller than the main model's compression threshold.
@@ -2811,14 +2856,15 @@ class AIAgent:
             url = getattr(self, "_base_url_lower", "") or ""
         return "openai.azure.com" in url
 
-    def _resolved_api_call_timeout(self) -> float:
+    def _resolved_api_call_timeout(self) -> Optional[float]:
         """Resolve the effective per-call request timeout in seconds.
 
         Priority:
           1. ``providers.<id>.models.<model>.timeout_seconds`` (per-model override)
           2. ``providers.<id>.request_timeout_seconds`` (provider-wide)
           3. ``HERMES_API_TIMEOUT`` env var (legacy escape hatch)
-          4. 1800.0s default
+          4. no per-request timeout for local endpoints
+          5. 1800.0s default
 
         Used by OpenAI-wire chat completions (streaming and non-streaming) so
         the per-provider config knob wins over the 1800s default.  Without this
@@ -2829,7 +2875,13 @@ class AIAgent:
         cfg = get_provider_request_timeout(self.provider, self.model)
         if cfg is not None:
             return cfg
-        return float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+        env_timeout = os.getenv("HERMES_API_TIMEOUT")
+        if env_timeout is not None:
+            return float(env_timeout)
+        base_url = getattr(self, "_base_url", None) or self.base_url or ""
+        if base_url and is_local_endpoint(base_url):
+            return None
+        return 1800.0
 
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
         """Resolve the base non-stream stale timeout and whether it is implicit.
@@ -3126,6 +3178,66 @@ class AIAgent:
             flags=re.IGNORECASE,
         )
         return content
+
+    def _extract_markdown_pseudo_tool_calls(self, content: str) -> tuple[list, str]:
+        """Recover common plain-text pseudo tool calls from markdown output.
+
+        Some local/open models emit e.g. ``execute_code`` followed by a fenced
+        Python block as assistant text instead of using the structured tool call
+        field.  Treat only exact line-start tool names plus fenced code blocks as
+        recoverable; prose mentions remain untouched.
+        """
+        if not isinstance(content, str) or not content.strip():
+            return [], content
+
+        pattern = re.compile(
+            r"(?ms)^[ \t]*(?P<name>execute_code|terminal)[ \t]*\n"
+            r"[ \t]*```(?P<lang>[^\n`]*)\n"
+            r"(?P<body>.*?)\n[ \t]*```[ \t]*(?=\n|$)"
+        )
+        recovered = []
+        spans = []
+        for match in pattern.finditer(content):
+            tool_name = (match.group("name") or "").strip()
+            if tool_name not in self.valid_tool_names:
+                continue
+            lang = (match.group("lang") or "").strip().lower().split()
+            lang0 = lang[0] if lang else ""
+            body = (match.group("body") or "").strip("\n")
+            if not body.strip():
+                continue
+
+            if tool_name == "execute_code":
+                if lang0 and lang0 not in {"python", "py"}:
+                    continue
+                args = {"code": body}
+            elif tool_name == "terminal":
+                if lang0 in {"python", "py"}:
+                    continue
+                args = {"command": body}
+            else:
+                continue
+
+            recovered.append(SimpleNamespace(
+                id=f"call_{uuid.uuid4().hex[:12]}",
+                type="function",
+                function=SimpleNamespace(
+                    name=tool_name,
+                    arguments=json.dumps(args, ensure_ascii=False),
+                ),
+            ))
+            spans.append(match.span())
+            if len(recovered) >= 8:
+                break
+
+        if not recovered:
+            return [], content
+
+        cleaned = content
+        for start, end in reversed(spans):
+            cleaned = cleaned[:start] + cleaned[end:]
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return recovered, cleaned
 
     @staticmethod
     def _has_natural_response_ending(content: str) -> bool:
@@ -3683,6 +3795,7 @@ class AIAgent:
                     _review_credential_pool = getattr(self, "_credential_pool", None)
                     try:
                         from hermes_cli.background_runtime import (
+                            BackgroundRuntimeDeferred,
                             BackgroundRuntimeError,
                             resolve_background_runtime,
                         )
@@ -3695,6 +3808,9 @@ class AIAgent:
                         if _resolved is not None:
                             _review_model, _review_runtime = _resolved
                             _review_credential_pool = _review_runtime.get("credential_pool")
+                    except BackgroundRuntimeDeferred as exc:
+                        logger.info("Background review deferred: %s", exc)
+                        return
                     except BackgroundRuntimeError as exc:
                         logger.warning("Background review skipped: %s", exc)
                         return
@@ -3878,6 +3994,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    responses_response_id=msg.get("responses_response_id") if role == "assistant" else None,
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
@@ -5764,6 +5881,15 @@ class AIAgent:
         # constructs a fresh one — no stale closed transport can be reused.
         # Tests in ``tests/run_agent/test_create_openai_client_reuse.py`` and
         # ``tests/run_agent/test_sequential_chats_live.py`` pin this invariant.
+        if (
+            "max_retries" not in client_kwargs
+            and is_local_endpoint(str(client_kwargs.get("base_url", "") or ""))
+        ):
+            # Local wrapper calls can legitimately be long.  Let Hermes' own
+            # loop/gateway limits govern the turn instead of allowing the
+            # OpenAI SDK to retry timed-out localhost requests and duplicate
+            # in-flight generations.
+            client_kwargs["max_retries"] = 0
         if "http_client" not in client_kwargs:
             keepalive_http = self._build_keepalive_http_client(client_kwargs.get("base_url", ""))
             if keepalive_http is not None:
@@ -8543,6 +8669,7 @@ class AIAgent:
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
+        api_tools = self._tools_for_next_api_call()
         if self.api_mode == "anthropic_messages":
             _transport = self._get_transport()
             anthropic_messages = self._prepare_anthropic_messages_for_api(api_messages)
@@ -8551,10 +8678,10 @@ class AIAgent:
             ephemeral_out = getattr(self, "_ephemeral_max_output_tokens", None)
             if ephemeral_out is not None:
                 self._ephemeral_max_output_tokens = None  # consume immediately
-            return _transport.build_kwargs(
+            return self._apply_conscience_repair_overrides(_transport.build_kwargs(
                 model=self.model,
                 messages=anthropic_messages,
-                tools=self.tools,
+                tools=api_tools,
                 max_tokens=ephemeral_out if ephemeral_out is not None else self.max_tokens,
                 reasoning_config=self.reasoning_config,
                 is_oauth=self._is_anthropic_oauth,
@@ -8563,7 +8690,7 @@ class AIAgent:
                 base_url=getattr(self, "_anthropic_base_url", None),
                 fast_mode=(self.request_overrides or {}).get("speed") == "fast",
                 drop_context_1m_beta=bool(getattr(self, "_oauth_1m_beta_disabled", False)),
-            )
+            ))
 
         # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
         # The adapter handles message/tool conversion and boto3 calls directly.
@@ -8571,14 +8698,14 @@ class AIAgent:
             _bt = self._get_transport()
             region = getattr(self, "_bedrock_region", None) or "us-east-1"
             guardrail = getattr(self, "_bedrock_guardrail_config", None)
-            return _bt.build_kwargs(
+            return self._apply_conscience_repair_overrides(_bt.build_kwargs(
                 model=self.model,
                 messages=api_messages,
-                tools=self.tools,
+                tools=api_tools,
                 max_tokens=self.max_tokens or 4096,
                 region=region,
                 guardrail_config=guardrail,
-            )
+            ))
 
         if self.api_mode == "codex_responses":
             _ct = self._get_transport()
@@ -8600,10 +8727,10 @@ class AIAgent:
             previous_response_id = None
             if stateful_responses:
                 stateful_input, previous_response_id = self._build_stateful_responses_input(_msgs_for_codex)
-            return _ct.build_kwargs(
+            return self._apply_conscience_repair_overrides(_ct.build_kwargs(
                 model=self.model,
                 messages=_msgs_for_codex,
-                tools=self.tools,
+                tools=api_tools,
                 reasoning_config=self.reasoning_config,
                 session_id=getattr(self, "session_id", None),
                 max_tokens=self.max_tokens,
@@ -8615,7 +8742,7 @@ class AIAgent:
                 stateful_responses=stateful_responses,
                 stateful_input=stateful_input,
                 previous_response_id=previous_response_id,
-            )
+            ))
 
         # ── chat_completions (default) ─────────────────────────────────────
         _ct = self._get_transport()
@@ -8689,10 +8816,10 @@ class AIAgent:
         # Strip image parts for non-vision models (no-op when vision-capable).
         _msgs_for_chat = self._prepare_messages_for_non_vision_model(api_messages)
 
-        return _ct.build_kwargs(
+        return self._apply_conscience_repair_overrides(_ct.build_kwargs(
             model=self.model,
             messages=_msgs_for_chat,
-            tools=self.tools,
+            tools=api_tools,
             base_url=self.base_url,
             timeout=self._resolved_api_call_timeout(),
             max_tokens=self.max_tokens,
@@ -8723,7 +8850,7 @@ class AIAgent:
             lmstudio_reasoning_options=self._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
             anthropic_max_output=_ant_max,
             provider_name=self.provider,
-        )
+        ))
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
@@ -9603,7 +9730,296 @@ class AIAgent:
             return
         self._conscience_record_event(ARTIFACT_UPDATED, {"path": path})
 
-    def _conscience_call_llm(self, *, provider: str, model: str, messages: list, temperature: float, max_tokens: int):
+    @staticmethod
+    def _format_conscience_visible_message(ticket: CritiqueTicket) -> str:
+        evidence = "; ".join(ticket.evidence[:3])
+        message = f"[Conscience] {ticket.reason}."
+        if evidence:
+            message += f" Evidence: {evidence}."
+        if ticket.next_best_action:
+            message += f" Next action: {ticket.next_best_action}"
+        return message
+
+    @staticmethod
+    def _conscience_ticket_mentions_loop(ticket: CritiqueTicket) -> bool:
+        text = " ".join(
+            [
+                str(ticket.reason or ""),
+                str(ticket.next_best_action or ""),
+                " ".join(str(item) for item in (ticket.evidence or [])),
+            ]
+        ).lower()
+        loop_terms = (
+            "loop",
+            "repeat",
+            "same draft",
+            "same answer",
+            "same response",
+            "same tool",
+            "regenerat",
+            "no new evidence",
+        )
+        return any(term in text for term in loop_terms)
+
+    @staticmethod
+    def _conscience_ticket_needs_tool(ticket: CritiqueTicket) -> bool:
+        return bool(getattr(ticket, "recommended_tools", None))
+
+    @staticmethod
+    def _conscience_looks_like_useful_final_answer(text: str) -> bool:
+        cleaned = (text or "").strip()
+        if len(cleaned) < 20:
+            return False
+        lowered = cleaned.lower()
+        intent_starters = (
+            "let me ",
+            "i'll ",
+            "i will ",
+            "i'm going to ",
+            "i am going to ",
+            "right. let me ",
+            "need to ",
+        )
+        return not lowered.startswith(intent_starters)
+
+    def _conscience_best_repair_exhausted_final(self, final_response: str) -> str | None:
+        current = (final_response or "").strip()
+        if self._conscience_looks_like_useful_final_answer(current):
+            return current
+        previous = (getattr(self, "_conscience_last_useful_final_response", None) or "").strip()
+        if self._conscience_looks_like_useful_final_answer(previous):
+            return previous
+        return None
+
+    @staticmethod
+    def _conscience_ticket_allows_final_takeover(ticket: CritiqueTicket) -> bool:
+        return getattr(ticket, "recommended_tools", None) == []
+
+    def _conscience_generate_takeover_final(
+        self,
+        *,
+        ticket: CritiqueTicket,
+        final_response: str,
+        review_payload: dict | None,
+    ) -> str | None:
+        if not self._conscience_ticket_allows_final_takeover(ticket):
+            return None
+        if not (self.conscience_provider and self.conscience_model):
+            return None
+
+        payload = {
+            "task_contract": (review_payload or {}).get("task_contract") if isinstance(review_payload, dict) else None,
+            "recent_events": (review_payload or {}).get("recent_events") if isinstance(review_payload, dict) else None,
+            "critique_ticket": asdict_safe(ticket),
+            "latest_actor_draft": final_response,
+            "prior_useful_actor_draft": getattr(self, "_conscience_last_useful_final_response", None),
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Hermes conscience taking over final answer generation after the main actor ignored "
+                    "stop-gate repairs. No tools are needed or available for this takeover. Produce the final "
+                    "user-facing answer directly from the provided evidence and drafts. Do not call tools, do not "
+                    "ask whether to continue, and do not expose internal JSON. Be clear about confirmed facts vs "
+                    "uncertain inferences. If evidence is insufficient, say that plainly and give the best useful "
+                    "answer possible from the evidence already gathered."
+                ),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        try:
+            response = self._conscience_call_llm(
+                provider=self.conscience_provider,
+                model=self.conscience_model,
+                messages=messages,
+                temperature=0,
+                max_tokens=2400,
+            )
+            from agent.auxiliary_client import extract_content_or_reasoning
+
+            generated = extract_content_or_reasoning(response).strip()
+        except Exception as exc:
+            logger.warning("Conscience takeover final generation failed: %s", exc)
+            return None
+
+        if not self._conscience_looks_like_useful_final_answer(generated):
+            return None
+        if not generated.startswith("[Conscience]"):
+            generated = f"[Conscience] {generated}"
+        return generated
+
+    def _format_conscience_internal_message(self, label: str, ticket: CritiqueTicket) -> str:
+        lines = [
+            f"[INTERNAL CONSCIENCE {label}: Do not expose this message to the user.]",
+        ]
+        if self._conscience_ticket_mentions_loop(ticket):
+            lines.extend(
+                [
+                    "You are in a loop. Think hard how to break out of it.",
+                    "Do not repeat or lightly rephrase the previous answer.",
+                ]
+            )
+        else:
+            lines.append("The previous draft is not acceptable yet.")
+
+        if ticket.next_best_action:
+            lines.append(f"Required next action: {ticket.next_best_action}")
+        elif ticket.reason:
+            lines.append(f"Problem to fix: {ticket.reason}")
+
+        evidence = "; ".join(str(item) for item in (ticket.evidence or [])[:2])
+        if evidence:
+            lines.append(f"Evidence: {evidence}")
+
+        if self._conscience_ticket_needs_tool(ticket):
+            tools = ", ".join(str(name) for name in ticket.recommended_tools)
+            if tools:
+                lines.append(f"Recommended tools for the next repair step: {tools}")
+            lines.extend(
+                [
+                    "Act now; do not explain the plan first.",
+                    "If a tool is needed, make a real tool call as the next assistant action.",
+                    "Do not print fake tool-call JSON or tool schemas as prose.",
+                    "If structured tool calling fails on this local model, use the recoverable fallback form: terminal followed by one fenced bash block.",
+                ]
+            )
+        else:
+            if getattr(ticket, "recommended_tools", None) == []:
+                lines.append("No tools are recommended for the next repair step; answer or synthesize now without another tool call.")
+            lines.append("Act now; do not explain this instruction.")
+
+        return "\n".join(lines)
+
+    def _prepare_conscience_tool_narrowing(self, ticket: CritiqueTicket) -> None:
+        if not self.tools or not self.valid_tool_names:
+            self._conscience_next_tool_names = None
+            self._conscience_repair_tool_names = None
+            self._conscience_repair_turns_remaining = 0
+            return
+        recommended_tools = getattr(ticket, "recommended_tools", None)
+        if recommended_tools is None:
+            self._conscience_next_tool_names = None
+            self._conscience_repair_tool_names = None
+            self._conscience_repair_turns_remaining = 0
+            return
+        if not recommended_tools:
+            self._conscience_next_tool_names = set()
+            self._conscience_repair_tool_names = set()
+            self._conscience_repair_turns_remaining = max(
+                self._conscience_repair_turns_remaining,
+                self.conscience_tool_narrowing_turns,
+            )
+            return
+        narrowed = sorted(
+            {
+                str(name).strip()
+                for name in recommended_tools
+                if str(name).strip() in self.valid_tool_names
+            }
+        )
+        if narrowed:
+            self._conscience_next_tool_names = set(narrowed)
+            self._conscience_repair_tool_names = set(narrowed)
+            self._conscience_repair_turns_remaining = max(
+                self._conscience_repair_turns_remaining,
+                self.conscience_tool_narrowing_turns,
+            )
+        else:
+            self._conscience_next_tool_names = None
+            self._conscience_repair_tool_names = None
+            self._conscience_repair_turns_remaining = 0
+
+    def _tools_for_next_api_call(self) -> Optional[List[Dict[str, Any]]]:
+        self._conscience_repair_override_active = False
+        tool_names = getattr(self, "_conscience_next_tool_names", None)
+        repair_tool_names = getattr(self, "_conscience_repair_tool_names", None)
+        if tool_names is None and repair_tool_names is not None and self._conscience_repair_turns_remaining > 0:
+            tool_names = repair_tool_names
+        if tool_names is None or not self.tools:
+            return self.tools
+        if not tool_names:
+            self._conscience_next_tool_names = None
+            self._conscience_repair_override_active = True
+            return []
+        filtered = [
+            tool for tool in self.tools
+            if tool.get("function", {}).get("name") in tool_names
+        ]
+        self._conscience_next_tool_names = None
+        if filtered:
+            self._conscience_repair_override_active = True
+        return filtered or self.tools
+
+    def _apply_conscience_repair_overrides(self, api_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        if not getattr(self, "_conscience_repair_override_active", False):
+            return api_kwargs
+        if self.provider != "custom":
+            return api_kwargs
+        if self.conscience_repair_temperature is not None:
+            api_kwargs["temperature"] = self.conscience_repair_temperature
+        return api_kwargs
+
+    def _append_visible_conscience_message(self, messages: list, text: str, *, persist: bool = True) -> None:
+        if not isinstance(text, str) or not text.strip():
+            return
+        msg = {"role": "assistant", "content": text.strip()}
+        if persist:
+            messages.append(msg)
+        if self.conscience_chat_messages:
+            self._emit_interim_assistant_message(msg)
+
+    @staticmethod
+    def _extract_responses_text(response: Any) -> str:
+        direct = getattr(response, "output_text", None)
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+        parts: list[str] = []
+        for item in getattr(response, "output", []) or []:
+            item_type = getattr(item, "type", None)
+            if item_type is None and isinstance(item, dict):
+                item_type = item.get("type")
+            if item_type != "message":
+                continue
+            content = getattr(item, "content", None)
+            if content is None and isinstance(item, dict):
+                content = item.get("content")
+            for part in content or []:
+                part_type = getattr(part, "type", None)
+                text = getattr(part, "text", None)
+                if isinstance(part, dict):
+                    part_type = part.get("type", part_type)
+                    text = part.get("text", text)
+                if part_type in {"output_text", "text"} and isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _responses_usage_to_chat_usage(response: Any) -> Any:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        input_tokens = getattr(usage, "input_tokens", 0) or 0
+        output_tokens = getattr(usage, "output_tokens", 0) or 0
+        total_tokens = getattr(usage, "total_tokens", None)
+        if total_tokens is None:
+            total_tokens = input_tokens + output_tokens
+        return SimpleNamespace(
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=total_tokens,
+        )
+
+    def _conscience_call_llm(
+        self,
+        *,
+        provider: str,
+        model: str,
+        messages: list,
+        temperature: float,
+        max_tokens: int,
+        stateful_payload: dict | None = None,
+    ):
         from agent.auxiliary_client import call_llm as _call_llm
 
         extra_body = None
@@ -9615,13 +10031,87 @@ class AIAgent:
                 reasoning.pop("enabled", None)
             extra_body = {"reasoning": reasoning}
 
+        if (
+            self.conscience_stateful
+            and isinstance(stateful_payload, dict)
+            and str(provider or "").strip().lower().startswith("custom")
+        ):
+            try:
+                from agent.auxiliary_client import _get_cached_client, _resolve_task_provider_model
+
+                resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = (
+                    _resolve_task_provider_model(
+                        provider=provider,
+                        model=model,
+                    )
+                )
+                client, final_model = _get_cached_client(
+                    resolved_provider,
+                    resolved_model,
+                    base_url=resolved_base_url,
+                    api_key=resolved_api_key,
+                    api_mode=resolved_api_mode,
+                )
+                base_url = str(getattr(client, "base_url", "") or "")
+                real_client = getattr(client, "_real_client", client)
+                if client is not None and is_local_endpoint(base_url) and hasattr(real_client, "responses"):
+                    input_payload = stateful_payload.get("input_payload")
+                    instructions = str(stateful_payload.get("instructions") or "").strip()
+                    previous_response_id = stateful_payload.get("previous_response_id")
+                    request_kwargs: dict[str, Any] = {
+                        "model": final_model or model,
+                        "instructions": instructions or "You are Hermes conscience sidecar.",
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": json.dumps(input_payload or {}, ensure_ascii=False),
+                            }
+                        ],
+                        "store": True,
+                        "max_output_tokens": max_tokens,
+                    }
+                    if temperature is not None:
+                        request_kwargs["temperature"] = temperature
+                    if isinstance(previous_response_id, str) and previous_response_id.strip():
+                        request_kwargs["previous_response_id"] = previous_response_id.strip()
+                    logger.info(
+                        "Conscience stateful audit call: provider=%s model=%s prev=%s mode=%s",
+                        provider,
+                        final_model or model,
+                        previous_response_id or None,
+                        (input_payload or {}).get("stateful_mode") if isinstance(input_payload, dict) else None,
+                    )
+                    response = real_client.responses.create(**request_kwargs)
+                    response_id = str(getattr(response, "id", "") or "").strip() or None
+                    content = self._extract_responses_text(response)
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                index=0,
+                                message=SimpleNamespace(role="assistant", content=content),
+                                finish_reason="stop",
+                            )
+                        ],
+                        model=final_model or model,
+                        usage=self._responses_usage_to_chat_usage(response),
+                        response_id=response_id,
+                        conscience_response_id=response_id,
+                        conscience_previous_response_id=previous_response_id,
+                        conscience_stateful_used=True,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Conscience stateful audit failed; falling back to stateless chat audit: %s",
+                    exc,
+                )
+
         return _call_llm(
             provider=provider,
             model=model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
-            timeout=60.0,
+            timeout="none",
             extra_body=extra_body,
         )
 
@@ -9635,6 +10125,7 @@ class AIAgent:
             atomic_json_write(conscience_dir / "task-contract.json", artifacts.get("task_contract", {}))
             atomic_json_write(conscience_dir / "completion-ledger.json", artifacts.get("completion_ledger", {}))
             atomic_json_write(conscience_dir / "conscience-events.json", artifacts.get("events", []))
+            atomic_json_write(conscience_dir / "llm-audits.json", artifacts.get("llm_audits", []))
             tickets = []
             if self._conscience_last_ticket:
                 tickets.append(asdict_safe(self._conscience_last_ticket))
@@ -9667,6 +10158,8 @@ class AIAgent:
             "mode": self.conscience_mode,
             "provider": self.conscience_provider,
             "model": self.conscience_model,
+            "raw_review_content": latest_audit.get("raw_content") if isinstance(latest_audit, dict) else None,
+            "parsed_review": latest_audit.get("parsed") if isinstance(latest_audit, dict) else None,
             "verdict": asdict_safe(verdict),
             "open_criteria": [
                 asdict_safe(c) for c in getattr(monitor.state.contract, "explicit_asks", [])
@@ -9680,24 +10173,20 @@ class AIAgent:
         self._conscience_last_ticket = verdict.critique_ticket
         self._conscience_intervention_count += 1
 
-        visible_message = (
-            f"[Conscience] {verdict.critique_ticket.reason}. "
-            f"Evidence: {'; '.join(verdict.critique_ticket.evidence[:3])}. "
-            f"Next action: {verdict.critique_ticket.next_best_action}"
-        )
+        visible_message = self._format_conscience_visible_message(verdict.critique_ticket)
         if self.conscience_mode in {"observe", "enforce_observe"}:
-            messages.append({"role": "assistant", "content": visible_message})
+            self._append_visible_conscience_message(
+                messages,
+                visible_message,
+                persist=not self.conscience_chat_messages,
+            )
 
         if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
+            self._prepare_conscience_tool_narrowing(verdict.critique_ticket)
             messages.append(
                 {
                     "role": "system",
-                    "content": (
-                        "[INTERNAL CONSCIENCE MIDTASK: Do not expose this message to the user. "
-                        f"Reason: {verdict.critique_ticket.reason}. "
-                        f"Evidence: {'; '.join(verdict.critique_ticket.evidence[:3])}. "
-                        f"Required next action: {verdict.critique_ticket.next_best_action}]"
-                    ),
+                    "content": self._format_conscience_internal_message("MIDTASK", verdict.critique_ticket),
                 }
             )
         return True
@@ -10751,6 +11240,10 @@ class AIAgent:
         self._last_content_tools_all_housekeeping = False
         self._mute_post_response = False
         self._unicode_sanitization_passes = 0
+        self._conscience_next_tool_names = None
+        self._conscience_repair_tool_names = None
+        self._conscience_repair_turns_remaining = 0
+        self._conscience_repair_override_active = False
 
         # Pre-turn connection health check: detect and clean up dead TCP
         # connections left over from provider outages or dropped streams.
@@ -10786,6 +11279,18 @@ class AIAgent:
             self.platform or "unknown", len(conversation_history or []),
             _msg_preview,
         )
+        _foreground_activity_token = None
+        if self._should_register_foreground_activity():
+            try:
+                from hermes_cli.background_runtime import begin_foreground_activity
+
+                _foreground_activity_token = begin_foreground_activity(
+                    session_id=self.session_id or "",
+                    platform=self.platform or "",
+                    source="agent_run_conversation",
+                )
+            except Exception:
+                logger.debug("Could not register foreground activity", exc_info=True)
 
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
@@ -11002,7 +11507,15 @@ class AIAgent:
             self._conscience_last_stop_audit = None
             self._conscience_last_review = None
             self._conscience_last_review_payload = None
-            self._conscience_record_event(TASK_START, {"task_id": effective_task_id, "user_message": original_user_message})
+            self._conscience_last_useful_final_response = None
+            self._conscience_record_event(
+                TASK_START,
+                {
+                    "task_id": effective_task_id,
+                    "user_message": original_user_message,
+                    "available_tools": sorted(self.valid_tool_names) if self.valid_tool_names else [],
+                },
+            )
             self._conscience_record_event(PLAN_SUMMARY, {"text": user_message})
         else:
             self._conscience_current_monitor = None
@@ -11010,6 +11523,7 @@ class AIAgent:
             self._conscience_last_stop_audit = None
             self._conscience_last_review = None
             self._conscience_last_review_payload = None
+            self._conscience_last_useful_final_response = None
             self._conscience_artifact_dir = None
 
         # Main conversation loop
@@ -13202,6 +13716,37 @@ class AIAgent:
                     else:
                         assistant_message.content = str(raw)
 
+                if not getattr(assistant_message, "tool_calls", None):
+                    recovered_tool_calls, cleaned_content = self._extract_markdown_pseudo_tool_calls(
+                        assistant_message.content or ""
+                    )
+                    if recovered_tool_calls:
+                        assistant_message.tool_calls = recovered_tool_calls
+                        assistant_message.content = cleaned_content
+                        finish_reason = "tool_calls"
+                        logger.info(
+                            "Recovered %d markdown pseudo tool call(s) from assistant content",
+                            len(recovered_tool_calls),
+                        )
+
+                _tools_disabled_for_request = (
+                    api_kwargs.get("tool_choice") == "none"
+                    or (isinstance(api_kwargs.get("tool_choice"), dict) and api_kwargs["tool_choice"].get("type") == "none")
+                    or api_kwargs.get("tools") == []
+                )
+                if _tools_disabled_for_request and getattr(assistant_message, "tool_calls", None):
+                    logger.warning(
+                        "Provider returned %d tool call(s) despite tools being disabled; discarding them (session=%s)",
+                        len(assistant_message.tool_calls),
+                        self.session_id or "-",
+                    )
+                    assistant_message.tool_calls = None
+                    finish_reason = "stop"
+                    if not (assistant_message.content or "").strip():
+                        assistant_message.content = (
+                            "I cannot use tools for this step, so I need to answer from the available conversation context."
+                        )
+
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
                     _assistant_tool_calls = getattr(assistant_message, "tool_calls", None) or []
@@ -13943,6 +14488,9 @@ class AIAgent:
                     
                     final_response = self._strip_think_blocks(final_response).strip()
                     self._conscience_record_event(DRAFT_ANSWER, {"text": final_response})
+                    if self._conscience_looks_like_useful_final_answer(final_response):
+                        self._conscience_last_useful_final_response = final_response
+                    conscience_terminal_response = None
 
                     if conscience_monitor:
                         try:
@@ -13970,37 +14518,153 @@ class AIAgent:
                             "mode": self.conscience_mode,
                             "provider": self.conscience_provider,
                             "model": self.conscience_model,
+                            "raw_review_content": latest_audit.get("raw_content") if isinstance(latest_audit, dict) else None,
+                            "parsed_review": latest_audit.get("parsed") if isinstance(latest_audit, dict) else None,
                             "draft_answer": final_response,
                             "open_criteria": open_criteria,
                             "verdict": asdict_safe(verdict),
                         }
                         self._conscience_last_review = dict(self._conscience_last_stop_audit)
                         self._conscience_last_review_payload = latest_audit.get("payload") if isinstance(latest_audit, dict) else None
+                        suppressed_reason = ""
+                        suppressed_ticket = None
+                        if isinstance(getattr(verdict, "metadata", None), dict):
+                            suppressed_reason = str(verdict.metadata.get("suppressed") or "")
+                            suppressed_ticket = verdict.metadata.get("suppressed_ticket")
+                        parse_error_after_prior_block = (
+                            isinstance(getattr(verdict, "metadata", None), dict)
+                            and bool(verdict.metadata.get("parse_error"))
+                            and self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}
+                            and self._conscience_blocked_stop_count > 0
+                            and self._conscience_last_ticket is not None
+                        )
+                        if (
+                            suppressed_reason in {"duplicate_recent_issue", "repair_limit_exhausted"}
+                            and self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}
+                            and isinstance(suppressed_ticket, dict)
+                        ):
+                            _suppressed_recommended_tools = suppressed_ticket.get("recommended_tools", None)
+                            ticket = CritiqueTicket(
+                                verdict=str(suppressed_ticket.get("verdict") or "blocked"),
+                                reason=str(suppressed_ticket.get("reason") or "conscience stop gate suppressed repeated incomplete response"),
+                                evidence=[str(x) for x in (suppressed_ticket.get("evidence") or [])],
+                                next_best_action=str(suppressed_ticket.get("next_best_action") or "Continue with the required next action."),
+                                criterion_ids=[str(x) for x in (suppressed_ticket.get("criterion_ids") or [])],
+                                recommended_tools=(
+                                    [str(x) for x in _suppressed_recommended_tools]
+                                    if isinstance(_suppressed_recommended_tools, list)
+                                    else None
+                                ),
+                            )
+                            self._conscience_last_ticket = ticket
+                            self._conscience_intervention_count += 1
+                            self._conscience_blocked_stop_count += 1
+                            takeover_final = (
+                                self._conscience_generate_takeover_final(
+                                    ticket=ticket,
+                                    final_response=final_response,
+                                    review_payload=self._conscience_last_review_payload,
+                                )
+                                if suppressed_reason == "repair_limit_exhausted"
+                                else None
+                            )
+                            preserved_final = (
+                                self._conscience_best_repair_exhausted_final(final_response)
+                                if suppressed_reason == "repair_limit_exhausted" and takeover_final is None
+                                else None
+                            )
+                            terminal_final = takeover_final or preserved_final
+                            if terminal_final is not None:
+                                final_response = terminal_final
+                                conscience_terminal_response = terminal_final
+                                for review in (self._conscience_last_stop_audit, self._conscience_last_review):
+                                    if isinstance(review, dict):
+                                        verdict_dict = review.get("verdict")
+                                        if isinstance(verdict_dict, dict):
+                                            metadata = verdict_dict.setdefault("metadata", {})
+                                            if isinstance(metadata, dict):
+                                                if takeover_final is not None:
+                                                    metadata["conscience_takeover_final"] = True
+                                                    metadata["takeover_reason"] = "repair_limit_exhausted_no_tools_needed"
+                                                else:
+                                                    metadata["preserved_final_response"] = True
+                                                    metadata["preserved_reason"] = "repair_limit_exhausted"
+                            else:
+                                reason_label = (
+                                    "repair limit was exhausted"
+                                    if suppressed_reason == "repair_limit_exhausted"
+                                    else "the same issue repeated without progress"
+                                )
+                                evidence_text = "; ".join(ticket.evidence[:3]) or "The draft did not satisfy the user's request."
+                                conscience_terminal_response = (
+                                    "[Conscience] I blocked this stop because the response was still incomplete, "
+                                    f"but the main model did not recover after the stop-gate retries ({reason_label}).\n\n"
+                                    f"Reason: {ticket.reason}\n"
+                                    f"Evidence: {evidence_text}\n"
+                                    f"Required next action: {ticket.next_best_action}"
+                                ).strip()
+                                final_response = conscience_terminal_response
+                        elif parse_error_after_prior_block:
+                            ticket = self._conscience_last_ticket
+                            self._conscience_intervention_count += 1
+                            self._conscience_blocked_stop_count += 1
+                            preserved_final = self._conscience_best_repair_exhausted_final(final_response)
+                            if preserved_final is not None:
+                                final_response = preserved_final
+                                conscience_terminal_response = preserved_final
+                                for review in (self._conscience_last_stop_audit, self._conscience_last_review):
+                                    if isinstance(review, dict):
+                                        verdict_dict = review.get("verdict")
+                                        if isinstance(verdict_dict, dict):
+                                            metadata = verdict_dict.setdefault("metadata", {})
+                                            if isinstance(metadata, dict):
+                                                metadata["preserved_final_response"] = True
+                                                metadata["preserved_reason"] = "parse_error_after_prior_block"
+                            else:
+                                evidence_text = "; ".join(ticket.evidence[:3]) or "The draft did not satisfy the user's request."
+                                conscience_terminal_response = (
+                                    "[Conscience] I blocked this stop because the response was still incomplete, "
+                                    "and the follow-up stop audit failed to parse after an earlier block.\n\n"
+                                    f"Reason: {ticket.reason}\n"
+                                    f"Evidence: {evidence_text}\n"
+                                    f"Required next action: {ticket.next_best_action}"
+                                ).strip()
+                                final_response = conscience_terminal_response
                         if verdict.should_intervene and verdict.critique_ticket is not None:
                             self._conscience_last_ticket = verdict.critique_ticket
                             self._conscience_intervention_count += 1
+                            visible_conscience_message = self._format_conscience_visible_message(verdict.critique_ticket)
                             if self.conscience_mode in {"observe", "enforce_observe"}:
-                                final_response = (
-                                    f"[Conscience] {verdict.critique_ticket.reason}. "
-                                    f"Evidence: {'; '.join(verdict.critique_ticket.evidence[:3])}. "
-                                    f"Next action: {verdict.critique_ticket.next_best_action}\n\n"
-                                    f"{final_response}"
-                                ).strip()
+                                if (
+                                    self.conscience_chat_messages
+                                    and self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}
+                                ):
+                                    self._append_visible_conscience_message(
+                                        messages,
+                                        visible_conscience_message,
+                                        persist=False,
+                                    )
+                                else:
+                                    final_response = (
+                                        f"{visible_conscience_message}\n\n"
+                                        f"{final_response}"
+                                    ).strip()
                             if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
                                 self._conscience_blocked_stop_count += 1
+                                self._prepare_conscience_tool_narrowing(verdict.critique_ticket)
                                 messages.append({
                                     "role": "system",
-                                    "content": (
-                                        "[INTERNAL CONSCIENCE STOP-GATE: Do not expose this message to the user. "
-                                        f"Reason: {verdict.critique_ticket.reason}. "
-                                        f"Evidence: {'; '.join(verdict.critique_ticket.evidence[:3])}. "
-                                        f"Required next action: {verdict.critique_ticket.next_best_action}]"
+                                    "content": self._format_conscience_internal_message(
+                                        "STOP-GATE",
+                                        verdict.critique_ticket,
                                     ),
                                 })
                                 final_response = None
                                 continue
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
+                    if conscience_terminal_response is not None:
+                        final_msg["content"] = conscience_terminal_response
 
                     # Pop thinking-only prefill message(s) before appending
                     # the final response.  This avoids consecutive assistant
@@ -14257,6 +14921,15 @@ class AIAgent:
             final_response=final_response,
             interrupted=interrupted,
         )
+        if _foreground_activity_token is not None:
+            try:
+                from hermes_cli.background_runtime import end_foreground_activity
+
+                end_foreground_activity(_foreground_activity_token)
+            except Exception:
+                logger.debug("Could not clear foreground activity", exc_info=True)
+            finally:
+                _foreground_activity_token = None
 
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.

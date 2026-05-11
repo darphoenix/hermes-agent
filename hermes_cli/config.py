@@ -467,6 +467,14 @@ DEFAULT_CONFIG = {
         "conscience_provider": "openai-codex",
         "conscience_model": "gpt-5.4",
         "conscience_reasoning_effort": "medium",
+        # When true, each conscience intervention is emitted as a visible
+        # interim assistant message in chat platforms instead of only being
+        # persisted in artifacts / injected internally.
+        "conscience_chat_messages": False,
+        # Keep a per-Hermes-turn stateful Responses thread for local custom
+        # conscience models. The first audit sends full context; later audits
+        # send append-only deltas so the wrapper can reuse KV/cache.
+        "conscience_stateful": True,
         "disabled_toolsets": [],
     },
     

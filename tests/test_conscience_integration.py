@@ -45,7 +45,7 @@ def _tool_call(name, arguments, call_id="call_1"):
     )
 
 
-def _make_agent(tmp_path, conscience_mode="shadow"):
+def _make_agent(tmp_path, conscience_mode="shadow", conscience_chat_messages=False):
     with (
         patch("run_agent.get_tool_definitions", return_value=_tool_defs()),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -58,6 +58,7 @@ def _make_agent(tmp_path, conscience_mode="shadow"):
                     "conscience_provider": "openai-codex",
                     "conscience_model": "gpt-5.4",
                     "conscience_reasoning_effort": "high",
+                    "conscience_chat_messages": conscience_chat_messages,
                 }
             },
         ),
@@ -104,6 +105,68 @@ def test_run_conversation_emits_conscience_artifacts_in_shadow_mode(tmp_path):
     assert "task_contract" in artifacts
     conscience_dir = Path.home() / ".hermes" / "conscience" / "test_session"
     assert (conscience_dir / "task-contract.json").exists() or artifacts["task_contract"]
+
+
+def test_conscience_call_llm_uses_stateful_responses_for_local_custom(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    agent.conscience_stateful = True
+    fake_response = SimpleNamespace(
+        id="resp_stateful_1",
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(type="output_text", text='{"should_intervene": false}')
+                ],
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=12, output_tokens=3, total_tokens=15),
+    )
+    fake_create = MagicMock(return_value=fake_response)
+    fake_client = SimpleNamespace(
+        base_url="http://127.0.0.1:1237/v1/",
+        responses=SimpleNamespace(create=fake_create),
+    )
+    stateful_payload = {
+        "previous_response_id": "resp_previous",
+        "instructions": "You are a stateful conscience.",
+        "input_payload": {
+            "review_type": "stop",
+            "stateful_mode": "delta",
+            "draft_answer": "Done.",
+        },
+    }
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "local-model", None, None, None),
+        ),
+        patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(fake_client, "local-model"),
+        ),
+    ):
+        response = agent._conscience_call_llm(
+            provider="custom:conscience-local",
+            model="local-model",
+            messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "{}"}],
+            temperature=0,
+            max_tokens=1200,
+            stateful_payload=stateful_payload,
+        )
+
+    fake_create.assert_called_once()
+    kwargs = fake_create.call_args.kwargs
+    assert kwargs["store"] is True
+    assert kwargs["previous_response_id"] == "resp_previous"
+    assert kwargs["max_output_tokens"] == 1200
+    sent_payload = json.loads(kwargs["input"][0]["content"])
+    assert sent_payload["stateful_mode"] == "delta"
+    assert response.conscience_stateful_used is True
+    assert response.conscience_response_id == "resp_stateful_1"
+    assert response.choices[0].message.content == '{"should_intervene": false}'
+    assert response.usage.prompt_tokens == 12
 
 
 def test_enforce_stop_gate_blocks_premature_completion(tmp_path):
@@ -363,6 +426,362 @@ def test_enforce_observe_shows_message_and_still_repairs(tmp_path):
     assert result["conscience"]["mode"] == "enforce_observe"
     assert result["conscience"]["blocked_stop_count"] == 1
     assert result["final_response"] == "Fixed now."
+
+
+def test_conscience_chat_messages_emit_stop_gate_interim(tmp_path):
+    agent = _make_agent(
+        tmp_path,
+        conscience_mode="enforce_observe",
+        conscience_chat_messages=True,
+    )
+    seen = []
+    agent.interim_assistant_callback = lambda text, **kwargs: seen.append((text, kwargs))
+    tool_calls = [_tool_call("write_file", {"path": str(tmp_path / "repair3.md"), "content": "hello"})]
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("Let me write the file."),
+        _mock_response("Writing", finish_reason="tool_calls", tool_calls=tool_calls),
+        _mock_response("Fixed now."),
+    ]
+    with (
+        patch.object(
+            agent,
+            "_conscience_call_llm",
+            side_effect=[
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=json.dumps(
+                                    {
+                                        "should_intervene": True,
+                                        "verdict": "block",
+                                        "reason": "still only intent",
+                                        "evidence": ["no file write yet"],
+                                        "next_best_action": "write the file",
+                                        "criterion_ids": ["criterion_001"],
+                                        "confidence": "high",
+                                    }
+                                )
+                            )
+                        )
+                    ]
+                ),
+                SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"should_intervene": false}'))]),
+                SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"should_intervene": false}'))]),
+            ],
+        ),
+        patch("run_agent.handle_function_call", return_value='{"success": true, "path": "/tmp/repair3.md"}'),
+    ):
+        result = agent.run_conversation("Save it into new .md file")
+
+    assert result["final_response"] == "Fixed now."
+    assert seen
+    assert seen[0][0].startswith("[Conscience]")
+    assert "still only intent" in seen[0][0]
+    assistant_messages = [m.get("content", "") for m in result["messages"] if m.get("role") == "assistant"]
+    assert not any(str(m).startswith("[Conscience]") for m in assistant_messages)
+    assert any(
+        "[INTERNAL CONSCIENCE STOP-GATE" in str(m.get("content", ""))
+        for m in result["messages"]
+        if m.get("role") == "system"
+    )
+
+
+def test_enforce_stop_gate_fails_closed_when_repair_limit_exhausts(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    bad_draft = "Right. Let me actually **do** the Firecrawl setup instead of talking about it."
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("Right. Let me check Docker status and pull the Firecrawl image."),
+        _mock_response(bad_draft),
+        _mock_response(bad_draft),
+        _mock_response(bad_draft),
+        _mock_response(bad_draft),
+    ]
+
+    audit_responses = []
+    for i in range(5):
+        audit_responses.append(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "should_intervene": True,
+                                    "verdict": "repair",
+                                    "reason": f"still_only_intent_round_{i}",
+                                    "evidence": ["no docker command output", "no service status"],
+                                    "next_best_action": "Run docker commands and report the output.",
+                                    "criterion_ids": ["criterion_001"],
+                                    "confidence": "high",
+                                }
+                            )
+                        )
+                    )
+                ]
+            )
+        )
+
+    with patch.object(agent, "_conscience_call_llm", side_effect=audit_responses):
+        result = agent.run_conversation("Continue with setup of firecrawl")
+
+    assert result["final_response"].startswith("[Conscience]")
+    assert "repair limit was exhausted" in result["final_response"]
+    assert "Run docker commands" in result["final_response"]
+    assert result["final_response"] != bad_draft
+    assert result["messages"][-1]["content"].startswith("[Conscience]")
+    assert result["conscience"]["blocked_stop_count"] == 5
+    assert result["conscience"]["latest_review"]["verdict"]["metadata"]["suppressed"] == "repair_limit_exhausted"
+
+
+def test_enforce_stop_gate_preserves_useful_answer_when_repair_limit_exhausts(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    useful_draft = (
+        "I found the relevant state. The setup is partially complete: the config file exists, "
+        "but the service has not been started yet. The next practical step is to start the service "
+        "and verify the health endpoint."
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(useful_draft),
+        _mock_response(useful_draft),
+        _mock_response(useful_draft),
+        _mock_response(useful_draft),
+        _mock_response(useful_draft),
+    ]
+
+    audit_responses = []
+    for i in range(5):
+        audit_responses.append(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "should_intervene": True,
+                                    "verdict": "repair",
+                                    "reason": f"still_missing_live_health_check_round_{i}",
+                                    "evidence": ["service health endpoint was not checked"],
+                                    "next_best_action": "Run the health check before stopping.",
+                                    "criterion_ids": ["criterion_001"],
+                                    "confidence": "high",
+                                }
+                            )
+                        )
+                    )
+                ]
+            )
+        )
+
+    with patch.object(agent, "_conscience_call_llm", side_effect=audit_responses):
+        result = agent.run_conversation("Check whether setup is fully working")
+
+    assert result["final_response"] == useful_draft
+    assert not result["final_response"].startswith("[Conscience]")
+    assert result["messages"][-1]["content"] == useful_draft
+    assert result["conscience"]["blocked_stop_count"] == 5
+    metadata = result["conscience"]["latest_review"]["verdict"]["metadata"]
+    assert metadata["suppressed"] == "repair_limit_exhausted"
+    assert metadata["preserved_final_response"] is True
+
+
+def test_enforce_stop_gate_conscience_takeover_when_exhausted_and_no_tools_needed(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    repeated_draft = "Alright, here is the same partial summary again. Want me to draft the final next step?"
+    takeover_final = "Here is the final consolidated answer with the next step included."
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(repeated_draft),
+        _mock_response(repeated_draft),
+        _mock_response(repeated_draft),
+        _mock_response(repeated_draft),
+        _mock_response(repeated_draft),
+    ]
+
+    audit_responses = []
+    for i in range(5):
+        audit_responses.append(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "should_intervene": True,
+                                    "verdict": "repair",
+                                    "reason": f"draft_loop_round_{i}",
+                                    "evidence": ["the actor is repeating the same draft"],
+                                    "next_best_action": "Stop asking to continue and produce the final answer now.",
+                                    "criterion_ids": ["criterion_001"],
+                                    "recommended_tools": [],
+                                    "confidence": "high",
+                                }
+                            )
+                        )
+                    )
+                ]
+            )
+        )
+    audit_responses.append(
+        SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=takeover_final))])
+    )
+
+    with patch.object(agent, "_conscience_call_llm", side_effect=audit_responses):
+        result = agent.run_conversation("Report on situation")
+
+    assert result["final_response"] == f"[Conscience] {takeover_final}"
+    assert result["messages"][-1]["content"] == f"[Conscience] {takeover_final}"
+    assert result["conscience"]["blocked_stop_count"] == 5
+    metadata = result["conscience"]["latest_review"]["verdict"]["metadata"]
+    assert metadata["suppressed"] == "repair_limit_exhausted"
+    assert metadata["conscience_takeover_final"] is True
+    assert metadata["takeover_reason"] == "repair_limit_exhausted_no_tools_needed"
+
+
+def test_enforce_stop_gate_falls_back_to_prior_useful_answer_when_exhausted(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    useful_draft = (
+        "I checked the available evidence. The import path is configured correctly, "
+        "but I could not confirm the background service health check yet."
+    )
+    intent_stub = "Right. Let me actually run that health check now."
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(useful_draft),
+        _mock_response(intent_stub),
+        _mock_response(intent_stub),
+        _mock_response(intent_stub),
+        _mock_response(intent_stub),
+    ]
+
+    audit_responses = []
+    for i in range(5):
+        audit_responses.append(
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "should_intervene": True,
+                                    "verdict": "repair",
+                                    "reason": f"missing_health_check_round_{i}",
+                                    "evidence": ["health check was still not run"],
+                                    "next_best_action": "Run the health check before stopping.",
+                                    "criterion_ids": ["criterion_001"],
+                                    "confidence": "high",
+                                }
+                            )
+                        )
+                    )
+                ]
+            )
+        )
+
+    with patch.object(agent, "_conscience_call_llm", side_effect=audit_responses):
+        result = agent.run_conversation("Check whether setup is fully working")
+
+    assert result["final_response"] == useful_draft
+    assert result["messages"][-1]["content"] == useful_draft
+    metadata = result["conscience"]["latest_review"]["verdict"]["metadata"]
+    assert metadata["suppressed"] == "repair_limit_exhausted"
+    assert metadata["preserved_final_response"] is True
+
+
+def test_enforce_stop_gate_fails_closed_on_parse_error_after_prior_block(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    bad_draft = "Let me check it.\n\nexecute_code\n```python\nprint('checking')\n```"
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(bad_draft),
+        _mock_response(bad_draft),
+    ]
+
+    with patch.object(
+        agent,
+        "_conscience_call_llm",
+        side_effect=[
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "should_intervene": True,
+                                    "verdict": "repair",
+                                    "reason": "code was written but not executed",
+                                    "evidence": ["no tool output is present"],
+                                    "next_best_action": "Execute the code and report the result.",
+                                    "criterion_ids": ["criterion_001"],
+                                    "confidence": "high",
+                                }
+                            )
+                        )
+                    )
+                ]
+            ),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))]),
+        ],
+    ):
+        result = agent.run_conversation("Check current internet setup")
+
+    assert result["final_response"].startswith("[Conscience]")
+    assert "failed to parse after an earlier block" in result["final_response"]
+    assert "Execute the code" in result["final_response"]
+    assert result["final_response"] != bad_draft
+    assert result["conscience"]["blocked_stop_count"] == 2
+    assert result["conscience"]["latest_review"]["verdict"]["metadata"]["parse_error"] is True
+    assert result["conscience"]["latest_review"]["raw_review_content"] == "not json"
+
+
+def test_enforce_stop_gate_preserves_useful_answer_on_parse_error_after_prior_block(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    bad_draft = "Let me check it.\n\nexecute_code\n```python\nprint('checking')\n```"
+    useful_draft = (
+        "Adamas Nanotechnologies should be listed as a USA supplier that ships to Europe, "
+        "not as a Hungary or Budapest source. The corrected answer is to prioritize EU-based "
+        "sources first, then note Adamas separately as a non-EU fallback."
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(bad_draft),
+        _mock_response(useful_draft),
+    ]
+
+    with patch.object(
+        agent,
+        "_conscience_call_llm",
+        side_effect=[
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "should_intervene": True,
+                                    "verdict": "repair",
+                                    "reason": "supplier country is mislabeled",
+                                    "evidence": ["Adamas is not an EU supplier"],
+                                    "next_best_action": "Correct Adamas to USA/non-EU fallback and then answer.",
+                                    "criterion_ids": ["criterion_001"],
+                                    "confidence": "high",
+                                }
+                            )
+                        )
+                    )
+                ]
+            ),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))]),
+        ],
+    ):
+        result = agent.run_conversation("Check qubit diamond sources in the EU")
+
+    assert result["final_response"] == useful_draft
+    assert result["messages"][-1]["content"] == useful_draft
+    assert not result["final_response"].startswith("[Conscience]")
+    assert result["conscience"]["blocked_stop_count"] == 2
+    latest_review = result["conscience"]["latest_review"]
+    assert latest_review["raw_review_content"] == "not json"
+    metadata = latest_review["verdict"]["metadata"]
+    assert metadata["parse_error"] is True
+    assert metadata["preserved_final_response"] is True
+    assert metadata["preserved_reason"] == "parse_error_after_prior_block"
 
 
 def test_midtask_intervention_visible_in_observe_mode(tmp_path):
