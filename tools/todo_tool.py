@@ -15,11 +15,45 @@ Design:
 """
 
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 
 # Valid status values for todo items
 VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
+
+
+def _coerce_todos_arg(todos: Any) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """
+    Normalize model-provided todo arguments.
+
+    Some local models emit a JSON-serialized array for an array-typed argument.
+    Accept that shape so the todo tool still works and progress display does not
+    count the string's characters as tasks.
+    """
+    if todos is None:
+        return None, None
+
+    if isinstance(todos, str):
+        raw = todos.strip()
+        if not raw:
+            return [], None
+        try:
+            todos = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return None, f"todos must be an array or JSON array string: {exc.msg}"
+
+    if isinstance(todos, dict) and isinstance(todos.get("todos"), list):
+        todos = todos["todos"]
+
+    if not isinstance(todos, list):
+        return None, f"todos must be an array, got {type(todos).__name__}"
+
+    normalized: List[Dict[str, Any]] = []
+    for idx, item in enumerate(todos):
+        if not isinstance(item, dict):
+            return None, f"todos[{idx}] must be an object, got {type(item).__name__}"
+        normalized.append(item)
+    return normalized, None
 
 
 class TodoStore:
@@ -173,7 +207,10 @@ def todo_tool(
         return tool_error("TodoStore not initialized")
 
     if todos is not None:
-        items = store.write(todos, merge)
+        normalized_todos, error = _coerce_todos_arg(todos)
+        if error:
+            return tool_error(error)
+        items = store.write(normalized_todos or [], merge)
     else:
         items = store.read()
 

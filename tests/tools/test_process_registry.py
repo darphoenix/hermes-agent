@@ -492,9 +492,30 @@ class TestSpawnEnvSanitization:
         assert "/data/data/com.termux/files/usr/tmp/hermes_bg_" in bg_command
         assert ".exit" in bg_command
         assert "rc=$?;" in bg_command
+        assert "&& ( nohup" not in bg_command
         assert " > /tmp/hermes_bg_" not in bg_command
         assert "cat /tmp/hermes_bg_" not in bg_command
         fake_thread.start.assert_called_once()
+
+    def test_spawn_via_env_fails_when_backend_returns_no_pid(self, registry):
+        class FakeEnv:
+            def get_temp_dir(self):
+                return "/tmp"
+
+            def execute(self, command, timeout=None):
+                return {"output": ""}
+
+        fake_thread = MagicMock()
+
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(FakeEnv(), "python3 server.py")
+
+        assert session.exited is True
+        assert session.exit_code == -1
+        assert session.pid is None
+        assert "did not return a background PID" in session.output_buffer
+        fake_thread.start.assert_not_called()
 
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")

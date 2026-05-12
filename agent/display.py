@@ -167,6 +167,22 @@ def _oneline(text: str) -> str:
     return " ".join(text.split())
 
 
+def _todo_item_count(todos_arg) -> int | None:
+    """Return todo item count, accepting JSON strings some local models emit."""
+    if todos_arg is None:
+        return None
+    if isinstance(todos_arg, str):
+        parsed = safe_json_loads(todos_arg, default=None)
+        if parsed is None:
+            return None
+        todos_arg = parsed
+    if isinstance(todos_arg, dict):
+        todos_arg = todos_arg.get("todos")
+    if isinstance(todos_arg, list):
+        return len(todos_arg)
+    return None
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
@@ -207,12 +223,13 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     if tool_name == "todo":
         todos_arg = args.get("todos")
         merge = args.get("merge", False)
+        count = _todo_item_count(todos_arg)
         if todos_arg is None:
             return "reading task list"
         elif merge:
-            return f"updating {len(todos_arg)} task(s)"
+            return f"updating {count if count is not None else '?'} task(s)"
         else:
-            return f"planning {len(todos_arg)} task(s)"
+            return f"planning {count if count is not None else '?'} task(s)"
 
     if tool_name == "session_search":
         query = _oneline(args.get("query", ""))
@@ -927,12 +944,15 @@ def get_cute_tool_message(
     if tool_name == "todo":
         todos_arg = args.get("todos")
         merge = args.get("merge", False)
+        count = _todo_item_count(todos_arg)
         if todos_arg is None:
             return _wrap(f"┊ 📋 plan      reading tasks  {dur}")
         elif merge:
-            return _wrap(f"┊ 📋 plan      update {len(todos_arg)} task(s)  {dur}")
+            label = count if count is not None else "?"
+            return _wrap(f"┊ 📋 plan      update {label} task(s)  {dur}")
         else:
-            return _wrap(f"┊ 📋 plan      {len(todos_arg)} task(s)  {dur}")
+            label = count if count is not None else "?"
+            return _wrap(f"┊ 📋 plan      {label} task(s)  {dur}")
     if tool_name == "session_search":
         return _wrap(f"┊ 🔍 recall    \"{_trunc(args.get('query', ''), 35)}\"  {dur}")
     if tool_name == "memory":
@@ -998,5 +1018,3 @@ def get_cute_tool_message(
 # =========================================================================
 # Honcho session line (one-liner with clickable OSC 8 hyperlink)
 # =========================================================================
-
-

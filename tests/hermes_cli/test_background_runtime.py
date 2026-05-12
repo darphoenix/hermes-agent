@@ -3,8 +3,12 @@ from __future__ import annotations
 import pytest
 
 from hermes_cli.background_runtime import (
+    BackgroundRuntimeDeferred,
     BackgroundRuntimeError,
     background_runtime_enabled_for,
+    begin_foreground_activity,
+    end_foreground_activity,
+    foreground_activity_snapshot,
     resolve_background_runtime,
 )
 
@@ -131,3 +135,63 @@ def test_background_runtime_fails_closed_when_enabled_but_incomplete():
             parent_model="/models/main",
             config=_config(base_url=""),
         )
+
+
+def test_background_runtime_defers_optional_work_while_foreground_active():
+    token = begin_foreground_activity(session_id="s1", platform="telegram")
+    try:
+        with pytest.raises(BackgroundRuntimeDeferred):
+            resolve_background_runtime(
+                "background_review",
+                parent_model="/models/main",
+                config=_config(),
+            )
+    finally:
+        end_foreground_activity(token)
+
+    assert foreground_activity_snapshot() == {}
+
+
+def test_background_runtime_allows_foreground_auxiliary_while_foreground_active():
+    cfg = _config(
+        use_for={
+            "background_review": True,
+            "gateway_background": True,
+            "auxiliary": False,
+            "auxiliary:compression": True,
+        }
+    )
+    token = begin_foreground_activity(session_id="s1", platform="cli")
+    try:
+        model, runtime = resolve_background_runtime(
+            "auxiliary:compression",
+            parent_model="/models/main",
+            parent_runtime={"responses_stateful": True},
+            config=cfg,
+        )
+    finally:
+        end_foreground_activity(token)
+
+    assert model == "/models/qwen"
+    assert runtime["base_url"] == "http://127.0.0.1:1237/v1"
+
+
+def test_background_runtime_defers_title_generation_while_foreground_active():
+    cfg = _config(
+        use_for={
+            "background_review": True,
+            "gateway_background": True,
+            "auxiliary": False,
+            "auxiliary:title_generation": True,
+        }
+    )
+    token = begin_foreground_activity(session_id="s1", platform="telegram")
+    try:
+        with pytest.raises(BackgroundRuntimeDeferred):
+            resolve_background_runtime(
+                "auxiliary:title_generation",
+                parent_model="/models/main",
+                config=cfg,
+            )
+    finally:
+        end_foreground_activity(token)

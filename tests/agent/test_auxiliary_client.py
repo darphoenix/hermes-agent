@@ -973,6 +973,84 @@ class TestIsConnectionError:
         assert _is_connection_error(err) is False
 
 
+class TestAuxiliaryTimeouts:
+    def test_call_llm_no_timeout_sentinel_passes_none_to_client(self):
+        client = MagicMock()
+        client.base_url = "http://127.0.0.1:1237/v1"
+        response = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        with (
+            patch("agent.auxiliary_client._get_cached_client", return_value=(client, "local-model")),
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+        ):
+            result = call_llm(
+                provider="custom",
+                model="local-model",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout="none",
+            )
+
+        assert result is response
+        assert client.chat.completions.create.call_args.kwargs["timeout"] is None
+
+    def test_call_llm_local_endpoint_disables_numeric_timeout(self):
+        client = MagicMock()
+        client.base_url = "http://127.0.0.1:1237/v1"
+        response = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        with (
+            patch("agent.auxiliary_client._get_cached_client", return_value=(client, "local-model")),
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+        ):
+            result = call_llm(
+                provider="custom",
+                model="local-model",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=30.0,
+            )
+
+        assert result is response
+        assert client.chat.completions.create.call_args.kwargs["timeout"] is None
+
+    def test_call_llm_remote_endpoint_preserves_numeric_timeout(self):
+        client = MagicMock()
+        client.base_url = "https://api.example.com/v1"
+        response = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        with (
+            patch("agent.auxiliary_client._get_cached_client", return_value=(client, "remote-model")),
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+        ):
+            result = call_llm(
+                provider="custom",
+                model="remote-model",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=30.0,
+            )
+
+        assert result is response
+        assert client.chat.completions.create.call_args.kwargs["timeout"] == 30.0
+
+    def test_resolve_provider_client_local_custom_disables_sdk_retries(self):
+        client = MagicMock()
+        client.base_url = "http://127.0.0.1:1237/v1"
+
+        with patch("agent.auxiliary_client.OpenAI", return_value=client) as mock_openai:
+            resolved, model = resolve_provider_client(
+                "custom",
+                model="local-model",
+                explicit_base_url="http://127.0.0.1:1237/v1",
+                explicit_api_key="mlx-key",
+            )
+
+        assert resolved is client
+        assert model == "local-model"
+        assert mock_openai.call_args.kwargs["max_retries"] == 0
+
+
 class TestKimiTemperatureOmitted:
     """Kimi/Moonshot models should have temperature OMITTED from API kwargs.
 

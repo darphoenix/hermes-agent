@@ -2415,6 +2415,16 @@ def _(rid, params: dict) -> dict:
                 session_id=new_key,
                 role=msg.get("role", "user"),
                 content=msg.get("content"),
+                tool_name=msg.get("tool_name") or msg.get("name"),
+                tool_calls=msg.get("tool_calls"),
+                tool_call_id=msg.get("tool_call_id"),
+                finish_reason=msg.get("finish_reason"),
+                reasoning=msg.get("reasoning") if msg.get("role") == "assistant" else None,
+                reasoning_content=msg.get("reasoning_content") if msg.get("role") == "assistant" else None,
+                reasoning_details=msg.get("reasoning_details") if msg.get("role") == "assistant" else None,
+                codex_reasoning_items=msg.get("codex_reasoning_items") if msg.get("role") == "assistant" else None,
+                codex_message_items=msg.get("codex_message_items") if msg.get("role") == "assistant" else None,
+                responses_response_id=msg.get("responses_response_id") if msg.get("role") == "assistant" else None,
             )
         db.set_session_title(new_key, title)
     except Exception as e:

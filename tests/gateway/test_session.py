@@ -578,6 +578,56 @@ class TestLoadTranscriptPreferLongerSource:
         assert len(result) == 4
         assert result[0]["content"] == "db-0"
 
+    def test_sqlite_round_trips_responses_response_id(self, store_with_db):
+        """New SQLite rows must keep local Responses continuation anchors."""
+        sid = "responses_id_session"
+        store_with_db._db.create_session(session_id=sid, source="gateway", model="m")
+        store_with_db.append_to_transcript(
+            sid,
+            {
+                "role": "assistant",
+                "content": "ready",
+                "responses_response_id": "resp_ready",
+            },
+        )
+
+        result = store_with_db.load_transcript(sid)
+        assert result == [
+            {
+                "role": "assistant",
+                "content": "ready",
+                "responses_response_id": "resp_ready",
+            }
+        ]
+
+    def test_sqlite_preferred_but_jsonl_backfills_response_id(self, store_with_db):
+        """Older DB rows lacked response ids while JSONL still had them."""
+        sid = "responses_id_backfill_session"
+        store_with_db._db.create_session(session_id=sid, source="gateway", model="m")
+        store_with_db.append_to_transcript(
+            sid,
+            {"role": "user", "content": "old-q"},
+            skip_db=True,
+        )
+        store_with_db.append_to_transcript(
+            sid,
+            {
+                "role": "assistant",
+                "content": "old-a",
+                "responses_response_id": "resp_jsonl",
+            },
+            skip_db=True,
+        )
+        store_with_db._db.append_message(session_id=sid, role="user", content="old-q")
+        store_with_db._db.append_message(session_id=sid, role="assistant", content="old-a")
+        store_with_db._db.append_message(session_id=sid, role="user", content="new-q")
+        store_with_db._db.append_message(session_id=sid, role="assistant", content="new-a")
+
+        result = store_with_db.load_transcript(sid)
+        assert len(result) == 4
+        assert result[1]["content"] == "old-a"
+        assert result[1]["responses_response_id"] == "resp_jsonl"
+
     def test_sqlite_empty_falls_back_to_jsonl(self, store_with_db):
         """No SQLite rows — falls back to JSONL (original behavior preserved)."""
         sid = "no_db_rows"

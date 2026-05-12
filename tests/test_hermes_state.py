@@ -382,6 +382,38 @@ class TestMessageStorage:
         assert len(conv) == 1
         assert conv[0].get("codex_message_items") == items
 
+    def test_responses_response_id_persisted_and_restored(self, db):
+        """Responses previous_response_id anchors must survive SQLite reload."""
+        db.create_session(session_id="s1", source="telegram")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="Done!",
+            responses_response_id=" resp_123 ",
+        )
+
+        conv = db.get_messages_as_conversation("s1")
+        assert len(conv) == 1
+        assert conv[0]["responses_response_id"] == "resp_123"
+
+    def test_replace_messages_preserves_responses_response_id(self, db):
+        """Transcript rewrites used by retry/undo/compress must keep anchors."""
+        db.create_session(session_id="s1", source="telegram")
+        db.replace_messages(
+            "s1",
+            [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": "hi",
+                    "responses_response_id": "resp_replace",
+                },
+            ],
+        )
+
+        conv = db.get_messages_as_conversation("s1")
+        assert conv[1]["responses_response_id"] == "resp_replace"
+
     def test_reasoning_not_set_for_non_assistant(self, db):
         """reasoning is never leaked onto user or tool messages."""
         db.create_session(session_id="s1", source="telegram")
@@ -1316,7 +1348,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 11
+        assert version == 12
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -1372,12 +1404,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v9
+        # Open with SessionDB — should migrate to the current schema.
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 11
+        assert cursor.fetchone()[0] == 12
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -2481,7 +2513,6 @@ class TestFTS5ToolCallMigration:
                 "SELECT version FROM schema_version LIMIT 1"
             ).fetchone()
             version = row["version"] if hasattr(row, "keys") else row[0]
-            assert version == 11
+            assert version == 12
         finally:
             session_db.close()
-

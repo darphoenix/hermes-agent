@@ -1952,6 +1952,10 @@ class HermesCLI:
         
         # streaming: stream tokens to the terminal as they arrive (display.streaming in config.yaml)
         self.streaming_enabled = CLI_CONFIG["display"].get("streaming", False)
+        self.interim_assistant_messages_enabled = CLI_CONFIG["display"].get(
+            "interim_assistant_messages",
+            True,
+        )
         self.final_response_markdown = str(
             CLI_CONFIG["display"].get("final_response_markdown", "strip")
         ).strip().lower() or "strip"
@@ -3541,6 +3545,11 @@ class HermesCLI:
                 tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
                 tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
                 stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
+                interim_assistant_callback=(
+                    self._on_interim_assistant_message
+                    if self.interim_assistant_messages_enabled
+                    else None
+                ),
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
             )
             # Store reference for atexit memory provider shutdown
@@ -5109,6 +5118,11 @@ class HermesCLI:
                     tool_calls=msg.get("tool_calls"),
                     tool_call_id=msg.get("tool_call_id"),
                     reasoning=msg.get("reasoning"),
+                    reasoning_content=msg.get("reasoning_content"),
+                    reasoning_details=msg.get("reasoning_details"),
+                    codex_reasoning_items=msg.get("codex_reasoning_items"),
+                    codex_message_items=msg.get("codex_message_items"),
+                    responses_response_id=msg.get("responses_response_id"),
                 )
             except Exception:
                 pass  # Best-effort copy
@@ -6602,6 +6616,7 @@ class HermesCLI:
         turn_route = self._resolve_turn_agent_config(prompt)
         try:
             from hermes_cli.background_runtime import (
+                BackgroundRuntimeDeferred,
                 BackgroundRuntimeError,
                 resolve_background_runtime,
             )
@@ -6627,6 +6642,9 @@ class HermesCLI:
                     ),
                     "request_overrides": None,
                 }
+        except BackgroundRuntimeDeferred as exc:
+            _cprint(f"  Background task deferred until foreground turn finishes: {exc}")
+            return
         except BackgroundRuntimeError as exc:
             _cprint(f"  (>_<) Cannot start background task: {exc}")
             return
@@ -7799,6 +7817,32 @@ class HermesCLI:
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(tool_name, default="⚡")
         _cprint(f"  ┊ {emoji} preparing {tool_name}…")
+
+    def _on_interim_assistant_message(self, text: str, *, already_streamed: bool = False) -> None:
+        """Render mid-turn assistant commentary, including visible conscience interventions."""
+        if already_streamed or not self.interim_assistant_messages_enabled:
+            return
+        visible = (text or "").strip()
+        if not visible:
+            return
+        if getattr(self, "_stream_box_opened", False):
+            self._flush_stream()
+            self._stream_box_opened = False
+        self._close_reasoning_box()
+
+        is_conscience = visible.startswith("[Conscience]")
+        title = "Conscience" if is_conscience else "Hermes"
+        border = "#B388FF" if is_conscience else _accent_hex()
+        body = _render_final_assistant_content(visible, mode=self.final_response_markdown)
+        ChatConsole().print(Panel(
+            body,
+            title=f"[{border} bold]{title}[/]",
+            title_align="left",
+            border_style=border,
+            style="#FFF8DC",
+            box=rich_box.HORIZONTALS,
+            padding=(1, 4),
+        ))
 
     # ====================================================================
     # Tool progress callback (audio cues for voice mode)
@@ -8997,6 +9041,11 @@ class HermesCLI:
                     agent_message = _srn + "\n\n" + agent_message
                     self._pending_skills_reload_note = None
                 try:
+                    self.agent.interim_assistant_callback = (
+                        self._on_interim_assistant_message
+                        if self.interim_assistant_messages_enabled
+                        else None
+                    )
                     result = self.agent.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added

@@ -640,6 +640,54 @@ def test_build_api_kwargs_stateful_custom_followup_uses_previous_response_id(mon
     assert kwargs["input"] == [{"role": "user", "content": "Next"}]
 
 
+def test_compress_context_resets_stateful_responses_chain(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._session_db = None
+    agent._responses_previous_response_id = "resp_old_tail"
+
+    class FakeCompressor:
+        compression_count = 1
+        _last_summary_error = None
+        _last_aux_model_failure_model = None
+        _last_aux_model_failure_error = None
+        last_prompt_tokens = 0
+        last_completion_tokens = 0
+
+        def compress(self, messages, current_tokens=None, focus_topic=None):
+            return [
+                {"role": "user", "content": "Summary"},
+                {
+                    "role": "assistant",
+                    "content": "Old retained answer",
+                    "responses_response_id": "resp_old_head",
+                    "codex_message_items": [{"type": "message", "role": "assistant"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": "Old retained tail",
+                    "responses_response_id": "resp_old_tail",
+                },
+                {"role": "user", "content": "Continue"},
+            ]
+
+    agent.context_compressor = FakeCompressor()
+
+    compressed, _ = agent._compress_context(
+        [{"role": "user", "content": "large history"}],
+        "You are Hermes.",
+        approx_tokens=200_000,
+    )
+
+    assert agent._responses_previous_response_id is None
+    assert all("responses_response_id" not in msg for msg in compressed)
+    assert all("codex_message_items" not in msg for msg in compressed)
+
+    kwargs = agent._build_api_kwargs(compressed)
+
+    assert "previous_response_id" not in kwargs
+    assert kwargs["input"][0] == {"role": "user", "content": "Summary"}
+
+
 def test_preflight_codex_api_kwargs_allows_stateful_fields_when_enabled(monkeypatch):
     agent = _build_stateful_custom_agent(monkeypatch)
 
@@ -1829,6 +1877,51 @@ def test_run_conversation_codex_continues_after_post_tool_dangling_intro(monkeyp
     assert any(
         msg.get("role") == "user"
         and "promised content directly" in (msg.get("content") or "")
+        for msg in result["messages"]
+    )
+
+
+def test_run_conversation_codex_does_not_continue_post_tool_final_with_paths(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    final_text = (
+        "Done. Patcher saved to `~/bin/codex-patch-computer-use.mjs` and memory updated.\n\n"
+        "After a Codex auto-update, just run:\n"
+        "```bash\n"
+        "pkill -f Codex && node ~/bin/codex-patch-computer-use.mjs && open -a Codex\n"
+        "```"
+    )
+    responses = [
+        _codex_tool_call_response(),
+        _codex_message_response(final_text),
+    ]
+    requests = []
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    def _fake_execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count=0):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("yes save")
+
+    assert result["completed"] is True
+    assert result["final_response"] == final_text
+    assert len(requests) == 2
+    assert not any(
+        msg.get("role") == "user"
+        and "Continue now. Execute the required tool calls" in (msg.get("content") or "")
         for msg in result["messages"]
     )
 

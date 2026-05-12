@@ -8,6 +8,9 @@ CLI background tasks do not each reinvent the same config parsing.
 from __future__ import annotations
 
 import os
+import threading
+import time
+import uuid
 from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -25,6 +28,39 @@ class BackgroundRuntimeError(RuntimeError):
     """Raised when a sidecar runtime is enabled but unusable."""
 
 
+class BackgroundRuntimeDeferred(BackgroundRuntimeError):
+    """Raised when sidecar work should wait for the foreground turn to finish."""
+
+
+_FOREGROUND_ACTIVITY_LOCK = threading.Lock()
+_FOREGROUND_ACTIVITY: Dict[str, Dict[str, Any]] = {}
+
+_DEFAULT_FOREGROUND_DEFER_TASKS = frozenset(
+    {
+        "background_review",
+        "cli_background",
+        "gateway_background",
+        "gateway_hygiene",
+        "auxiliary:curator",
+        "auxiliary:title_generation",
+    }
+)
+
+_DEFAULT_FOREGROUND_ALLOW_TASKS = frozenset(
+    {
+        "auxiliary:approval",
+        "auxiliary:compression",
+        "auxiliary:mcp",
+        "auxiliary:session_search",
+        "auxiliary:skills_hub",
+        "auxiliary:vision",
+        "auxiliary:web_extract",
+        "conscience",
+        "delegation",
+    }
+)
+
+
 def _as_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -39,6 +75,45 @@ def _as_bool(value: Any, default: bool = False) -> bool:
         if lowered in {"0", "false", "no", "off", "disabled"}:
             return False
     return default
+
+
+def begin_foreground_activity(
+    *,
+    session_id: str = "",
+    platform: str = "",
+    source: str = "main_agent",
+) -> str:
+    """Register a live foreground turn and return an opaque token."""
+
+    token = f"fg_{uuid.uuid4().hex[:12]}"
+    with _FOREGROUND_ACTIVITY_LOCK:
+        _FOREGROUND_ACTIVITY[token] = {
+            "session_id": session_id or "",
+            "platform": platform or "",
+            "source": source or "main_agent",
+            "started_at": time.monotonic(),
+        }
+    return token
+
+
+def end_foreground_activity(token: Optional[str]) -> None:
+    """Clear a foreground turn token if it is still registered."""
+
+    if not token:
+        return
+    with _FOREGROUND_ACTIVITY_LOCK:
+        _FOREGROUND_ACTIVITY.pop(str(token), None)
+
+
+def foreground_activity_snapshot() -> Dict[str, Dict[str, Any]]:
+    """Return a copy of active foreground work for diagnostics/tests."""
+
+    with _FOREGROUND_ACTIVITY_LOCK:
+        return {key: dict(value) for key, value in _FOREGROUND_ACTIVITY.items()}
+
+
+def is_foreground_active() -> bool:
+    return bool(foreground_activity_snapshot())
 
 
 def _coerce_config(config: Optional[Mapping[str, Any]]) -> Mapping[str, Any]:
@@ -83,11 +158,55 @@ def _normalise_use_for(raw: Any) -> Dict[str, bool]:
     return result
 
 
+def _normalise_name_set(raw: Any) -> set[str]:
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        return {part.strip() for part in raw.split(",") if part.strip()}
+    if isinstance(raw, Mapping):
+        return {str(key).strip() for key, value in raw.items() if str(key).strip() and _as_bool(value, False)}
+    if isinstance(raw, (list, tuple, set)):
+        return {str(name).strip() for name in raw if str(name).strip()}
+    return set()
+
+
 def _task_enabled(task: str, cfg: Mapping[str, Any]) -> bool:
     use_for = _normalise_use_for(cfg.get("use_for"))
     if task.startswith("auxiliary:"):
         return _as_bool(use_for.get(task), _as_bool(use_for.get("auxiliary"), False))
     return _as_bool(use_for.get(task), False)
+
+
+def _foreground_gate_enabled(cfg: Mapping[str, Any]) -> bool:
+    if "pause_while_foreground" in cfg:
+        return _as_bool(cfg.get("pause_while_foreground"), True)
+    gate_cfg = cfg.get("foreground_gate")
+    if isinstance(gate_cfg, Mapping) and "enabled" in gate_cfg:
+        return _as_bool(gate_cfg.get("enabled"), True)
+    return True
+
+
+def _task_deferred_while_foreground(task: str, cfg: Mapping[str, Any]) -> bool:
+    if not _foreground_gate_enabled(cfg) or not is_foreground_active():
+        return False
+
+    gate_cfg = cfg.get("foreground_gate")
+    allow = set(_DEFAULT_FOREGROUND_ALLOW_TASKS)
+    defer = set(_DEFAULT_FOREGROUND_DEFER_TASKS)
+    allow.update(_normalise_name_set(cfg.get("allow_while_foreground")))
+    defer.update(_normalise_name_set(cfg.get("defer_while_foreground")))
+    if isinstance(gate_cfg, Mapping):
+        allow.update(_normalise_name_set(gate_cfg.get("allow")))
+        defer.update(_normalise_name_set(gate_cfg.get("defer")))
+
+    if task in allow or (task.startswith("auxiliary:") and "auxiliary" in allow):
+        return False
+    if task in defer or (task.startswith("auxiliary:") and "auxiliary" in defer):
+        return True
+
+    # Unknown sidecar tasks are treated as non-critical background work by
+    # default. Foreground-blocking helpers should be listed in allow above.
+    return True
 
 
 def _task_bool_override(raw: Any, task: str) -> Optional[bool]:
@@ -165,6 +284,13 @@ def resolve_background_runtime(
         return None
     if not _task_enabled(task, cfg):
         return None
+    if _task_deferred_while_foreground(task, cfg):
+        active = foreground_activity_snapshot()
+        oldest = min((float(item.get("started_at") or 0.0) for item in active.values()), default=time.monotonic())
+        raise BackgroundRuntimeDeferred(
+            f"background runtime task {task!r} deferred while foreground turn is active "
+            f"(active={len(active)}, oldest_seconds={max(0.0, time.monotonic() - oldest):.1f})"
+        )
 
     parent = dict(parent_runtime or {})
     model = (

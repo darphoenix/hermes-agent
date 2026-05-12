@@ -1253,6 +1253,7 @@ class SessionStore:
                     reasoning_details=message.get("reasoning_details") if message.get("role") == "assistant" else None,
                     codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
                     codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
+                    responses_response_id=message.get("responses_response_id") if message.get("role") == "assistant" else None,
                 )
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
@@ -1281,6 +1282,67 @@ class SessionStore:
         with open(transcript_path, "w", encoding="utf-8") as f:
             for msg in messages:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _tool_call_identity(message: Dict[str, Any]) -> tuple:
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return ()
+        identity = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            identity.append((
+                call.get("id") or call.get("call_id"),
+                call.get("response_item_id"),
+                function.get("name") if isinstance(function, dict) else call.get("name"),
+            ))
+        return tuple(identity)
+
+    @classmethod
+    def _merge_missing_replay_fields_from_jsonl(
+        cls,
+        db_messages: List[Dict[str, Any]],
+        jsonl_messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Overlay Responses replay metadata that older SQLite rows lack.
+
+        Before ``responses_response_id`` was added to SQLite, JSONL retained
+        the field while DB rows did not.  When SQLite has more rows we still
+        prefer it, but we can safely graft missing assistant replay fields from
+        matching JSONL assistant turns so stateful Responses can resume.
+        """
+        if not db_messages or not jsonl_messages:
+            return db_messages
+
+        replay_fields = (
+            "responses_response_id",
+            "codex_message_items",
+            "codex_reasoning_items",
+        )
+        db_idx = 0
+        for src in jsonl_messages:
+            if src.get("role") != "assistant" or not any(src.get(k) for k in replay_fields):
+                continue
+            src_content = src.get("content")
+            src_tool_identity = cls._tool_call_identity(src)
+
+            for idx in range(db_idx, len(db_messages)):
+                dst = db_messages[idx]
+                if dst.get("role") != "assistant":
+                    continue
+                if dst.get("content") != src_content:
+                    continue
+                if src_tool_identity and cls._tool_call_identity(dst) != src_tool_identity:
+                    continue
+                for field in replay_fields:
+                    if src.get(field) and not dst.get(field):
+                        dst[field] = src[field]
+                db_idx = idx + 1
+                break
+
+        return db_messages
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages from a session's transcript."""
@@ -1328,7 +1390,7 @@ class SessionStore:
                 )
             return jsonl_messages
 
-        return db_messages
+        return self._merge_missing_replay_fields_from_jsonl(db_messages, jsonl_messages)
 
 
 def build_session_context(

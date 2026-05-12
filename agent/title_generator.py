@@ -71,6 +71,14 @@ def generate_title(
             title = title[:77] + "..."
         return title if title else None
     except Exception as e:
+        try:
+            from hermes_cli.background_runtime import BackgroundRuntimeDeferred
+
+            if isinstance(e, BackgroundRuntimeDeferred):
+                logger.info("Title generation deferred: %s", e)
+                return None
+        except Exception:
+            pass
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.
         logger.warning("Title generation failed: %s", e)

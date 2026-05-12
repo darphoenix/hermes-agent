@@ -849,6 +849,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         if not _has_explicit_curator_runtime(_cfg):
             try:
                 from hermes_cli.background_runtime import (
+                    BackgroundRuntimeDeferred,
                     BackgroundRuntimeError,
                     resolve_background_runtime,
                 )
@@ -862,6 +863,10 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
                 )
                 if _sidecar is not None:
                     _model_name, _runtime = _sidecar
+            except BackgroundRuntimeDeferred as e:
+                result_meta["error"] = f"background runtime deferred: {e}"
+                result_meta["summary"] = "curator deferred while foreground turn is active"
+                return result_meta
             except BackgroundRuntimeError as e:
                 result_meta["error"] = f"background runtime error: {e}"
                 result_meta["summary"] = result_meta["error"]

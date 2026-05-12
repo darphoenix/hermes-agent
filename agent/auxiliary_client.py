@@ -125,6 +125,26 @@ def _extract_url_query_params(url: str):
     return url, None
 
 
+def _is_local_base_url(base_url: Optional[str]) -> bool:
+    if not base_url:
+        return False
+    try:
+        host = (urlparse(str(base_url)).hostname or "").lower()
+    except Exception:
+        return False
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def _openai_client_options_for_base_url(base_url: Optional[str]) -> Dict[str, Any]:
+    """Return OpenAI SDK options that are safer for local wrapper endpoints."""
+    if _is_local_base_url(base_url):
+        # Local MLX wrapper calls can legitimately run longer than small aux
+        # defaults.  SDK-level retries after a timeout create duplicate model
+        # generations, so disable those retries for local endpoints.
+        return {"max_retries": 0}
+    return {}
+
+
 # Module-level flag: only warn once per process about stale OPENAI_BASE_URL.
 _stale_base_url_warned = False
 
@@ -1104,7 +1124,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
                 if is_native_gemini_base_url(base_url):
                     return GeminiNativeClient(api_key=api_key, base_url=base_url), model
-            extra = {}
+            extra = _openai_client_options_for_base_url(base_url)
             if base_url_host_matches(base_url, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
             elif base_url_host_matches(base_url, "api.githubcopilot.com"):
@@ -1131,7 +1151,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
             if is_native_gemini_base_url(base_url):
                 return GeminiNativeClient(api_key=api_key, base_url=base_url), model
-        extra = {}
+        extra = _openai_client_options_for_base_url(base_url)
         if base_url_host_matches(base_url, "api.kimi.com"):
             extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
         elif base_url_host_matches(base_url, "api.githubcopilot.com"):
@@ -1403,7 +1423,9 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
     model = _read_main_model() or "gpt-4o-mini"
     logger.debug("Auxiliary client: custom endpoint (%s, api_mode=%s)", model, custom_mode or "chat_completions")
     _clean_base, _dq = _extract_url_query_params(custom_base)
-    _extra = {"default_query": _dq} if _dq else {}
+    _extra = _openai_client_options_for_base_url(_clean_base)
+    if _dq:
+        _extra["default_query"] = _dq
     if custom_mode == "codex_responses":
         real_client = OpenAI(api_key=custom_key, base_url=_clean_base, **_extra)
         return CodexAuxiliaryClient(real_client, model), model
@@ -1978,6 +2000,7 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         "base_url": str(sync_client.base_url),
     }
     sync_base_url = str(sync_client.base_url)
+    async_kwargs.update(_openai_client_options_for_base_url(sync_base_url))
     if base_url_host_matches(sync_base_url, "openrouter.ai"):
         async_kwargs["default_headers"] = dict(_OR_HEADERS)
     elif base_url_host_matches(sync_base_url, "api.githubcopilot.com"):
@@ -2198,7 +2221,7 @@ def resolve_provider_client(
                 model or (main_runtime.get("model") if main_runtime else None) or "gpt-4o-mini",
                 provider,
             )
-            extra = {}
+            extra = _openai_client_options_for_base_url(custom_base)
             _clean_base, _dq = _extract_url_query_params(custom_base)
             if _dq:
                 extra["default_query"] = _dq
@@ -2375,8 +2398,10 @@ def resolve_provider_client(
             headers.update(copilot_request_headers(
                 is_agent_turn=True, is_vision=is_vision
             ))
-        client = OpenAI(api_key=api_key, base_url=base_url,
-                        **({"default_headers": headers} if headers else {}))
+        extra = _openai_client_options_for_base_url(base_url)
+        if headers:
+            extra["default_headers"] = headers
+        client = OpenAI(api_key=api_key, base_url=base_url, **extra)
 
         # Copilot GPT-5+ models (except gpt-5-mini) require the Responses
         # API — they are not accessible via /chat/completions.  Wrap the
@@ -3180,6 +3205,37 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
     return default
 
 
+def _resolve_call_timeout(
+    task: str,
+    timeout: float | str | None,
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> float | None:
+    """Resolve per-call timeout.
+
+    ``None`` keeps the historical config/default lookup.  A string sentinel is
+    used for callers that intentionally want the OpenAI/httpx request to have
+    no timeout at all.  Local wrapper endpoints also use no request timeout:
+    higher-level operation limits can still bound the task, but the HTTP client
+    should not disconnect and leave an in-flight local generation running.
+    """
+    if isinstance(timeout, str):
+        value = timeout.strip().lower()
+        if value in {"none", "no_timeout", "no-timeout", "off", "disabled"}:
+            return None
+        try:
+            parsed_timeout = float(value)
+        except ValueError:
+            parsed_timeout = _get_task_timeout(task)
+        return None if _is_local_base_url(base_url) else parsed_timeout
+    if _is_local_base_url(base_url):
+        return None
+    if timeout is not None:
+        return timeout
+    return _get_task_timeout(task)
+
+
 def _get_task_extra_body(task: str) -> Dict[str, Any]:
     """Read auxiliary.<task>.extra_body and return a shallow copy when valid."""
     task_config = _get_auxiliary_task_config(task)
@@ -3381,6 +3437,7 @@ def call_llm(
         max_tokens: Max output tokens (handles max_tokens vs max_completion_tokens).
         tools: Tool definitions (for function calling).
         timeout: Request timeout in seconds (None = read from auxiliary.{task}.timeout config).
+            Use "none" to disable the per-request timeout.
         extra_body: Additional request body fields.
 
     Returns:
@@ -3452,10 +3509,14 @@ def call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
-
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
+    effective_timeout = _resolve_call_timeout(
+        task,
+        timeout,
+        provider=resolved_provider,
+        base_url=_base_info or resolved_base_url,
+    )
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
                      task, resolved_provider or "auto", final_model or "default",
@@ -3757,12 +3818,16 @@ async def async_call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
-
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
+    effective_timeout = _resolve_call_timeout(
+        task,
+        timeout,
+        provider=resolved_provider,
+        base_url=_client_base or resolved_base_url,
+    )
     kwargs = _build_call_kwargs(
         resolved_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,

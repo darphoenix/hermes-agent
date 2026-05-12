@@ -107,6 +107,32 @@ class InterruptedAgent:
         return {"final_response": "interrupted", "messages": [], "api_calls": 1}
 
 
+class CaptureHistoryAgent:
+    captured_history = None
+
+    def __init__(self, **kwargs):
+        self.tools = []
+        self.session_id = kwargs.get("session_id")
+        self.context_compressor = SimpleNamespace(last_prompt_tokens=0, context_length=0)
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+
+    @property
+    def is_interrupted(self) -> bool:
+        return False
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).captured_history = conversation_history
+        return {
+            "final_response": "done",
+            "messages": list(conversation_history or []) + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "done"},
+            ],
+            "api_calls": 1,
+        }
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -166,6 +192,60 @@ async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
         session_key="agent:main:telegram:group:-1001:17585",
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_simple_assistant_history_preserves_responses_metadata(monkeypatch, tmp_path):
+    """Plain final assistant replies still need stateful Responses anchors."""
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureHistoryAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "fake", "api_mode": "codex_responses", "responses_stateful": True},
+    )
+
+    history = [
+        {"role": "user", "content": "First", "timestamp": "t1"},
+        {
+            "role": "assistant",
+            "content": "Ack",
+            "responses_response_id": "resp_prev",
+            "codex_message_items": [{"type": "message", "id": "msg_prev"}],
+            "timestamp": "t2",
+        },
+    ]
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="Next",
+        context_prompt="",
+        history=history,
+        source=source,
+        session_id="sess-responses",
+        session_key="agent:main:telegram:group:-1001:17585",
+    )
+
+    assert result["final_response"] == "done"
+    captured = CaptureHistoryAgent.captured_history
+    assert captured[1]["responses_response_id"] == "resp_prev"
+    assert captured[1]["codex_message_items"] == [{"type": "message", "id": "msg_prev"}]
+    assert "timestamp" not in captured[1]
 
 
 @pytest.mark.asyncio

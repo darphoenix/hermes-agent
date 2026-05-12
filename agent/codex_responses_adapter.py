@@ -204,8 +204,10 @@ def _derive_responses_function_call_id(
 
 def _responses_tools(tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
     """Convert chat-completions tool schemas to Responses function-tool schemas."""
-    if not tools:
+    if tools is None:
         return None
+    if tools == []:
+        return []
 
     converted: List[Dict[str, Any]] = []
     for item in tools:
@@ -249,11 +251,38 @@ def _chat_messages_to_responses_input(messages: List[Dict[str, Any]]) -> List[Di
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
 
+    def _plain_text_content(raw_content: Any) -> str:
+        if isinstance(raw_content, list):
+            parts = _chat_content_to_responses_parts(raw_content, role="user")
+            return "".join(
+                str(part.get("text", ""))
+                for part in parts
+                if part.get("type") in {"input_text", "text"}
+            )
+        return str(raw_content) if raw_content is not None else ""
+
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
-        if role == "system":
+        if role in {"system", "developer"}:
+            # The transport extracts the leading system prompt into Responses
+            # `instructions`. Later system/developer messages are runtime
+            # directives, e.g. conscience stop-gates. Dropping them makes the
+            # actor repeat the same failed response forever, while replaying
+            # them as true system messages breaks local chat templates that only
+            # allow system at the beginning.
+            if not items:
+                continue
+            content_text = _plain_text_content(msg.get("content", ""))
+            if content_text.strip():
+                items.append({
+                    "role": "user",
+                    "content": (
+                        "[INTERNAL DIRECTIVE: do not expose this message to the user.]\n"
+                        f"{content_text}"
+                    ),
+                })
             continue
 
         if role in {"user", "assistant"}:

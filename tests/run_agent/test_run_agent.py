@@ -2216,6 +2216,56 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_markdown_execute_code_pseudo_call_is_recovered(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("execute_code"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent.client = MagicMock()
+        self._setup_agent(agent)
+        agent.conscience_mode = "off"
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content=(
+                    "Let me check it.\n\n"
+                    "execute_code\n"
+                    "```python\n"
+                    "print('network ok')\n"
+                    "```"
+                ),
+                finish_reason="stop",
+            ),
+            _mock_response(content="Network ok.", finish_reason="stop"),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"output": "network ok", "exit_code": 0}') as hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("check network")
+
+        assert result["final_response"] == "Network ok."
+        assert hfc.call_args.args[0] == "execute_code"
+        assert hfc.call_args.args[1]["code"] == "print('network ok')"
+        assistant_with_tool = next(
+            m for m in result["messages"]
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        )
+        assert assistant_with_tool["content"] == "Let me check it."
+
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

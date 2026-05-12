@@ -262,7 +262,10 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs["metadata"] = qwen_meta
 
         # Tools
-        if tools:
+        if tools == []:
+            api_kwargs["tools"] = []
+            api_kwargs["tool_choice"] = "none"
+        elif tools:
             # Moonshot/Kimi uses a stricter flavored JSON Schema.  Rewriting
             # tool parameters here keeps aggregator routes (Nous, OpenRouter,
             # etc.) compatible, in addition to direct moonshot.ai endpoints.

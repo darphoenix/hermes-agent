@@ -111,6 +111,8 @@ class ProcessSession:
     watcher_thread_id: str = ""
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    resume_on_complete: bool = False             # Completion may resume the agent after the spawning turn exits
+    watcher_run_generation: str = ""             # Gateway run generation that spawned the watcher
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -278,6 +280,7 @@ class ProcessRegistry:
                     "user_id": session.watcher_user_id,
                     "user_name": session.watcher_user_name,
                     "thread_id": session.watcher_thread_id,
+                    "run_generation": session.watcher_run_generation,
                     "message": (
                         f"Watch patterns disabled for process {session.id} — "
                         f"{WATCH_STRIKE_LIMIT} consecutive rate-limit windows triggered "
@@ -310,6 +313,7 @@ class ProcessRegistry:
             "user_id": session.watcher_user_id,
             "user_name": session.watcher_user_name,
             "thread_id": session.watcher_thread_id,
+            "run_generation": session.watcher_run_generation,
         })
 
     def _global_watch_admit(self, now: float) -> bool:
@@ -610,7 +614,7 @@ class ProcessRegistry:
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
         bg_command = (
-            f"mkdir -p {quoted_temp_dir} && "
+            f"mkdir -p {quoted_temp_dir} || exit 1; "
             f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
             f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
             f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
@@ -625,6 +629,13 @@ class ProcessRegistry:
                 if line.isdigit():
                     session.pid = int(line)
                     break
+            if not session.pid:
+                session.exited = True
+                session.exit_code = -1
+                session.output_buffer = (
+                    "Failed to start: sandbox backend did not return a background PID"
+                    + (f" (output: {output[:500]})" if output else "")
+                )
         except Exception as e:
             session.exited = True
             session.exit_code = -1
@@ -1253,6 +1264,8 @@ class ProcessRegistry:
                             "watcher_thread_id": s.watcher_thread_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "resume_on_complete": s.resume_on_complete,
+                            "watcher_run_generation": s.watcher_run_generation,
                             "watch_patterns": s.watch_patterns,
                         })
             
@@ -1316,6 +1329,8 @@ class ProcessRegistry:
                     watcher_thread_id=entry.get("watcher_thread_id", ""),
                     watcher_interval=entry.get("watcher_interval", 0),
                     notify_on_complete=entry.get("notify_on_complete", False),
+                    resume_on_complete=entry.get("resume_on_complete", False),
+                    watcher_run_generation=str(entry.get("watcher_run_generation", "") or ""),
                     watch_patterns=entry.get("watch_patterns", []),
                 )
                 with self._lock:
@@ -1335,6 +1350,8 @@ class ProcessRegistry:
                         "user_name": session.watcher_user_name,
                         "thread_id": session.watcher_thread_id,
                         "notify_on_complete": session.notify_on_complete,
+                        "resume_on_complete": session.resume_on_complete,
+                        "run_generation": session.watcher_run_generation,
                     })
 
         self._write_checkpoint()

@@ -114,6 +114,22 @@ class TestTodoToolFunction:
         ))
         assert result["summary"]["in_progress"] == 1
 
+    def test_write_mode_accepts_json_string(self):
+        store = TodoStore()
+        todos = json.dumps([
+            {"id": "1", "content": "New", "status": "in_progress"},
+            {"id": "2", "content": "Next", "status": "pending"},
+        ])
+        result = json.loads(todo_tool(todos=todos, store=store))
+        assert result["summary"]["total"] == 2
+        assert result["summary"]["in_progress"] == 1
+
+    def test_write_mode_rejects_non_array_json_string(self):
+        store = TodoStore()
+        result = json.loads(todo_tool(todos='"not a list"', store=store))
+        assert "error" in result
+        assert "array" in result["error"]
+
     def test_no_store_returns_error(self):
         result = json.loads(todo_tool())
         assert "error" in result

@@ -98,12 +98,15 @@ class ResponsesApiTransport(ProviderTransport):
             else _chat_messages_to_responses_input(payload_messages)
         )
 
+        response_tools = _responses_tools(tools)
+        tools_disabled = tools == []
+
         kwargs = {
             "model": model,
             "instructions": instructions,
             "input": input_items,
-            "tools": _responses_tools(tools),
-            "tool_choice": "auto",
+            "tools": response_tools,
+            "tool_choice": "none" if tools_disabled else "auto",
             "parallel_tool_calls": not stateful_responses,
             "store": stateful_responses,
         }

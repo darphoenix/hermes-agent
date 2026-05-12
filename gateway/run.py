@@ -4938,7 +4938,7 @@ class GatewayRunner:
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(context, run_generation=run_generation)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -5248,8 +5248,16 @@ class GatewayRunner:
                                 force_stateless=True,
                             )
                         except Exception as exc:
-                            logger.warning("Gateway hygiene compression skipped: %s", exc)
-                            _hyg_runtime = {}
+                            try:
+                                from hermes_cli.background_runtime import BackgroundRuntimeDeferred
+                            except Exception:
+                                BackgroundRuntimeDeferred = ()  # type: ignore[assignment]
+                            if isinstance(exc, BackgroundRuntimeDeferred):
+                                logger.info("Gateway hygiene compression deferred: %s", exc)
+                                _hyg_runtime = {}
+                            else:
+                                logger.warning("Gateway hygiene compression skipped: %s", exc)
+                                _hyg_runtime = {}
                         if _hyg_runtime.get("api_key"):
                             _hyg_msgs = [
                                 {"role": m.get("role"), "content": m.get("content")}
@@ -7562,12 +7570,26 @@ class GatewayRunner:
                 source=source,
                 user_config=user_config,
             )
-            model, runtime_kwargs = _resolve_background_agent_runtime(
-                "gateway_background",
-                model,
-                runtime_kwargs,
-                user_config=user_config,
-            )
+            try:
+                model, runtime_kwargs = _resolve_background_agent_runtime(
+                    "gateway_background",
+                    model,
+                    runtime_kwargs,
+                    user_config=user_config,
+                )
+            except Exception as exc:
+                try:
+                    from hermes_cli.background_runtime import BackgroundRuntimeDeferred
+                except Exception:
+                    BackgroundRuntimeDeferred = ()  # type: ignore[assignment]
+                if isinstance(exc, BackgroundRuntimeDeferred):
+                    await adapter.send(
+                        source.chat_id,
+                        f"⏸ Background task {task_id} deferred until the active turn finishes.",
+                        metadata=_thread_metadata,
+                    )
+                    return
+                raise
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
@@ -8343,6 +8365,9 @@ class GatewayRunner:
                     tool_call_id=msg.get("tool_call_id"),
                     reasoning=msg.get("reasoning"),
                     reasoning_content=msg.get("reasoning_content"),
+                    codex_reasoning_items=msg.get("codex_reasoning_items"),
+                    codex_message_items=msg.get("codex_message_items"),
+                    responses_response_id=msg.get("responses_response_id"),
                 )
             except Exception:
                 pass  # Best-effort copy
@@ -9472,7 +9497,7 @@ class GatewayRunner:
         finally:
             notify_path.unlink(missing_ok=True)
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(self, context: SessionContext, run_generation: int | None = None) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -9490,6 +9515,7 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            run_generation=str(run_generation or ""),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -9769,19 +9795,45 @@ class GatewayRunner:
         if not adapter:
             return
         try:
-            synth_event = MessageEvent(
-                text=synth_text,
-                message_type=MessageType.TEXT,
-                source=source,
-                internal=True,
-            )
-            logger.info(
-                "Watch pattern notification — injecting for %s chat=%s thread=%s",
-                platform_name,
-                source.chat_id,
-                source.thread_id,
-            )
-            await adapter.handle_message(synth_event)
+            session_key = str(evt.get("session_key") or "").strip()
+            watcher_run_generation = str(evt.get("run_generation") or "").strip()
+            active_same_turn = False
+            if session_key and watcher_run_generation:
+                try:
+                    active_event = getattr(adapter, "_active_sessions", {}).get(session_key)
+                    active_generation = getattr(active_event, "_hermes_run_generation", None)
+                    active_same_turn = (
+                        active_event is not None
+                        and active_generation is not None
+                        and int(active_generation) == int(watcher_run_generation)
+                        and self._is_session_run_current(session_key, int(watcher_run_generation))
+                    )
+                except Exception:
+                    active_same_turn = False
+
+            if active_same_turn:
+                synth_event = MessageEvent(
+                    text=synth_text,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    internal=True,
+                )
+                logger.info(
+                    "Watch pattern notification — injecting for %s chat=%s thread=%s",
+                    platform_name,
+                    source.chat_id,
+                    source.thread_id,
+                )
+                await adapter.handle_message(synth_event)
+            else:
+                logger.info(
+                    "Watch pattern notification after spawning turn ended — sending passive message for %s chat=%s thread=%s",
+                    platform_name,
+                    source.chat_id,
+                    source.thread_id,
+                )
+                metadata = {"thread_id": source.thread_id} if source.thread_id else None
+                await adapter.send(source.chat_id, synth_text, metadata=metadata)
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
 
@@ -9809,6 +9861,8 @@ class GatewayRunner:
         user_id = watcher.get("user_id", "")
         user_name = watcher.get("user_name", "")
         agent_notify = watcher.get("notify_on_complete", False)
+        resume_on_complete = bool(watcher.get("resume_on_complete", False))
+        watcher_run_generation = str(watcher.get("run_generation", "") or "")
         notify_mode = self._load_background_notifications_mode()
 
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
@@ -9873,20 +9927,52 @@ class GatewayRunner:
                             break
                     if adapter and source.chat_id:
                         try:
-                            synth_event = MessageEvent(
-                                text=synth_text,
-                                message_type=MessageType.TEXT,
-                                source=source,
-                                internal=True,
-                            )
-                            logger.info(
-                                "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
-                                session_id,
-                                session_key,
-                                source.chat_id,
-                                source.thread_id,
-                            )
-                            await adapter.handle_message(synth_event)
+                            active_same_turn = False
+                            if session_key and watcher_run_generation:
+                                try:
+                                    active_event = getattr(adapter, "_active_sessions", {}).get(session_key)
+                                    active_generation = getattr(active_event, "_hermes_run_generation", None)
+                                    active_same_turn = (
+                                        active_event is not None
+                                        and active_generation is not None
+                                        and int(active_generation) == int(watcher_run_generation)
+                                        and self._is_session_run_current(session_key, int(watcher_run_generation))
+                                    )
+                                except Exception:
+                                    active_same_turn = False
+
+                            if active_same_turn or resume_on_complete:
+                                synth_event = MessageEvent(
+                                    text=synth_text,
+                                    message_type=MessageType.TEXT,
+                                    source=source,
+                                    internal=True,
+                                )
+                                logger.info(
+                                    "Process %s finished — injecting agent notification for session %s chat=%s thread=%s active_same_turn=%s resume_on_complete=%s",
+                                    session_id,
+                                    session_key,
+                                    source.chat_id,
+                                    source.thread_id,
+                                    active_same_turn,
+                                    resume_on_complete,
+                                )
+                                await adapter.handle_message(synth_event)
+                            else:
+                                logger.info(
+                                    "Process %s finished after spawning turn ended — sending passive notification for session %s chat=%s thread=%s",
+                                    session_id,
+                                    session_key,
+                                    source.chat_id,
+                                    source.thread_id,
+                                )
+                                passive_text = (
+                                    f"[Background process {session_id} finished with exit code {session.exit_code}.\n"
+                                    f"Command: {session.command}\n"
+                                    f"Output:\n{_out}]"
+                                )
+                                send_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                                await adapter.send(source.chat_id, passive_text, metadata=send_meta)
                         except Exception as e:
                             logger.error("Agent notify injection error: %s", e)
                     break
@@ -9954,6 +10040,11 @@ class GatewayRunner:
         ("compression", "threshold"),
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
+        ("agent", "conscience_mode"),
+        ("agent", "conscience_provider"),
+        ("agent", "conscience_model"),
+        ("agent", "conscience_reasoning_effort"),
+        ("agent", "conscience_chat_messages"),
     )
 
     @classmethod
@@ -11506,13 +11597,18 @@ class GatewayRunner:
                             mirror_src = msg.get("mirror_source", "another session")
                             content = f"[Delivered from {mirror_src}] {content}"
                         entry = {"role": role, "content": content}
-                        # Preserve reasoning fields on assistant messages so
-                        # multi-turn reasoning context survives session reload.
+                        # Preserve replay fields on assistant messages so
+                        # multi-turn provider state survives session reload.
                         # The agent's _build_api_kwargs converts these to the
                         # provider-specific format (reasoning_content, etc.).
                         if role == "assistant":
-                            for _rkey in ("reasoning", "reasoning_details",
-                                          "codex_reasoning_items"):
+                            for _rkey in (
+                                "reasoning",
+                                "reasoning_details",
+                                "codex_reasoning_items",
+                                "codex_message_items",
+                                "responses_response_id",
+                            ):
                                 _rval = msg.get(_rkey)
                                 if _rval:
                                     entry[_rkey] = _rval
@@ -11654,10 +11750,34 @@ class GatewayRunner:
                 and getattr(_resume_entry, "resume_pending", False)
                 and _interruption_is_fresh
             )
+            def _has_unanswered_tool_tail(_messages: list) -> bool:
+                if not _messages or _messages[-1].get("role") != "tool":
+                    return False
+                idx = len(_messages) - 1
+                tail_tool_ids: set[str] = set()
+                while idx >= 0 and _messages[idx].get("role") == "tool":
+                    _tcid = _messages[idx].get("tool_call_id")
+                    if isinstance(_tcid, str) and _tcid:
+                        tail_tool_ids.add(_tcid)
+                    idx -= 1
+                if idx < 0:
+                    return False
+                owner = _messages[idx]
+                if owner.get("role") != "assistant":
+                    return False
+                owner_tool_calls = owner.get("tool_calls")
+                if not isinstance(owner_tool_calls, list) or not owner_tool_calls:
+                    return False
+                owner_ids = {
+                    tc.get("id")
+                    for tc in owner_tool_calls
+                    if isinstance(tc, dict) and isinstance(tc.get("id"), str)
+                }
+                return not tail_tool_ids or bool(tail_tool_ids & owner_ids)
+
             _has_fresh_tool_tail = bool(
-                agent_history
-                and agent_history[-1].get("role") == "tool"
-                and _interruption_is_fresh
+                _interruption_is_fresh
+                and _has_unanswered_tool_tail(agent_history)
             )
 
             if _is_resume_pending:
@@ -12020,6 +12140,29 @@ class GatewayRunner:
                     logger.debug("Long-running notification error: %s", _ne)
 
         _notify_task = asyncio.create_task(_notify_long_running())
+        _side_tasks_stopped_for_handoff = False
+
+        async def _stop_parent_side_tasks_for_handoff() -> None:
+            """Stop parent-run status tasks before recursive follow-up handling.
+
+            Recursive pending-message handling awaits a nested ``_run_agent`` call.
+            Without stopping these tasks first, the parent turn keeps sending
+            progress/elapsed notifications while the child turn starts its own.
+            """
+            nonlocal _side_tasks_stopped_for_handoff
+            if _side_tasks_stopped_for_handoff:
+                return
+            _side_tasks_stopped_for_handoff = True
+            if progress_task:
+                progress_task.cancel()
+            interrupt_monitor.cancel()
+            _notify_task.cancel()
+            for task in [progress_task, interrupt_monitor, _notify_task]:
+                if task:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
@@ -12406,6 +12549,7 @@ class GatewayRunner:
                     except Exception:
                         pass
 
+                await _stop_parent_side_tasks_for_handoff()
                 return await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
@@ -12420,10 +12564,11 @@ class GatewayRunner:
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
-            if progress_task:
-                progress_task.cancel()
-            interrupt_monitor.cancel()
-            _notify_task.cancel()
+            if not _side_tasks_stopped_for_handoff:
+                if progress_task:
+                    progress_task.cancel()
+                interrupt_monitor.cancel()
+                _notify_task.cancel()
 
             # Wait for stream consumer to finish its final edit
             if stream_task:

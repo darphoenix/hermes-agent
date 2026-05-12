@@ -66,6 +66,11 @@ class TestRewrites:
         cmd = "A && B &\nfalse || C &"
         assert rewrite(cmd) == "A && { B & }\nfalse || { C & }"
 
+    def test_following_command_gets_separator_after_group(self):
+        cmd = "mkdir -p /tmp && ( server ) & echo $! > /tmp/pid && cat /tmp/pid"
+        expected = "mkdir -p /tmp && { ( server ) & }; echo $! > /tmp/pid && cat /tmp/pid"
+        assert rewrite(cmd) == expected
+
 
 class TestPreserved:
     """Commands that DON'T have the bug MUST pass through unchanged."""

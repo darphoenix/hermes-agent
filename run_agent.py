@@ -3402,6 +3402,9 @@ class AIAgent:
         if recent_tool_context and dangling_intro and assistant_mentions_action:
             return True
 
+        if recent_tool_context:
+            return False
+
         return (
             (user_targets_workspace or assistant_targets_workspace)
             and assistant_mentions_action
@@ -9457,6 +9460,26 @@ class AIAgent:
                         f"({_aux_fail_err or 'unknown error'}). Recovered using main model — "
                         "check auxiliary.compression.model in config.yaml."
                     )
+
+        if self._responses_stateful_enabled():
+            stripped_response_ids = 0
+            stripped_replay_items = 0
+            for msg in compressed:
+                if not isinstance(msg, dict):
+                    continue
+                if "responses_response_id" in msg:
+                    msg.pop("responses_response_id", None)
+                    stripped_response_ids += 1
+                if "codex_message_items" in msg:
+                    msg.pop("codex_message_items", None)
+                    stripped_replay_items += 1
+            self._clear_responses_stateful_chain(reason="context_compression")
+            if stripped_response_ids or stripped_replay_items:
+                logger.info(
+                    "Stripped %d stateful Responses anchor(s) and %d replay item set(s) after context compression",
+                    stripped_response_ids,
+                    stripped_replay_items,
+                )
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:

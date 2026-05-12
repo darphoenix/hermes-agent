@@ -778,9 +778,17 @@ def _rewrite_compound_background(command: str) -> str:
         prefix = result[:insert_pos]
         middle = result[insert_pos:amp_pos]  # inner command + trailing space
         suffix = result[amp_pos + 1 :]
+        suffix_pos = 0
+        while suffix_pos < len(suffix) and suffix[suffix_pos] in " \t":
+            suffix_pos += 1
+        needs_separator = (
+            suffix_pos < len(suffix)
+            and suffix[suffix_pos] not in "\n;#&|"
+        )
         # `{` needs a trailing space in bash; the closing `}` needs to be
         # preceded by `;` or `&` — we're providing `&` from the backgrounding.
-        result = prefix + "{ " + middle + "& }" + suffix
+        separator = ";" if needs_separator else ""
+        result = prefix + "{ " + middle + "& }" + separator + suffix
 
     return result
 
@@ -1513,7 +1521,7 @@ _LONG_LIVED_FOREGROUND_PATTERNS = (
     re.compile(r"\bnext\s+dev\b", re.IGNORECASE),
     re.compile(r"\bvite(?:\s|$)", re.IGNORECASE),
     re.compile(r"\bnodemon\b", re.IGNORECASE),
-    re.compile(r"\buvicorn\b", re.IGNORECASE),
+    re.compile(r"(?:^|(?:&&|\|\||;)\s*)(?:python(?:3)?\s+-m\s+)?uvicorn\b", re.IGNORECASE),
     re.compile(r"\bgunicorn\b", re.IGNORECASE),
     re.compile(r"\bpython(?:3)?\s+-m\s+http\.server\b", re.IGNORECASE),
 )
@@ -1599,6 +1607,7 @@ def terminal_tool(
     workdir: Optional[str] = None,
     pty: bool = False,
     notify_on_complete: bool = False,
+    resume_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
 ) -> str:
     """
@@ -1613,6 +1622,7 @@ def terminal_tool(
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
+        resume_on_complete: If True with notify_on_complete, the gateway may start a new agent turn from the completion after the spawning turn is no longer active.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
 
     Returns:
@@ -1879,6 +1889,19 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
+                if getattr(proc_session, "exited", False) is True and getattr(proc_session, "exit_code", 0):
+                    error_text = (
+                        getattr(proc_session, "output_buffer", None)
+                        or "Failed to start background process"
+                    )
+                    return json.dumps({
+                        "output": getattr(proc_session, "output_buffer", "") or "",
+                        "session_id": getattr(proc_session, "id", None),
+                        "pid": getattr(proc_session, "pid", None),
+                        "exit_code": getattr(proc_session, "exit_code", -1) or -1,
+                        "error": error_text,
+                    }, ensure_ascii=False)
+
                 result_data = {
                     "output": "Background process started",
                     "session_id": proc_session.id,
@@ -1902,11 +1925,13 @@ def terminal_tool(
                         _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
                         _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
                         _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
+                        _gw_run_generation = _gse("HERMES_SESSION_RUN_GENERATION", "")
                         proc_session.watcher_platform = _gw_platform
                         proc_session.watcher_chat_id = _gw_chat_id
                         proc_session.watcher_user_id = _gw_user_id
                         proc_session.watcher_user_name = _gw_user_name
                         proc_session.watcher_thread_id = _gw_thread_id
+                        proc_session.watcher_run_generation = _gw_run_generation
 
                 # Mutual exclusion: if both notify_on_complete and watch_patterns
                 # are set, drop watch_patterns. The combination produces duplicate
@@ -1927,11 +1952,15 @@ def terminal_tool(
                 # Mark for agent notification on completion
                 if notify_on_complete and background:
                     proc_session.notify_on_complete = True
+                    proc_session.resume_on_complete = bool(resume_on_complete)
                     result_data["notify_on_complete"] = True
+                    if proc_session.resume_on_complete:
+                        result_data["resume_on_complete"] = True
 
                     # In gateway mode, auto-register a fast watcher so the
-                    # gateway can detect completion and trigger a new agent
-                    # turn.  CLI mode uses the completion_queue directly.
+                    # gateway can detect completion. By default completions are
+                    # passive after the spawning turn ends; resume_on_complete
+                    # opts back into starting a follow-up agent turn.
                     if proc_session.watcher_platform:
                         proc_session.watcher_interval = 5
                         process_registry.pending_watchers.append({
@@ -1944,6 +1973,8 @@ def terminal_tool(
                             "user_name": proc_session.watcher_user_name,
                             "thread_id": proc_session.watcher_thread_id,
                             "notify_on_complete": True,
+                            "resume_on_complete": proc_session.resume_on_complete,
+                            "run_generation": proc_session.watcher_run_generation,
                         })
 
                 # Set watch patterns for output monitoring
@@ -2269,7 +2300,12 @@ TERMINAL_SCHEMA = {
             },
             "notify_on_complete": {
                 "type": "boolean",
-                "description": "When true (and background=true), you'll be automatically notified exactly once when the process finishes. **This is the right choice for almost every long-running task** — tests, builds, deployments, multi-item batch jobs, anything that takes over a minute and has a defined end. Use this and keep working on other things; the system notifies you on exit. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
+                "description": "When true (and background=true), you'll be automatically notified exactly once when the process finishes. **This is the right choice for almost every long-running task** — tests, builds, deployments, multi-item batch jobs, anything that takes over a minute and has a defined end. Use this and keep working on other things; the system notifies you on exit. This notification is passive after the current turn has already finished. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
+                "default": False
+            },
+            "resume_on_complete": {
+                "type": "boolean",
+                "description": "When true with background=true and notify_on_complete=true, the gateway may start a follow-up agent turn from the completion notification even after the spawning turn has already ended. Leave false unless the process result is required before answering.",
                 "default": False
             },
             "watch_patterns": {
@@ -2292,6 +2328,7 @@ def _handle_terminal(args, **kw):
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
+        resume_on_complete=args.get("resume_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
     )
 

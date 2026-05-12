@@ -76,6 +76,27 @@ class TestForegroundTimeoutCap:
         assert "long-lived" in result["error"].lower()
         assert "background=true" in result["error"]
 
+    def test_foreground_rejects_explicit_uvicorn_server_command(self):
+        """Explicit uvicorn server launches should still be redirected to background mode."""
+        from tools.terminal_tool import terminal_tool
+
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+             patch("tools.terminal_tool._start_cleanup_thread"):
+
+            result = json.loads(terminal_tool(command="cd /workdir && python3 -m uvicorn app:app"))
+
+        assert result["exit_code"] == -1
+        assert "long-lived" in result["error"].lower()
+        assert "background=true" in result["error"]
+
+    def test_foreground_allows_harmless_uvicorn_mentions(self):
+        """Installing, importing, or grepping uvicorn should not look like a server launch."""
+        from tools.terminal_tool import _foreground_background_guidance
+
+        assert _foreground_background_guidance("pip install fastapi uvicorn") is None
+        assert _foreground_background_guidance("python3 -c 'import uvicorn; print(uvicorn.__version__)'") is None
+        assert _foreground_background_guidance("ps aux | grep uvicorn") is None
+
     def test_foreground_allows_help_variant_for_server_command(self):
         """Informational variants like '--help' should not be blocked."""
         from tools.terminal_tool import terminal_tool
@@ -172,6 +193,39 @@ class TestForegroundTimeoutCap:
 
         # Background should NOT be rejected
         assert "error" not in result or result["error"] is None
+
+    def test_background_reports_spawn_failure(self):
+        """Sandbox background launch failures must not look like a started process."""
+        from tools.terminal_tool import terminal_tool
+
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config(env_type="docker")), \
+             patch("tools.terminal_tool._start_cleanup_thread"):
+
+            mock_env = MagicMock()
+            mock_proc_session = MagicMock()
+            mock_proc_session.id = "proc_missing_pid"
+            mock_proc_session.pid = None
+            mock_proc_session.exited = True
+            mock_proc_session.exit_code = -1
+            mock_proc_session.output_buffer = "Failed to start: sandbox backend did not return a background PID"
+
+            mock_registry = MagicMock()
+            mock_registry.spawn_via_env.return_value = mock_proc_session
+
+            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+                 patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
+                 patch("tools.process_registry.process_registry", mock_registry), \
+                 patch("tools.approval.get_current_session_key", return_value=""):
+                result = json.loads(terminal_tool(
+                    command="python server.py",
+                    background=True,
+                ))
+
+        assert result["exit_code"] == -1
+        assert result["pid"] is None
+        assert "did not return a background PID" in result["error"]
+        assert result["output"] != "Background process started"
 
     def test_default_timeout_not_rejected(self):
         """Default timeout (180s) should not trigger rejection."""

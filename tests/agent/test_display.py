@@ -78,6 +78,15 @@ class TestBuildToolPreview:
         assert result is not None
         assert "1 task" in result
 
+    def test_todo_tool_with_json_string_todos(self):
+        result = build_tool_preview(
+            "todo",
+            {"todos": '[{"id":"1","content":"test","status":"pending"}]'},
+        )
+        assert result is not None
+        assert "1 task" in result
+        assert "49 task" not in result
+
     def test_memory_tool_add(self):
         result = build_tool_preview("memory", {"action": "add", "target": "user", "content": "test note"})
         assert result is not None

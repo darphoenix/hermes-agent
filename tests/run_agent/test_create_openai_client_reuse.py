@@ -135,6 +135,42 @@ def test_second_create_does_not_wrap_closed_transport_from_first():
             )
 
 
+def test_local_openai_client_disables_sdk_retries_without_mutating_kwargs():
+    agent = _make_agent()
+    constructed: list = []
+    fake_openai = _make_fake_openai_factory(constructed)
+    kwargs = {
+        "api_key": "test-key-value",
+        "base_url": "http://127.0.0.1:1237/v1",
+    }
+
+    with patch("run_agent.OpenAI", fake_openai):
+        agent._create_openai_client(kwargs, reason="local", shared=True)
+
+    assert constructed[0]._kwargs["max_retries"] == 0
+    assert "max_retries" not in kwargs
+
+
+def test_local_api_call_timeout_uses_no_per_request_timeout(monkeypatch):
+    agent = _make_agent()
+    agent.base_url = "http://127.0.0.1:1237/v1"
+    agent._base_url = agent.base_url
+    monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
+
+    with patch("run_agent.get_provider_request_timeout", return_value=None):
+        assert agent._resolved_api_call_timeout() is None
+
+
+def test_remote_api_call_timeout_keeps_default(monkeypatch):
+    agent = _make_agent()
+    agent.base_url = "https://api.example.com/v1"
+    agent._base_url = agent.base_url
+    monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
+
+    with patch("run_agent.get_provider_request_timeout", return_value=None):
+        assert agent._resolved_api_call_timeout() == 1800.0
+
+
 def test_replace_primary_openai_client_survives_repeated_rebuilds():
     """Full rebuild path: exercise _replace_primary_openai_client three times
     back-to-back and confirm every resulting ``self.client`` is a fresh,

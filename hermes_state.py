@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS messages (
     reasoning_content TEXT,
     reasoning_details TEXT,
     codex_reasoning_items TEXT,
-    codex_message_items TEXT
+    codex_message_items TEXT,
+    responses_response_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (
@@ -1103,6 +1104,7 @@ class SessionDB:
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
+        responses_response_id: str = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -1123,6 +1125,11 @@ class SessionDB:
             json.dumps(codex_message_items)
             if codex_message_items else None
         )
+        responses_response_id = (
+            responses_response_id.strip()
+            if isinstance(responses_response_id, str) and responses_response_id.strip()
+            else None
+        )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
 
         # Pre-compute tool call count
@@ -1135,8 +1142,8 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, responses_response_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -1152,6 +1159,7 @@ class SessionDB:
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    responses_response_id,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -1202,6 +1210,14 @@ class SessionDB:
                 codex_message_items = (
                     msg.get("codex_message_items") if role == "assistant" else None
                 )
+                responses_response_id = (
+                    msg.get("responses_response_id") if role == "assistant" else None
+                )
+                responses_response_id = (
+                    responses_response_id.strip()
+                    if isinstance(responses_response_id, str) and responses_response_id.strip()
+                    else None
+                )
 
                 reasoning_details_json = (
                     json.dumps(reasoning_details) if reasoning_details else None
@@ -1218,8 +1234,8 @@ class SessionDB:
                     """INSERT INTO messages (session_id, role, content, tool_call_id,
                        tool_calls, tool_name, timestamp, token_count, finish_reason,
                        reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                       codex_message_items)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       codex_message_items, responses_response_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         role,
@@ -1235,6 +1251,7 @@ class SessionDB:
                         reasoning_details_json,
                         codex_items_json,
                         codex_message_items_json,
+                        responses_response_id,
                     ),
                 )
                 total_messages += 1
@@ -1352,7 +1369,7 @@ class SessionDB:
             rows = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
                 "reasoning, reasoning_content, reasoning_details, codex_reasoning_items, "
-                "codex_message_items "
+                "codex_message_items, responses_response_id "
                 f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY timestamp, id",
                 tuple(session_ids),
             ).fetchall()
@@ -1399,6 +1416,8 @@ class SessionDB:
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Failed to deserialize codex_message_items, falling back to None")
                         msg["codex_message_items"] = None
+                if row["responses_response_id"]:
+                    msg["responses_response_id"] = row["responses_response_id"]
             if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
                 continue
             messages.append(msg)
@@ -2091,4 +2110,3 @@ class SessionDB:
             result["error"] = str(exc)
 
         return result
-
