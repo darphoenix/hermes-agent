@@ -65,6 +65,7 @@ def _watcher_dict_with_notify():
         "chat_id": "123",
         "thread_id": "",
         "notify_on_complete": True,
+        "resume_on_complete": True,
     }
 
 
@@ -268,6 +269,7 @@ async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monk
         "chat_id": "-100",
         "thread_id": "42",
         "notify_on_complete": True,
+        "resume_on_complete": True,
     }
 
     await runner._run_process_watcher(watcher)

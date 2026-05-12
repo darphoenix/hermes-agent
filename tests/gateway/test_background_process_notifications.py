@@ -24,13 +24,17 @@ from gateway.run import GatewayRunner, _parse_session_key
 class _FakeRegistry:
     """Return pre-canned sessions, then None once exhausted."""
 
-    def __init__(self, sessions):
+    def __init__(self, sessions, consumed=()):
         self._sessions = list(sessions)
+        self._completion_consumed = set(consumed)
 
     def get(self, session_id):
         if self._sessions:
             return self._sessions.pop(0)
         return None
+
+    def is_completion_consumed(self, session_id):
+        return session_id in self._completion_consumed
 
 
 def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
@@ -246,12 +250,42 @@ async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_consumed_completion_suppresses_background_notification(monkeypatch, tmp_path):
+    """If the agent already consumed a process result, don't also message the user."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)]
+    monkeypatch.setattr(
+        pr_module,
+        "process_registry",
+        _FakeRegistry(sessions, consumed={"proc_test"}),
+    )
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher(_watcher_dict(session_id="proc_test"))
+
+    assert adapter.send.await_count == 0
+    assert adapter.handle_message.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
     adapter = runner.adapters[Platform.TELEGRAM]
-    runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
+    session_key = "agent:main:telegram:group:-100:42"
+    adapter._active_sessions = {
+        session_key: SimpleNamespace(_hermes_run_generation=7)
+    }
+    monkeypatch.setattr(runner, "_is_session_run_current", lambda key, generation: True)
+    runner.session_store._entries[session_key] = SimpleNamespace(
         origin=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="-100",
@@ -264,7 +298,8 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
 
     evt = {
         "session_id": "proc_watch",
-        "session_key": "agent:main:telegram:group:-100:42",
+        "session_key": session_key,
+        "run_generation": "7",
     }
 
     await runner._inject_watch_notification("[SYSTEM: Background process matched]", evt)
@@ -311,9 +346,14 @@ async def test_inject_watch_notification_ignores_foreground_event_source(monkeyp
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
     adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "agent:main:telegram:group:-100:42"
+    adapter._active_sessions = {
+        session_key: SimpleNamespace(_hermes_run_generation=7)
+    }
+    monkeypatch.setattr(runner, "_is_session_run_current", lambda key, generation: True)
 
     # Session store has the process's original thread (thread 42)
-    runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
+    runner.session_store._entries[session_key] = SimpleNamespace(
         origin=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="-100",
@@ -327,7 +367,8 @@ async def test_inject_watch_notification_ignores_foreground_event_source(monkeyp
     # The evt dict carries the correct session_key — NOT a foreground event
     evt = {
         "session_id": "proc_cross_thread",
-        "session_key": "agent:main:telegram:group:-100:42",
+        "session_key": session_key,
+        "run_generation": "7",
     }
 
     await runner._inject_watch_notification("[SYSTEM: watch match]", evt)
