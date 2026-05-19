@@ -169,6 +169,112 @@ def test_conscience_call_llm_uses_stateful_responses_for_local_custom(tmp_path):
     assert response.usage.prompt_tokens == 12
 
 
+def test_conscience_stateful_responses_propagates_incomplete_status(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    agent.conscience_stateful = True
+    fake_response = SimpleNamespace(
+        id="resp_incomplete",
+        status="incomplete",
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(type="output_text", text="!" * 1200)
+                ],
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=99, output_tokens=1200, total_tokens=1299),
+    )
+    fake_create = MagicMock(return_value=fake_response)
+    fake_client = SimpleNamespace(
+        base_url="http://127.0.0.1:1237/v1/",
+        responses=SimpleNamespace(create=fake_create),
+    )
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "local-model", None, None, None),
+        ),
+        patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(fake_client, "local-model"),
+        ),
+    ):
+        response = agent._conscience_call_llm(
+            provider="custom:conscience-local",
+            model="local-model",
+            messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "{}"}],
+            temperature=0,
+            max_tokens=1200,
+            stateful_payload={
+                "previous_response_id": "resp_previous",
+                "instructions": "You are a stateful conscience.",
+                "input_payload": {"review_type": "stop", "stateful_mode": "delta"},
+            },
+        )
+
+    assert response.status == "incomplete"
+    assert response.conscience_response_status == "incomplete"
+    assert response.choices[0].finish_reason == "length"
+    assert response.usage.completion_tokens == 1200
+
+
+def test_conscience_fresh_fallback_does_not_store_or_send_previous_response_id(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    agent.conscience_stateful = True
+    fake_response = SimpleNamespace(
+        id="resp_fallback",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(type="output_text", text='{"should_intervene": false, "verdict": "pass"}')
+                ],
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=3000, output_tokens=12, total_tokens=3012),
+    )
+    fake_create = MagicMock(return_value=fake_response)
+    fake_client = SimpleNamespace(
+        base_url="http://127.0.0.1:1237/v1/",
+        responses=SimpleNamespace(create=fake_create),
+    )
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "local-model", None, None, None),
+        ),
+        patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(fake_client, "local-model"),
+        ),
+    ):
+        response = agent._conscience_call_llm(
+            provider="custom:conscience-local",
+            model="local-model",
+            messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "{}"}],
+            temperature=0,
+            max_tokens=1200,
+            stateful_payload={
+                "previous_response_id": "resp_should_not_send",
+                "instructions": "Fresh stop audit.",
+                "input_payload": {"review_type": "stop"},
+                "fresh_fallback": True,
+                "store": False,
+            },
+        )
+
+    kwargs = fake_create.call_args.kwargs
+    assert kwargs["store"] is False
+    assert "previous_response_id" not in kwargs
+    assert response.conscience_stateful_used is False
+    assert response.conscience_fresh_fallback is True
+    assert response.conscience_previous_response_id is None
+
+
 def test_enforce_stop_gate_blocks_premature_completion(tmp_path):
     agent = _make_agent(tmp_path, conscience_mode="enforce_stop_gate")
     tool_calls = [_tool_call("write_file", {"path": str(tmp_path / "repair.md"), "content": "hello"})]
