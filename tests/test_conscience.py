@@ -141,12 +141,14 @@ def test_stateful_conscience_sends_full_payload_then_delta():
 
     def fake_llm(*, provider, model, messages, temperature, max_tokens, stateful_payload=None):
         calls.append(stateful_payload)
+        review_type = (stateful_payload or {}).get("input_payload", {}).get("review_type")
+        content = {"should_intervene": False, "verdict": "pass" if review_type == "stop" else "observe"}
         return SimpleNamespace(
             response_id=f"resp_{len(calls)}",
             conscience_stateful_used=True,
             choices=[
                 SimpleNamespace(
-                    message=SimpleNamespace(content='{"should_intervene": false}')
+                    message=SimpleNamespace(content=json.dumps(content))
                 )
             ],
         )
@@ -172,7 +174,13 @@ def test_stateful_conscience_sends_full_payload_then_delta():
     assert calls[1]["previous_response_id"] == "resp_1"
     assert calls[1]["input_payload"]["stateful_mode"] == "delta"
     assert "task_contract" not in calls[1]["input_payload"]
+    assert "trajectory_memory" not in calls[1]["input_payload"]
+    assert "ledger_delta" in calls[1]["input_payload"]
     assert [event["event_type"] for event in calls[1]["input_payload"]["new_events"]] == [
+        TOOL_RESULT,
+        INTENT_TO_STOP,
+    ]
+    assert [row["event_type"] for row in calls[1]["input_payload"]["ledger_delta"]["action_append"]] == [
         TOOL_RESULT,
         INTENT_TO_STOP,
     ]
@@ -180,6 +188,648 @@ def test_stateful_conscience_sends_full_payload_then_delta():
     assert latest_audit["stateful"]["used"] is True
     assert latest_audit["stateful"]["previous_response_id"] == "resp_1"
     assert latest_audit["stateful"]["response_id"] == "resp_2"
+
+
+def test_stateful_conscience_compacts_after_prompt_token_limit():
+    monitor = ConscienceMonitor("task-stateful-compact", "Check current setup")
+    monitor.record_event(TASK_START, {"available_tools": ["terminal"]})
+    calls = []
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens, stateful_payload=None):
+        calls.append(stateful_payload)
+        prompt_tokens = 50_001 if len(calls) == 1 else 4000
+        return SimpleNamespace(
+            response_id=f"resp_{len(calls)}",
+            conscience_response_id=f"resp_{len(calls)}",
+            conscience_previous_response_id=(stateful_payload or {}).get("previous_response_id"),
+            conscience_stateful_used=True,
+            usage=SimpleNamespace(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=10,
+                total_tokens=prompt_tokens + 10,
+            ),
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content=json.dumps({"should_intervene": False, "verdict": "observe"})
+                    ),
+                )
+            ],
+        )
+
+    monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+    assert monitor.state.stateful_previous_response_id is None
+    assert monitor.state.stateful_initialized is False
+    assert monitor.state.stateful_reset_count == 1
+
+    monitor.record_event(TOOL_CALL, {"tool_name": "terminal", "tool_args": "pwd"})
+    monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+
+    assert calls[1]["previous_response_id"] is None
+    assert calls[1]["input_payload"]["stateful_mode"] == "compact_restart"
+    assert calls[1]["input_payload"]["stateful_compaction"]["prompt_token_limit"] == 50_000
+    assert calls[1]["input_payload"]["stateful_compaction"]["last_prompt_tokens"] == 50_001
+    assert calls[1]["input_payload"]["recent_events"]
+    assert "trajectory_memory" in calls[1]["input_payload"]
+    assert monitor.state.stateful_previous_response_id == "resp_2"
+    assert monitor.state.stateful_initialized is True
+
+
+def test_stateful_conscience_compacts_before_projected_delta_exceeds_limit():
+    monitor = ConscienceMonitor("task-stateful-projected-compact", "Check current setup")
+    monitor.state.stateful_prompt_token_limit = 100_000
+    monitor.record_event(TASK_START, {"available_tools": ["terminal"]})
+    calls = []
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens, stateful_payload=None):
+        calls.append(stateful_payload)
+        prompt_tokens = 94_000 if len(calls) == 1 else 5000
+        return SimpleNamespace(
+            response_id=f"resp_{len(calls)}",
+            conscience_response_id=f"resp_{len(calls)}",
+            conscience_previous_response_id=(stateful_payload or {}).get("previous_response_id"),
+            conscience_stateful_used=True,
+            usage=SimpleNamespace(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=10,
+                total_tokens=prompt_tokens + 10,
+            ),
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content=json.dumps({"should_intervene": False, "verdict": "observe"})
+                    ),
+                )
+            ],
+        )
+
+    monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+    monitor.record_event(
+        TOOL_RESULT,
+        {
+            "tool_name": "terminal",
+            "success": True,
+            "result_preview": "x" * 20_000,
+        },
+    )
+    monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+
+    assert calls[1]["previous_response_id"] is None
+    assert calls[1]["input_payload"]["stateful_mode"] == "compact_restart"
+    assert calls[1]["input_payload"]["stateful_compaction"]["reason"] == "projected_prompt_token_limit_exceeded"
+    assert "trajectory_memory" in calls[1]["input_payload"]
+
+
+def test_stateful_conscience_compact_restart_is_budgeted():
+    monitor = ConscienceMonitor("task-stateful-budgeted-compact", "Fix the solver and verify sol.csv")
+    monitor.state.stateful_initialized = True
+    monitor.state.stateful_last_prompt_tokens = 50_001
+    monitor.record_event(TASK_START, {"available_tools": ["terminal", "read_file", "write_file"]})
+
+    for i in range(36):
+        monitor.record_event(
+            TOOL_CALL,
+            {
+                "tool_name": "terminal",
+                "tool_args": json.dumps(
+                    {
+                        "command": f"python solve.py --attempt {i}",
+                        "content": "print('large edit')\n" * 600,
+                    }
+                ),
+            },
+        )
+        monitor.record_event(
+            TOOL_RESULT,
+            {
+                "tool_name": "terminal",
+                "success": i % 3 == 0,
+                "duration_seconds": 12.5,
+                "result_preview": ("same parse failure with large traceback\n" * 240),
+            },
+        )
+        monitor.state.intervention_ledger.append(
+            {
+                "id": f"intervention_{i:03d}",
+                "status": "attempted",
+                "event_index": i,
+                "reason": "The actor is repeating the same failing solver strategy. " * 20,
+                "evidence": ["same traceback repeated " * 20, "no new validation evidence " * 20],
+                "next_best_action": "Change approach, inspect the data shape, and verify the output. " * 20,
+                "recommended_tools": ["terminal", "read_file"],
+                "last_result_preview": "long result preview " * 200,
+            }
+        )
+
+    payload = monitor.build_stateful_review_payload("stop", "The task is done." * 200)
+    compaction = payload["stateful_compaction"]
+    memory = payload["trajectory_memory"]
+
+    assert payload["stateful_mode"] == "compact_restart"
+    assert len(payload["recent_events"]) <= 12
+    assert len(memory["action_ledger"]) <= 24
+    assert len(memory["intervention_ledger"]) <= 8
+    assert compaction["omitted"]["recent_events"] > 0
+    assert compaction["omitted"]["action_ledger"] > 0
+    assert compaction["omitted"]["intervention_ledger"] > 0
+    assert compaction["payload_chars"] <= compaction["payload_char_budget"] + 5_000
+    assert compaction["estimated_payload_tokens"] < monitor.state.stateful_prompt_token_limit // 2
+
+
+def test_stateful_conscience_delta_does_not_resend_full_trajectory_memory():
+    monitor = ConscienceMonitor("task-stateful-true-delta", "Check current setup")
+    monitor.record_event(TASK_START, {"available_tools": ["terminal"]})
+    monitor.record_event(TOOL_CALL, {"tool_name": "terminal", "tool_args": "pwd"})
+    calls = []
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens, stateful_payload=None):
+        calls.append(stateful_payload)
+        return SimpleNamespace(
+            response_id=f"resp_{len(calls)}",
+            conscience_response_id=f"resp_{len(calls)}",
+            conscience_previous_response_id=(stateful_payload or {}).get("previous_response_id"),
+            conscience_stateful_used=True,
+            usage=SimpleNamespace(prompt_tokens=5000 + (100 * len(calls)), completion_tokens=10, total_tokens=5010 + (100 * len(calls))),
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content=json.dumps({"should_intervene": False, "verdict": "observe"})
+                    ),
+                )
+            ],
+        )
+
+    monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+    monitor.record_event(
+        TOOL_RESULT,
+        {
+            "tool_name": "terminal",
+            "success": True,
+            "result_preview": "ok",
+        },
+    )
+    monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+
+    delta = calls[1]["input_payload"]
+    assert delta["stateful_mode"] == "delta"
+    assert "trajectory_memory" not in delta
+    assert "ticket_history" not in delta
+    assert delta["ledger_delta"]["action_append"] == [
+        {
+            "event_index": 2,
+            "event_type": TOOL_RESULT,
+            "tool_name": "terminal",
+            "success": True,
+            "result_preview": "ok",
+        }
+    ]
+    assert delta["ledger_delta"]["artifact_upsert"] == []
+    assert delta["ledger_delta"]["intervention_upsert"] == []
+    assert len(json.dumps(delta, ensure_ascii=False)) < len(json.dumps(calls[0]["input_payload"], ensure_ascii=False))
+
+
+def test_stateful_conscience_delta_carries_new_intervention_once():
+    monitor = ConscienceMonitor("task-stateful-intervention-delta", "Fix the parser")
+    calls = []
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens, stateful_payload=None):
+        calls.append(stateful_payload)
+        if len(calls) == 1:
+            content = {
+                "should_intervene": True,
+                "verdict": "repair",
+                "reason": "parser still failing",
+                "evidence": ["same parse error repeated"],
+                "next_best_action": "Debug parser from observed file structure.",
+                "recommended_tools": ["terminal"],
+                "criterion_ids": ["criterion_001"],
+                "confidence": "high",
+            }
+        else:
+            content = {"should_intervene": False, "verdict": "observe"}
+        return SimpleNamespace(
+            response_id=f"resp_{len(calls)}",
+            conscience_response_id=f"resp_{len(calls)}",
+            conscience_previous_response_id=(stateful_payload or {}).get("previous_response_id"),
+            conscience_stateful_used=True,
+            usage=SimpleNamespace(prompt_tokens=4000 + (100 * len(calls)), completion_tokens=20, total_tokens=4020 + (100 * len(calls))),
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content=json.dumps(content)),
+                )
+            ],
+        )
+
+    verdict = monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+    assert verdict.should_intervene is True
+
+    monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+    intervention_delta = calls[1]["input_payload"]["ledger_delta"]["intervention_upsert"]
+    assert [entry["id"] for entry in intervention_delta] == ["intervention_001"]
+    assert intervention_delta[0]["status"] == "issued"
+
+    monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+    assert calls[2]["input_payload"]["ledger_delta"]["intervention_upsert"] == []
+
+
+def test_review_payload_compacts_large_tool_payload_but_artifacts_keep_raw_events():
+    monitor = ConscienceMonitor("task-large", "Write solve.py and validate it")
+    large_content = "print('x')\n" * 2000
+    tool_args = json.dumps({"path": "/workdir/solve.py", "content": large_content})
+    monitor.record_event(TOOL_CALL, {"tool_name": "write_file", "tool_args": tool_args})
+
+    artifacts = monitor.to_artifacts()
+    raw_tool_args = json.loads(artifacts["events"][0]["payload"]["tool_args"])
+    assert raw_tool_args["content"] == large_content
+
+    payload = monitor.build_review_payload("midtask")
+    compact_tool_args = payload["recent_events"][0]["payload"]["tool_args"]
+    assert compact_tool_args["path"] == "/workdir/solve.py"
+    assert compact_tool_args["content"]["kind"] == "large_text_summary"
+    assert compact_tool_args["content"]["chars"] == len(large_content)
+    assert compact_tool_args["content"]["sha256"]
+    assert len(json.dumps(payload)) < len(tool_args)
+
+    artifact_ledger = payload["trajectory_memory"]["artifact_ledger"]
+    assert artifact_ledger[-1]["path"] == "/workdir/solve.py"
+    assert artifact_ledger[-1]["last_content_chars"] == len(large_content)
+    assert artifact_ledger[-1]["last_content_sha256"] == compact_tool_args["content"]["sha256"]
+
+
+def test_stateful_stop_audit_retries_fresh_when_stateful_output_is_unreliable():
+    monitor = ConscienceMonitor("task-stop-fallback", "Create sol.csv with the required header")
+    monitor.state.stateful_previous_response_id = "resp_prev"
+    monitor.state.stateful_initialized = True
+    monitor.state.stateful_last_event_index = 1
+    monitor.record_event(TOOL_RESULT, {"tool_name": "terminal", "success": True, "result_preview": "wrote sol.csv"})
+    calls = []
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens, stateful_payload=None):
+        calls.append(stateful_payload)
+        if len(calls) == 1:
+            return SimpleNamespace(
+                response_id="resp_bad",
+                conscience_response_id="resp_bad",
+                conscience_previous_response_id="resp_prev",
+                conscience_stateful_used=True,
+                conscience_response_status="incomplete",
+                usage=SimpleNamespace(completion_tokens=max_tokens, prompt_tokens=99, total_tokens=99 + max_tokens),
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="length",
+                        message=SimpleNamespace(content="!" * max_tokens),
+                    )
+                ],
+            )
+        return SimpleNamespace(
+            response_id="resp_fresh",
+            conscience_response_id="resp_fresh",
+            conscience_previous_response_id=None,
+            conscience_stateful_used=False,
+            conscience_fresh_fallback=True,
+            conscience_response_status="",
+            usage=SimpleNamespace(completion_tokens=40, prompt_tokens=3000, total_tokens=3040),
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_intervene": True,
+                                "verdict": "block",
+                                "reason": "missing_csv_header",
+                                "evidence": ["sol.csv was written without the expected header"],
+                                "next_best_action": "Add the required header and revalidate sol.csv.",
+                                "recommended_tools": ["terminal"],
+                                "criterion_ids": ["criterion_001"],
+                                "confidence": "high",
+                            }
+                        )
+                    ),
+                )
+            ],
+        )
+
+    verdict = monitor.audit_stop_decision(
+        "Done.",
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+
+    assert verdict.should_intervene is True
+    assert verdict.critique_ticket is not None
+    assert verdict.critique_ticket.reason == "missing_csv_header"
+    assert len(calls) == 2
+    assert calls[0]["previous_response_id"] == "resp_prev"
+    assert calls[1]["fresh_fallback"] is True
+    assert calls[1]["previous_response_id"] is None
+    assert monitor.state.stateful_previous_response_id is None
+    assert monitor.state.stateful_initialized is False
+    assert monitor.state.stateful_last_event_index == 0
+    assert monitor.state.llm_audits[-1]["fallback_from_stateful_reason"] == "stateful_response_incomplete"
+    assert monitor.state.llm_audits[-1]["stateful"]["fresh_fallback"] is True
+    assert monitor.state.llm_audits[-1]["stateful"]["previous_response_id"] is None
+    assert monitor.state.intervention_ledger[-1]["reason"] == "missing_csv_header"
+
+
+def test_intervention_ledger_marks_attempted_and_records_tool_result():
+    monitor = ConscienceMonitor("task-ledger", "Fix the parser")
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_intervene": True,
+                                "verdict": "repair",
+                                "reason": "parser still failing",
+                                "evidence": ["same parse error repeated"],
+                                "next_best_action": "Debug parser from observed file structure.",
+                                "recommended_tools": ["read_file", "write_file", "terminal"],
+                                "criterion_ids": ["criterion_001"],
+                                "confidence": "high",
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+
+    verdict = monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="openai-codex",
+        model="gpt-5.4",
+    )
+
+    assert verdict.should_intervene is True
+    entry = monitor.state.intervention_ledger[-1]
+    assert entry["id"] == "intervention_001"
+    assert entry["status"] == "issued"
+    assert entry["required_action"] == "Debug parser from observed file structure."
+
+    monitor.record_event(TOOL_CALL, {"tool_name": "terminal", "tool_args": "python solve.py"})
+    assert entry["status"] == "attempted"
+    assert entry["followed_tool"] == "terminal"
+    assert entry["followed_event_index"] == len(monitor.state.events) - 1
+
+    monitor.record_event(
+        TOOL_RESULT,
+        {
+            "tool_name": "terminal",
+            "success": False,
+            "error": "parser failed on book block",
+            "result_preview": "ValueError: parser failed on book block",
+        },
+    )
+    assert entry["last_result_event_index"] == len(monitor.state.events) - 1
+    assert entry["last_result_success"] is False
+    assert "parser failed" in entry["last_result_error"]
+
+
+def test_llm_review_updates_intervention_outcome_without_new_intervention():
+    monitor = ConscienceMonitor("task-ledger-outcome", "Fix the parser")
+
+    def initial_llm(*, provider, model, messages, temperature, max_tokens):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_intervene": True,
+                                "verdict": "repair",
+                                "reason": "parser still failing",
+                                "evidence": ["same parse error repeated"],
+                                "next_best_action": "Debug parser from observed file structure.",
+                                "recommended_tools": ["terminal"],
+                                "criterion_ids": ["criterion_001"],
+                                "confidence": "high",
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+
+    monitor.audit_midtask_progress(
+        llm_callable=initial_llm,
+        provider="openai-codex",
+        model="gpt-5.4",
+    )
+    monitor.record_event(TOOL_CALL, {"tool_name": "terminal", "tool_args": "python solve.py"})
+    monitor.record_event(
+        TOOL_RESULT,
+        {
+            "tool_name": "terminal",
+            "success": True,
+            "result_preview": "parser now parses 103 books",
+        },
+    )
+
+    def outcome_llm(*, provider, model, messages, temperature, max_tokens):
+        payload = json.loads(messages[1]["content"])
+        prior = payload["trajectory_memory"]["intervention_ledger"][-1]
+        assert prior["id"] == "intervention_001"
+        assert prior["status"] == "attempted"
+        assert "parser now parses 103 books" in prior["last_result_preview"]
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_intervene": False,
+                                "verdict": "observe",
+                                "intervention_outcomes": [
+                                    {
+                                        "id": "intervention_001",
+                                        "status": "resolved",
+                                        "outcome": "Parser now parses 103 books.",
+                                        "evidence": ["terminal output says parser now parses 103 books"],
+                                        "confidence": "high",
+                                    }
+                                ],
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+
+    verdict = monitor.audit_midtask_progress(
+        llm_callable=outcome_llm,
+        provider="openai-codex",
+        model="gpt-5.4",
+    )
+
+    assert verdict.should_intervene is False
+    entry = monitor.state.intervention_ledger[-1]
+    assert entry["status"] == "resolved"
+    assert entry["outcome"] == "Parser now parses 103 books."
+    assert entry["outcome_review_type"] == "midtask"
+    assert entry["outcome_confidence"] == "high"
+    assert "terminal output" in entry["outcome_evidence"][0]
+    assert verdict.metadata["intervention_outcomes_applied"] == [
+        {"id": "intervention_001", "status": "resolved", "outcome_event_index": len(monitor.state.events) - 1}
+    ]
+
+
+def test_artifacts_preserve_ticket_history_outcomes_and_done_ledger():
+    monitor = ConscienceMonitor("task-ticket-history", "Create sol.csv and verify it")
+
+    def intervention_llm(*, provider, model, messages, temperature, max_tokens):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_intervene": True,
+                                "verdict": "repair",
+                                "reason": "solver is looping",
+                                "evidence": ["same timeout repeated"],
+                                "next_best_action": "Switch to SQL-backed search and verify sol.csv.",
+                                "recommended_tools": ["terminal", "write_file"],
+                                "criterion_ids": ["criterion_001"],
+                                "confidence": "high",
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+
+    monitor.audit_midtask_progress(
+        llm_callable=intervention_llm,
+        provider="openai-codex",
+        model="gpt-5.4",
+    )
+    monitor.record_event(TOOL_CALL, {"tool_name": "terminal", "tool_args": "python solve.py"})
+    monitor.record_event(
+        TOOL_RESULT,
+        {
+            "tool_name": "terminal",
+            "success": True,
+            "result_preview": "wrote /workdir/sol.csv and verified all constraints",
+        },
+    )
+
+    def outcome_llm(*, provider, model, messages, temperature, max_tokens):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_intervene": False,
+                                "verdict": "observe",
+                                "intervention_outcomes": [
+                                    {
+                                        "id": "intervention_001",
+                                        "status": "resolved",
+                                        "outcome": "Actor wrote sol.csv and verified all constraints.",
+                                        "evidence": ["terminal result says verified all constraints"],
+                                        "confidence": "high",
+                                    }
+                                ],
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+
+    monitor.audit_midtask_progress(
+        llm_callable=outcome_llm,
+        provider="openai-codex",
+        model="gpt-5.4",
+    )
+
+    def stop_llm(*, provider, model, messages, temperature, max_tokens):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_intervene": False,
+                                "verdict": "allow_stop",
+                                "reason": "task complete",
+                                "evidence": ["sol.csv exists", "all constraints verified"],
+                                "next_best_action": "Allow stop.",
+                                "recommended_tools": [],
+                                "criterion_ids": ["criterion_001"],
+                                "confidence": "high",
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+
+    monitor.audit_stop_decision(
+        "Done.",
+        llm_callable=stop_llm,
+        provider="openai-codex",
+        model="gpt-5.4",
+    )
+
+    artifacts = monitor.to_artifacts()
+    assert artifacts["completion_ledger"]["criterion_001"]["status"] == "done"
+    assert artifacts["completion_ledger"]["criterion_001"]["evidence_refs"] == [
+        "sol.csv exists",
+        "all constraints verified",
+    ]
+    assert len(artifacts["critique_tickets"]) == 1
+    ticket = artifacts["critique_tickets"][0]
+    assert ticket["id"] == "intervention_001"
+    assert ticket["verdict"] == "repair"
+    assert ticket["status"] == "resolved"
+    assert ticket["outcome"] == "Actor wrote sol.csv and verified all constraints."
+    assert ticket["recommended_tools"] == ["terminal", "write_file"]
 
 
 def test_llm_midtask_audit_uses_sparse_trajectory_prompt():

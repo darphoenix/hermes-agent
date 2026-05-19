@@ -118,6 +118,76 @@ else:
     logger.info("No .env file found. Using system environment variables.")
 
 
+def _bridge_terminal_config_after_dotenv() -> None:
+    """Keep documented terminal config authoritative after dotenv reloads.
+
+    ``cli.py`` and ``gateway/run.py`` both bridge ``terminal.*`` config values
+    into ``TERMINAL_*`` env vars.  This module also loads ``~/.hermes/.env`` at
+    import time, so direct AIAgent harnesses can otherwise regress back to stale
+    dotenv values such as ``TERMINAL_LIFETIME_SECONDS=300`` after the bridge ran.
+    """
+    config_path = Path(_hermes_home) / "config.yaml"
+    if not config_path.exists():
+        return
+    try:
+        import yaml
+        from hermes_cli.config import _expand_env_vars
+
+        with config_path.open(encoding="utf-8") as handle:
+            cfg = yaml.safe_load(handle) or {}
+        cfg = _expand_env_vars(cfg)
+    except Exception as exc:
+        logger.debug("Terminal config bridge skipped after dotenv reload: %s", exc)
+        return
+
+    terminal_cfg = cfg.get("terminal", {})
+    if not isinstance(terminal_cfg, dict) or not terminal_cfg:
+        return
+
+    env_map = {
+        "backend": "TERMINAL_ENV",
+        "env_type": "TERMINAL_ENV",
+        "cwd": "TERMINAL_CWD",
+        "timeout": "TERMINAL_TIMEOUT",
+        "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
+        "docker_image": "TERMINAL_DOCKER_IMAGE",
+        "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
+        "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
+        "modal_image": "TERMINAL_MODAL_IMAGE",
+        "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+        "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
+        "ssh_host": "TERMINAL_SSH_HOST",
+        "ssh_user": "TERMINAL_SSH_USER",
+        "ssh_port": "TERMINAL_SSH_PORT",
+        "ssh_key": "TERMINAL_SSH_KEY",
+        "container_cpu": "TERMINAL_CONTAINER_CPU",
+        "container_memory": "TERMINAL_CONTAINER_MEMORY",
+        "container_disk": "TERMINAL_CONTAINER_DISK",
+        "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+        "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
+        "docker_env": "TERMINAL_DOCKER_ENV",
+        "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
+        "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
+        "sandbox_dir": "TERMINAL_SANDBOX_DIR",
+        "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
+    }
+    for key, env_var in env_map.items():
+        if key not in terminal_cfg:
+            continue
+        value = terminal_cfg[key]
+        if key == "cwd" and str(value) in {".", "auto", "cwd"}:
+            continue
+        if key == "cwd" and isinstance(value, str):
+            value = os.path.expanduser(value)
+        if isinstance(value, (list, dict)):
+            os.environ[env_var] = json.dumps(value)
+        else:
+            os.environ[env_var] = str(value)
+
+
+_bridge_terminal_config_after_dotenv()
+
+
 # Import our tool system
 from model_tools import (
     get_tool_definitions,
@@ -1451,6 +1521,12 @@ class AIAgent:
         self._last_activity_desc: str = "initializing"
         self._current_tool: str | None = None
         self._api_call_count: int = 0
+        self._trace_lock = threading.Lock()
+        self._request_trace: list[dict[str, Any]] = []
+        self._trace_turn_id: str | None = None
+        self._trace_task_id: str | None = None
+        self._trace_turn_started_at: float = time.time()
+        self._active_api_trace_row: dict[str, Any] | None = None
 
         # Rate limit tracking — updated from x-ratelimit-* response headers
         # after each API call.  Accessed by /usage slash command.
@@ -7248,9 +7324,27 @@ class AIAgent:
             if self._interrupt_requested:
                 raise InterruptedError("Agent interrupted before Codex stream retry")
             collected_output_items: list = []
+            stream_open_started = time.perf_counter()
+            stream_read_started = None
+            stream_chunks = 0
+            stream_first_event_recorded = False
+            self._trace_update_active_api(stream_transport="responses.stream", stream_attempt=attempt)
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
+                    self._trace_update_active_api(
+                        stream_open_s=round(time.perf_counter() - stream_open_started, 6)
+                    )
+                    stream_read_started = time.perf_counter()
                     for event in stream:
+                        stream_chunks += 1
+                        if not stream_first_event_recorded:
+                            stream_first_event_recorded = True
+                            self._trace_update_active_api(
+                                stream_time_to_first_event_s=round(
+                                    time.perf_counter() - stream_read_started,
+                                    6,
+                                )
+                            )
                         self._touch_activity("receiving stream response")
                         if self._interrupt_requested:
                             break
@@ -7297,7 +7391,16 @@ class AIAgent:
                                 sum(len(p) for p in self._codex_streamed_text_parts),
                                 self._client_log_context(),
                             )
+                    parse_started = time.perf_counter()
                     final_response = stream.get_final_response()
+                    self._trace_update_active_api(
+                        stream_chunks=stream_chunks,
+                        stream_read_s=round(
+                            time.perf_counter() - (stream_read_started or stream_open_started),
+                            6,
+                        ),
+                        response_parse_s=round(time.perf_counter() - parse_started, 6),
+                    )
                     # PATCH: ChatGPT Codex backend streams valid output items
                     # but get_final_response() can return an empty output list.
                     # Backfill from collected items or synthesize from deltas.
@@ -7869,6 +7972,7 @@ class AIAgent:
         )
 
         _call_start = time.time()
+        _wait_started = time.perf_counter()
         self._touch_activity("waiting for non-streaming API response")
 
         t = threading.Thread(target=_call, daemon=True)
@@ -7941,6 +8045,7 @@ class AIAgent:
                 raise InterruptedError("Agent interrupted during API call")
         if result["error"] is not None:
             raise result["error"]
+        self._trace_update_active_api(nonstream_wait_s=round(time.perf_counter() - _wait_started, 6))
         return result["response"]
 
     # ── Unified streaming API call ─────────────────────────────────────────
@@ -9858,6 +9963,140 @@ class AIAgent:
                     content[-1]["cache_control"] = {"type": "ephemeral"}
                 break
 
+    def _should_send_mtplx_session_header(self) -> bool:
+        """Return True when a local MTPLX chat-completions request needs a session header."""
+        if self.api_mode != "chat_completions" or not self.session_id:
+            return False
+        if not self.base_url or not is_local_endpoint(self.base_url):
+            return False
+
+        provider = str(self.provider or "").strip().lower()
+        if provider in {"mtplx", "local-mtplx"}:
+            return True
+
+        # Full Hermes smoke tests may intentionally run the local wrapper via
+        # provider="custom" so the regular Hermes provider path is exercised.
+        # The MTPLX wrapper still needs the stable session header for SessionBank
+        # cache reuse; gate on the model name/path so unrelated local custom
+        # endpoints (Ollama, LM Studio, etc.) do not receive MTPLX-specific headers.
+        model_lower = str(self.model or "").lower()
+        return "mtplx" in model_lower
+
+    def _request_trace_enabled(self) -> bool:
+        value = str(os.getenv("HERMES_REQUEST_TRACE", "1")).strip().lower()
+        return value not in {"0", "false", "off", "no"}
+
+    def _trace_actor_name(self) -> str:
+        prefix = str(getattr(self, "log_prefix", "") or "").strip().lower()
+        if "subagent" in prefix or int(getattr(self, "_delegate_depth", 0) or 0) > 0:
+            return "delegate"
+        return "main"
+
+    def _trace_base_event(self, kind: str, *, actor: str | None = None, **fields: Any) -> dict[str, Any]:
+        now = time.time()
+        turn_started = float(getattr(self, "_trace_turn_started_at", now) or now)
+        row: dict[str, Any] = {
+            "schema_version": 1,
+            "kind": kind,
+            "created_at_s": round(now, 6),
+            "turn_elapsed_s": round(max(0.0, now - turn_started), 6),
+            "session_id": self.session_id or "",
+            "turn_id": getattr(self, "_trace_turn_id", None) or "",
+            "task_id": getattr(self, "_trace_task_id", None) or getattr(self, "_current_task_id", "") or "",
+            "actor": actor or self._trace_actor_name(),
+        }
+        row.update(fields)
+        return row
+
+    def _trace_record_event(self, kind: str, *, actor: str | None = None, **fields: Any) -> dict[str, Any] | None:
+        if not self._request_trace_enabled():
+            return None
+        row = self._trace_base_event(kind, actor=actor, **fields)
+        with self._trace_lock:
+            self._request_trace.append(row)
+        return row
+
+    def _trace_update_active_api(self, **fields: Any) -> None:
+        if not self._request_trace_enabled():
+            return
+        with self._trace_lock:
+            row = self._active_api_trace_row
+            if row is not None:
+                row.update(fields)
+
+    def _trace_apply_headers(self, api_kwargs: dict, *, request_id: str, actor: str) -> dict:
+        if not isinstance(api_kwargs, dict):
+            return api_kwargs
+        existing = api_kwargs.get("extra_headers")
+        headers: dict[str, str] = {}
+        if isinstance(existing, dict):
+            headers.update({str(k): str(v) for k, v in existing.items()})
+        headers.setdefault("X-Hermes-Request-Id", request_id)
+        headers.setdefault("X-Hermes-Actor", actor)
+        headers.setdefault("X-Hermes-Turn-Id", str(getattr(self, "_trace_turn_id", "") or ""))
+        headers.setdefault("X-Hermes-Session-Id", str(self.session_id or ""))
+        headers.setdefault("X-Hermes-Task-Id", str(getattr(self, "_trace_task_id", "") or getattr(self, "_current_task_id", "") or ""))
+        api_kwargs["extra_headers"] = headers
+        return api_kwargs
+
+    def _trace_start_api_call(
+        self,
+        *,
+        api_call_index: int,
+        message_count: int,
+        tool_count: int,
+        approx_input_tokens: int,
+        request_char_count: int,
+    ) -> dict[str, Any] | None:
+        if not self._request_trace_enabled():
+            return None
+        actor = self._trace_actor_name()
+        short_turn = str(getattr(self, "_trace_turn_id", "") or "turn").replace("turn_", "")
+        request_id = f"hrq_{short_turn}_{api_call_index}_{uuid.uuid4().hex[:6]}"
+        return self._trace_base_event(
+            "api_call",
+            actor=actor,
+            request_id=request_id,
+            api_call_index=api_call_index,
+            model=self.model,
+            provider=self.provider or "",
+            api_mode=self.api_mode,
+            base_url=self.base_url or "",
+            message_count=message_count,
+            tool_count=tool_count,
+            approx_input_tokens=approx_input_tokens,
+            request_char_count=request_char_count,
+            status="started",
+        )
+
+    def _trace_finish_api_call(self, row: dict[str, Any] | None, **fields: Any) -> None:
+        if not row or not self._request_trace_enabled():
+            return
+        now = time.time()
+        turn_started = float(getattr(self, "_trace_turn_started_at", now) or now)
+        row.update(fields)
+        row["finished_at_s"] = round(now, 6)
+        row["turn_finished_elapsed_s"] = round(max(0.0, now - turn_started), 6)
+        with self._trace_lock:
+            self._request_trace.append(dict(row))
+            if self._active_api_trace_row is row:
+                self._active_api_trace_row = None
+
+    def _apply_mtplx_session_header(self, api_kwargs: dict) -> dict:
+        """Attach the MTPLX SessionBank identity without disturbing caller headers."""
+        if not self._should_send_mtplx_session_header():
+            return api_kwargs
+
+        existing = api_kwargs.get("extra_headers")
+        headers: dict[str, str] = {}
+        if isinstance(existing, dict):
+            headers.update({str(k): str(v) for k, v in existing.items()})
+
+        if not any(k.lower() == "x-mtplx-session-id" for k in headers):
+            headers["x-mtplx-session-id"] = str(self.session_id)
+        api_kwargs["extra_headers"] = headers
+        return api_kwargs
+
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
         api_tools = self._tools_for_next_api_call()
@@ -10025,7 +10264,7 @@ class AIAgent:
             if _ephemeral_out is not None:
                 self._ephemeral_max_output_tokens = None
 
-            return _ct.build_kwargs(
+            api_kwargs = _ct.build_kwargs(
                 model=self.model,
                 messages=api_messages,
                 tools=tools_for_api,
@@ -10046,6 +10285,7 @@ class AIAgent:
                 supports_reasoning=self._supports_reasoning_extra_body(),
                 qwen_session_metadata=_qwen_meta,
             )
+            return self._apply_mtplx_session_header(api_kwargs)
 
         # ── Legacy flag path ────────────────────────────────────────────
         # Reached only when get_provider_profile() returns None — i.e. a
@@ -10057,7 +10297,7 @@ class AIAgent:
         # Strip image parts for non-vision models (no-op when vision-capable).
         _msgs_for_chat = self._prepare_messages_for_non_vision_model(api_messages)
 
-        return self._apply_conscience_repair_overrides(_ct.build_kwargs(
+        api_kwargs = self._apply_conscience_repair_overrides(_ct.build_kwargs(
             model=self.model,
             messages=_msgs_for_chat,
             tools=tools_for_api,
@@ -10093,6 +10333,7 @@ class AIAgent:
             anthropic_max_output=_ant_max,
             provider_name=self.provider,
         ))
+        return self._apply_mtplx_session_header(api_kwargs)
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
@@ -11385,6 +11626,23 @@ class AIAgent:
                 reasoning.pop("enabled", None)
             extra_body = {"reasoning": reasoning}
 
+        trace_row = None
+        trace_started = time.perf_counter()
+        if self._request_trace_enabled():
+            short_turn = str(getattr(self, "_trace_turn_id", "") or "turn").replace("turn_", "")
+            trace_row = self._trace_base_event(
+                "conscience_call",
+                actor="conscience",
+                request_id=f"hrq_{short_turn}_conscience_{uuid.uuid4().hex[:6]}",
+                provider=provider or "",
+                model=model or "",
+                api_mode="codex_responses" if self.conscience_stateful else "chat_completions",
+                stateful_requested=bool(self.conscience_stateful),
+                max_tokens=max_tokens,
+                temperature=temperature,
+                status="started",
+            )
+
         if (
             self.conscience_stateful
             and isinstance(stateful_payload, dict)
@@ -11411,7 +11669,9 @@ class AIAgent:
                 if client is not None and is_local_endpoint(base_url) and hasattr(real_client, "responses"):
                     input_payload = stateful_payload.get("input_payload")
                     instructions = str(stateful_payload.get("instructions") or "").strip()
-                    previous_response_id = stateful_payload.get("previous_response_id")
+                    fresh_fallback = bool(stateful_payload.get("fresh_fallback"))
+                    previous_response_id = None if fresh_fallback else stateful_payload.get("previous_response_id")
+                    store_response = not fresh_fallback and bool(stateful_payload.get("store", True))
                     request_kwargs: dict[str, Any] = {
                         "model": final_model or model,
                         "instructions": instructions or "You are Hermes conscience sidecar.",
@@ -11421,13 +11681,19 @@ class AIAgent:
                                 "content": json.dumps(input_payload or {}, ensure_ascii=False),
                             }
                         ],
-                        "store": True,
+                        "store": store_response,
                         "max_output_tokens": max_tokens,
                     }
                     if temperature is not None:
                         request_kwargs["temperature"] = temperature
                     if isinstance(previous_response_id, str) and previous_response_id.strip():
                         request_kwargs["previous_response_id"] = previous_response_id.strip()
+                    if trace_row is not None:
+                        request_kwargs = self._trace_apply_headers(
+                            request_kwargs,
+                            request_id=str(trace_row.get("request_id") or ""),
+                            actor="conscience",
+                        )
                     logger.info(
                         "Conscience stateful audit call: provider=%s model=%s prev=%s mode=%s",
                         provider,
@@ -11437,37 +11703,116 @@ class AIAgent:
                     )
                     response = real_client.responses.create(**request_kwargs)
                     response_id = str(getattr(response, "id", "") or "").strip() or None
+                    response_status = str(getattr(response, "status", "") or "").strip()
+                    response_finish_reason = "length" if response_status == "incomplete" else "stop"
                     content = self._extract_responses_text(response)
+                    if trace_row is not None:
+                        usage = self._responses_usage_to_chat_usage(response)
+                        trace_fields = {
+                            "status": "ok",
+                            "api_duration_s": round(time.perf_counter() - trace_started, 6),
+                            "response_id": response_id or "",
+                            "stateful_used": not fresh_fallback,
+                            "fresh_fallback": fresh_fallback,
+                            "previous_response_id": previous_response_id or "",
+                            "responses_status": response_status,
+                            "finish_reason": response_finish_reason,
+                        }
+                        if usage is not None:
+                            trace_fields.update({
+                                "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+                                "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+                                "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+                            })
+                        self._trace_finish_api_call(trace_row, **trace_fields)
+                        trace_row = None
                     return SimpleNamespace(
                         choices=[
                             SimpleNamespace(
                                 index=0,
                                 message=SimpleNamespace(role="assistant", content=content),
-                                finish_reason="stop",
+                                finish_reason=response_finish_reason,
                             )
                         ],
                         model=final_model or model,
                         usage=self._responses_usage_to_chat_usage(response),
+                        status=response_status,
                         response_id=response_id,
                         conscience_response_id=response_id,
                         conscience_previous_response_id=previous_response_id,
-                        conscience_stateful_used=True,
+                        conscience_stateful_used=not fresh_fallback,
+                        conscience_fresh_fallback=fresh_fallback,
+                        conscience_response_status=response_status,
                     )
             except Exception as exc:
+                if trace_row is not None:
+                    self._trace_finish_api_call(
+                        trace_row,
+                        status="error",
+                        api_duration_s=round(time.perf_counter() - trace_started, 6),
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:500],
+                        stateful_used=False,
+                    )
+                    trace_row = None
                 logger.warning(
                     "Conscience stateful audit failed; falling back to stateless chat audit: %s",
                     exc,
                 )
 
-        return _call_llm(
-            provider=provider,
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout="none",
-            extra_body=extra_body,
-        )
+        fallback_trace_row = trace_row
+        fallback_started = trace_started
+        if fallback_trace_row is None and self._request_trace_enabled():
+            short_turn = str(getattr(self, "_trace_turn_id", "") or "turn").replace("turn_", "")
+            fallback_trace_row = self._trace_base_event(
+                "conscience_call",
+                actor="conscience",
+                request_id=f"hrq_{short_turn}_conscience_{uuid.uuid4().hex[:6]}",
+                provider=provider or "",
+                model=model or "",
+                api_mode="chat_completions",
+                stateful_requested=bool(self.conscience_stateful),
+                max_tokens=max_tokens,
+                temperature=temperature,
+                status="started",
+            )
+            fallback_started = time.perf_counter()
+        try:
+            response = _call_llm(
+                provider=provider,
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout="none",
+                extra_body=extra_body,
+            )
+            if fallback_trace_row is not None:
+                usage = getattr(response, "usage", None)
+                trace_fields = {
+                    "status": "ok",
+                    "api_duration_s": round(time.perf_counter() - fallback_started, 6),
+                    "stateful_used": False,
+                }
+                if usage is not None:
+                    trace_fields.update({
+                        "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+                        "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+                        "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+                    })
+                self._trace_finish_api_call(fallback_trace_row, **trace_fields)
+            return response
+        except Exception as exc:
+            if fallback_trace_row is not None:
+                self._trace_finish_api_call(
+                    fallback_trace_row,
+                    status="error",
+                    api_duration_s=round(time.perf_counter() - fallback_started, 6),
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:500],
+                    stateful_used=False,
+                )
+            raise
 
     def _persist_conscience_artifacts(self, monitor: ConscienceMonitor) -> dict | None:
         if not monitor:
@@ -11479,10 +11824,13 @@ class AIAgent:
             atomic_json_write(conscience_dir / "task-contract.json", artifacts.get("task_contract", {}))
             atomic_json_write(conscience_dir / "completion-ledger.json", artifacts.get("completion_ledger", {}))
             atomic_json_write(conscience_dir / "conscience-events.json", artifacts.get("events", []))
+            atomic_json_write(conscience_dir / "intervention-ledger.json", artifacts.get("intervention_ledger", []))
             atomic_json_write(conscience_dir / "llm-audits.json", artifacts.get("llm_audits", []))
-            tickets = []
+            tickets = list(artifacts.get("critique_tickets") or [])
             if self._conscience_last_ticket:
-                tickets.append(asdict_safe(self._conscience_last_ticket))
+                last_ticket = asdict_safe(self._conscience_last_ticket)
+                if not tickets or (tickets[-1].get("reason") != last_ticket.get("reason")):
+                    tickets.append(last_ticket)
             atomic_json_write(conscience_dir / "critique-tickets.json", tickets)
             atomic_json_write(conscience_dir / "stop-audit.json", self._conscience_last_stop_audit or {})
             atomic_json_write(conscience_dir / "last-review.json", self._conscience_last_review or {})
@@ -11617,28 +11965,6 @@ class AIAgent:
                 function_args = {}
             if not isinstance(function_args, dict):
                 function_args = {}
-
-            # Checkpoint for file-mutating tools
-            if function_name in {"write_file", "patch"} and self._checkpoint_mgr.enabled:
-                try:
-                    file_path = function_args.get("path", "")
-                    if file_path:
-                        work_dir = self._checkpoint_mgr.get_working_dir_for_path(file_path)
-                        self._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
-                except Exception:
-                    pass
-
-            # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and self._checkpoint_mgr.enabled:
-                try:
-                    cmd = function_args.get("command", "")
-                    if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
-                        self._checkpoint_mgr.ensure_checkpoint(
-                            cwd, f"before terminal: {cmd[:60]}"
-                        )
-                except Exception:
-                    pass
 
             block_result = None
             blocked_by_guardrail = False
@@ -11874,6 +12200,7 @@ class AIAgent:
                 else:
                     function_result = f"Error executing tool '{name}': thread did not return a result"
                 tool_duration = 0.0
+                is_error = True
             else:
                 function_name, function_args, function_result, tool_duration, is_error, blocked = r
 
@@ -11918,6 +12245,17 @@ class AIAgent:
 
             self._current_tool = None
             self._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
+            self._trace_record_event(
+                "tool_call",
+                tool_name=name,
+                tool_call_id=getattr(tc, "id", ""),
+                execution_mode="concurrent",
+                api_call_index=api_call_count,
+                duration_s=round(float(tool_duration or 0.0), 6),
+                output_chars=len(_multimodal_text_summary(function_result)),
+                is_error=bool(is_error),
+                blocked=bool(blocked),
+            )
 
             if not blocked and self.tool_complete_callback:
                 try:
@@ -12350,6 +12688,17 @@ class AIAgent:
 
             self._current_tool = None
             self._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
+            self._trace_record_event(
+                "tool_call",
+                tool_name=function_name,
+                tool_call_id=getattr(tool_call, "id", ""),
+                execution_mode="sequential",
+                api_call_index=api_call_count,
+                duration_s=round(float(tool_duration or 0.0), 6),
+                output_chars=len(_multimodal_text_summary(function_result)),
+                is_error=bool(_is_error_result),
+                blocked=bool(_execution_blocked),
+            )
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
@@ -12751,6 +13100,12 @@ class AIAgent:
         # state registry.  Set BEFORE any tool dispatch so snapshots taken at
         # child-launch time see the parent's real id, not None.
         self._current_task_id = effective_task_id
+        self._trace_turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+        self._trace_task_id = effective_task_id
+        self._trace_turn_started_at = time.time()
+        with self._trace_lock:
+            self._request_trace = []
+            self._active_api_trace_row = None
         
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
@@ -13505,6 +13860,9 @@ class AIAgent:
             api_kwargs = None  # Guard against UnboundLocalError in except handler
 
             while retry_count < max_retries:
+                trace_row = None
+                trace_finished = False
+                trace_attempt_wall_start = time.time()
                 # ── Nous Portal rate limit guard ──────────────────────
                 # If another session already recorded that Nous is rate-
                 # limited, skip the API call entirely.  Each attempt
@@ -13553,12 +13911,29 @@ class AIAgent:
                         pass  # Never let rate guard break the agent loop
 
                 try:
+                    trace_row = self._trace_start_api_call(
+                        api_call_index=api_call_count,
+                        message_count=len(api_messages),
+                        tool_count=len(self.tools or []),
+                        approx_input_tokens=approx_tokens,
+                        request_char_count=total_chars,
+                    )
+                    request_build_started = time.perf_counter()
                     self._reset_stream_delivery_tracking()
                     api_kwargs = self._build_api_kwargs(api_messages)
                     if self._force_ascii_payload:
                         _sanitize_structure_non_ascii(api_kwargs)
                     if self.api_mode == "codex_responses":
                         api_kwargs = self._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
+                    if trace_row is not None:
+                        trace_row["request_build_s"] = round(time.perf_counter() - request_build_started, 6)
+                        trace_row["request_tool_count"] = len(api_kwargs.get("tools") or []) if isinstance(api_kwargs, dict) else 0
+                        if self.api_mode in {"chat_completions", "codex_responses"} and is_local_endpoint(self.base_url):
+                            api_kwargs = self._trace_apply_headers(
+                                api_kwargs,
+                                request_id=str(trace_row.get("request_id") or ""),
+                                actor=str(trace_row.get("actor") or self._trace_actor_name()),
+                            )
 
                     try:
                         from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -13627,12 +14002,20 @@ class AIAgent:
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
 
+                    if trace_row is not None:
+                        trace_row["streaming"] = bool(_use_streaming)
+                        trace_row["model_call_started_at_s"] = round(time.time(), 6)
+                        with self._trace_lock:
+                            self._active_api_trace_row = trace_row
+                    trace_model_started = time.perf_counter()
                     if _use_streaming:
                         response = self._interruptible_streaming_api_call(
                             api_kwargs, on_first_delta=_stop_spinner
                         )
                     else:
                         response = self._interruptible_api_call(api_kwargs)
+                    if trace_row is not None:
+                        trace_row["model_call_s"] = round(time.perf_counter() - trace_model_started, 6)
                     
                     api_duration = time.time() - api_start_time
                     
@@ -14085,6 +14468,7 @@ class AIAgent:
                             }
                     
                     # Track actual token usage from response for context management
+                    canonical_usage = None
                     if hasattr(response, 'usage') and response.usage:
                         canonical_usage = normalize_usage(
                             response.usage,
@@ -14213,6 +14597,29 @@ class AIAgent:
                                 f"{cached:,}/{prompt:,} tokens "
                                 f"({hit_pct:.0f}% hit, {written:,} written)"
                             )
+
+                    if trace_row is not None and not trace_finished:
+                        response_id = str(getattr(response, "id", "") or "")
+                        trace_fields = {
+                            "status": "ok",
+                            "api_duration_s": round(api_duration, 6),
+                            "response_id": response_id,
+                            "response_model": str(getattr(response, "model", "") or ""),
+                            "finish_reason": str(finish_reason or ""),
+                        }
+                        if canonical_usage is not None:
+                            trace_fields.update({
+                                "prompt_tokens": canonical_usage.prompt_tokens,
+                                "completion_tokens": canonical_usage.output_tokens,
+                                "total_tokens": canonical_usage.total_tokens,
+                                "input_tokens": canonical_usage.input_tokens,
+                                "output_tokens": canonical_usage.output_tokens,
+                                "cache_read_tokens": canonical_usage.cache_read_tokens,
+                                "cache_write_tokens": canonical_usage.cache_write_tokens,
+                                "reasoning_tokens": canonical_usage.reasoning_tokens,
+                            })
+                        self._trace_finish_api_call(trace_row, **trace_fields)
+                        trace_finished = True
                     
                     has_retried_429 = False  # Reset on success
                     # Clear Nous rate limit state on successful request —
@@ -14234,6 +14641,15 @@ class AIAgent:
                     if self.thinking_callback:
                         self.thinking_callback("")
                     api_elapsed = time.time() - api_start_time
+                    if trace_row is not None and not trace_finished:
+                        self._trace_finish_api_call(
+                            trace_row,
+                            status="interrupted",
+                            api_duration_s=round(time.time() - trace_attempt_wall_start, 6),
+                            error_type="InterruptedError",
+                            error="Agent interrupted during API call",
+                        )
+                        trace_finished = True
                     self._vprint(f"{self.log_prefix}⚡ Interrupted during API call.", force=True)
                     self._persist_session(messages, conversation_history)
                     interrupted = True
@@ -14247,6 +14663,16 @@ class AIAgent:
                         thinking_spinner = None
                     if self.thinking_callback:
                         self.thinking_callback("")
+                    if trace_row is not None and not trace_finished:
+                        self._trace_finish_api_call(
+                            trace_row,
+                            status="error",
+                            api_duration_s=round(time.time() - trace_attempt_wall_start, 6),
+                            error_type=type(api_error).__name__,
+                            error=str(api_error)[:500],
+                            retry_count=retry_count,
+                        )
+                        trace_finished = True
 
                     # -----------------------------------------------------------
                     # UnicodeEncodeError recovery.  Two common causes:
@@ -16730,6 +17156,7 @@ class AIAgent:
             "estimated_cost_usd": self.session_estimated_cost_usd,
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
+            "request_trace": list(getattr(self, "_request_trace", []) or []),
         }
         if self._tool_guardrail_halt_decision is not None:
             result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()
@@ -16747,6 +17174,11 @@ class AIAgent:
                 for entry in conscience_monitor.state.ledger.values()
                 if getattr(entry, "status", None) != "done"
             )
+            critique_tickets = []
+            if isinstance(conscience_artifacts, dict):
+                critique_tickets = list(conscience_artifacts.get("critique_tickets") or [])
+            if not critique_tickets and self._conscience_last_ticket:
+                critique_tickets = [asdict_safe(self._conscience_last_ticket)]
             result["conscience"] = {
                 "mode": self.conscience_mode,
                 "provider": self.conscience_provider,
@@ -16757,8 +17189,8 @@ class AIAgent:
                 "blocked_stop_count": self._conscience_blocked_stop_count,
                 "unresolved_criteria_count": unresolved_criteria_count,
                 "last_critique_reason": self._conscience_last_ticket.reason if self._conscience_last_ticket else None,
-                "ticket_count": 1 if self._conscience_last_ticket else 0,
-                "latest_ticket": asdict_safe(self._conscience_last_ticket) if self._conscience_last_ticket else None,
+                "ticket_count": len(critique_tickets),
+                "latest_ticket": critique_tickets[-1] if critique_tickets else None,
                 "latest_review": self._conscience_last_review,
                 "latest_review_payload": self._conscience_last_review_payload,
                 "stop_audit": self._conscience_last_stop_audit,

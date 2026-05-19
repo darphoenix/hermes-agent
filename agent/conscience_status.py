@@ -32,6 +32,9 @@ def build_conscience_status_summary(conscience: dict | None = None, artifact_dir
     last_review = _load_json(artifact_path / "last-review.json", {})
     last_review_payload = _load_json(artifact_path / "last-review-payload.json", {})
     critique_tickets = _load_json(artifact_path / "critique-tickets.json", [])
+    intervention_ledger = _load_json(artifact_path / "intervention-ledger.json", [])
+    if not critique_tickets and isinstance(intervention_ledger, list):
+        critique_tickets = intervention_ledger
     stop_audit = _load_json(artifact_path / "stop-audit.json", {})
     task_contract = _load_json(artifact_path / "task-contract.json", {})
     completion_ledger = _load_json(artifact_path / "completion-ledger.json", {})
@@ -57,6 +60,8 @@ def build_conscience_status_summary(conscience: dict | None = None, artifact_dir
         "artifact_dir": str(artifact_path),
         "review_type": review_type,
         "latest_ticket": latest_ticket,
+        "ticket_count": len(critique_tickets) if isinstance(critique_tickets, list) else 0,
+        "intervention_ledger": intervention_ledger,
         "last_review": last_review,
         "last_review_payload": payload_preview,
         "payload_json": payload_json,
@@ -81,6 +86,7 @@ def format_conscience_status_text(summary: Dict[str, Any]) -> str:
         f"- review type: {summary.get('review_type') or 'unknown'}",
         f"- artifact dir: {summary.get('artifact_dir')}",
         f"- intervened: {bool(verdict.get('should_intervene'))}",
+        f"- tickets: {summary.get('ticket_count') or 0}",
         f"- blocked/intervened reason: {latest_ticket.get('reason') or verdict.get('critique_ticket', {}).get('reason') or verdict.get('metadata', {}).get('review_type') or 'none'}",
     ]
 
