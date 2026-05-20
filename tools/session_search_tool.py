@@ -25,6 +25,7 @@ import re
 from typing import Dict, Any, List, Optional, Union
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+from tools.interrupt import is_interrupted
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
 
@@ -199,6 +200,9 @@ async def _summarize_session(
     conversation_text: str, query: str, session_meta: Dict[str, Any]
 ) -> Optional[str]:
     """Summarize a single session conversation focused on the search query."""
+    if is_interrupted():
+        raise InterruptedError("Session search interrupted before summarization")
+
     system_prompt = (
         "You are reviewing a past conversation transcript to help recall what happened. "
         "Summarize the conversation with a focus on the search topic. Include:\n"
@@ -225,6 +229,8 @@ async def _summarize_session(
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            if is_interrupted():
+                raise InterruptedError("Session search interrupted during summarization")
             response = await async_call_llm(
                 task="session_search",
                 messages=[
@@ -241,8 +247,13 @@ async def _summarize_session(
             logging.warning("Session search LLM returned empty content (attempt %d/%d)", attempt + 1, max_retries)
             if attempt < max_retries - 1:
                 await asyncio.sleep(1 * (attempt + 1))
+                if is_interrupted():
+                    raise InterruptedError("Session search interrupted during summarization retry")
                 continue
             return content
+        except InterruptedError:
+            logging.info("Session summarization interrupted")
+            raise
         except RuntimeError:
             logging.warning("No auxiliary model available for session summarization")
             return None
@@ -336,6 +347,13 @@ def session_search(
     configured auxiliary session_search model.
     The current session is excluded from results since the agent already has that context.
     """
+    if is_interrupted():
+        return json.dumps({
+            "success": False,
+            "error": "Session search interrupted by user.",
+            "interrupted": True,
+        }, ensure_ascii=False)
+
     if db is None:
         try:
             from hermes_state import SessionDB
@@ -386,6 +404,9 @@ def session_search(
                 "count": 0,
                 "message": "No matching sessions found.",
             }, ensure_ascii=False)
+
+        if is_interrupted():
+            raise InterruptedError("Session search interrupted after database search")
 
         # Resolve child sessions to their parent — delegation stores detailed
         # content in child sessions, but the user's conversation is the parent.
@@ -441,6 +462,8 @@ def session_search(
         # Prepare all sessions for parallel summarization
         tasks = []
         for session_id, match_info in seen_sessions.items():
+            if is_interrupted():
+                raise InterruptedError("Session search interrupted while preparing results")
             try:
                 messages = db.get_messages_as_conversation(session_id)
                 if not messages:
@@ -464,6 +487,8 @@ def session_search(
             semaphore = asyncio.Semaphore(max_concurrency)
 
             async def _bounded_summary(text: str, meta: Dict[str, Any]) -> Optional[str]:
+                if is_interrupted():
+                    raise InterruptedError("Session search interrupted before summary worker")
                 async with semaphore:
                     return await _summarize_session(text, query, meta)
 
@@ -471,7 +496,11 @@ def session_search(
                 _bounded_summary(text, meta)
                 for _, _, text, meta in tasks
             ]
-            return await asyncio.gather(*coros, return_exceptions=True)
+            results = await asyncio.gather(*coros, return_exceptions=True)
+            for result in results:
+                if isinstance(result, InterruptedError):
+                    raise result
+            return results
 
         try:
             # Use _run_async() which properly manages event loops across
@@ -482,6 +511,13 @@ def session_search(
             # causing deadlocks in gateway mode (#2681).
             from model_tools import _run_async
             results = _run_async(_summarize_all())
+        except InterruptedError:
+            logging.info("Session search interrupted")
+            return json.dumps({
+                "success": False,
+                "error": "Session search interrupted by user.",
+                "interrupted": True,
+            }, ensure_ascii=False)
         except concurrent.futures.TimeoutError:
             logging.warning(
                 "Session summarization timed out after 60 seconds",
@@ -533,6 +569,13 @@ def session_search(
             "sessions_searched": len(seen_sessions),
         }, ensure_ascii=False)
 
+    except InterruptedError:
+        logging.info("Session search interrupted")
+        return json.dumps({
+            "success": False,
+            "error": "Session search interrupted by user.",
+            "interrupted": True,
+        }, ensure_ascii=False)
     except Exception as e:
         logging.error("Session search failed: %s", e, exc_info=True)
         return tool_error(f"Search failed: {str(e)}", success=False)

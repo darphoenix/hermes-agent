@@ -603,7 +603,18 @@ class ChatCompletionsTransport(ProviderTransport):
         return True
 
     def extract_cache_stats(self, response: Any) -> dict[str, int] | None:
-        """Extract OpenRouter/OpenAI cache stats from prompt_tokens_details."""
+        """Extract provider cache stats from OpenAI-compatible responses."""
+        mtplx_stats = getattr(response, "mtplx_stats", None)
+        if mtplx_stats is None and hasattr(response, "model_extra"):
+            extra = getattr(response, "model_extra", None) or {}
+            if isinstance(extra, dict):
+                mtplx_stats = extra.get("mtplx_stats")
+        if isinstance(mtplx_stats, dict):
+            cached = int(mtplx_stats.get("cached_tokens") or 0)
+            written = int(mtplx_stats.get("cache_write_tokens") or 0)
+            if cached or written:
+                return {"cached_tokens": cached, "creation_tokens": written}
+
         usage = getattr(response, "usage", None)
         if usage is None:
             return None

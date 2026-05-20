@@ -613,6 +613,86 @@ class DockerEnvironment(BaseEnvironment):
 
         return _popen_bash(cmd, stdin_data)
 
+    def _kill_process(self, proc: subprocess.Popen):
+        """Kill an active docker-exec command and its in-container children.
+
+        Killing the host-side ``docker exec`` CLI is not enough on Docker
+        Desktop: the bash/python process inside the container can keep running
+        after the client exits.  The wrapped command always contains this
+        environment session's snapshot path, so use that as a scoped marker and
+        recursively terminate matching process trees inside the container before
+        cleaning up the local docker client process.
+        """
+        container_id = self._container_id
+        if container_id:
+            script = r'''
+pattern="${HERMES_KILL_PATTERN:-}"
+[ -n "$pattern" ] || exit 0
+
+roots="$(COLUMNS=4096 ps -ww -eo pid=,ppid=,args= 2>/dev/null | awk -v pat="$pattern" -v self="$$" 'index($0, pat) > 0 { pid=$1; if (pid != self) print pid }')"
+[ -n "$roots" ] || exit 0
+
+children_of() {
+  ps -eo pid=,ppid= 2>/dev/null | awk -v parent="$1" '$2 == parent { print $1 }'
+}
+
+kill_tree_term() {
+  pid="$1"
+  for child in $(children_of "$pid"); do
+    kill_tree_term "$child"
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+kill_tree_kill() {
+  pid="$1"
+  for child in $(children_of "$pid"); do
+    kill_tree_kill "$child"
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+for pid in $roots; do
+  kill_tree_term "$pid"
+done
+sleep 1
+for pid in $roots; do
+  kill_tree_kill "$pid"
+done
+'''
+            try:
+                subprocess.run(
+                    [
+                        self._docker_exe,
+                        "exec",
+                        "-e",
+                        f"HERMES_KILL_PATTERN={self._snapshot_path}",
+                        container_id,
+                        "sh",
+                        "-lc",
+                        script,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=6,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Failed to kill in-container process tree for %s: %s",
+                    container_id,
+                    exc,
+                )
+
+        try:
+            proc.terminate()
+            proc.wait(timeout=0.5)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                proc.kill()
+                proc.wait(timeout=0.5)
+            except Exception:
+                pass
+
     @staticmethod
     def _storage_opt_supported() -> bool:
         """Check if Docker's storage driver supports --storage-opt size=.

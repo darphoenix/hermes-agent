@@ -147,6 +147,8 @@ _MAX_FILES = 50_000
 # Valid git commit hash pattern: 4–40 hex chars (short or full SHA-1/SHA-256).
 _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')
 
+_CONTAINER_TERMINAL_BACKENDS = {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
+
 
 # ---------------------------------------------------------------------------
 # Input validation helpers
@@ -193,6 +195,39 @@ def _validate_file_path(file_path: str, working_dir: str) -> Optional[str]:
 def _normalize_path(path_value: str) -> Path:
     """Return a canonical absolute path for checkpoint operations."""
     return Path(path_value).expanduser().resolve()
+
+
+def _truthy_env(name: str) -> bool:
+    return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _terminal_backend() -> str:
+    return str(os.getenv("TERMINAL_ENV", "local") or "local").strip().lower()
+
+
+def _map_container_workdir_to_host(path_value: Path) -> Optional[Path]:
+    """Map known container workspace paths to the mounted host worktree.
+
+    Docker mode commonly mounts the host terminal cwd at ``/workspace``.  Git
+    checkpoints run on the host, so a mutating tool path under that mount should
+    snapshot the host path instead of trying to run git in the container-only
+    path.
+    """
+    if _terminal_backend() != "docker":
+        return None
+    if not _truthy_env("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE"):
+        return None
+
+    workspace_root = Path("/workspace")
+    try:
+        relative = path_value.relative_to(workspace_root)
+    except ValueError:
+        return None
+
+    host_cwd = os.getenv("TERMINAL_CWD")
+    if not host_cwd:
+        return None
+    return (Path(host_cwd).expanduser().resolve() / relative).resolve()
 
 
 def _project_hash(working_dir: str) -> str:
@@ -636,7 +671,26 @@ class CheckpointManager:
         if not self._git_available:
             return False
 
-        abs_dir = str(_normalize_path(working_dir))
+        requested_dir = _normalize_path(working_dir)
+        mapped_dir = _map_container_workdir_to_host(requested_dir)
+        checkpoint_dir = mapped_dir or requested_dir
+
+        if not checkpoint_dir.exists():
+            backend = _terminal_backend()
+            if backend in _CONTAINER_TERMINAL_BACKENDS:
+                logger.debug(
+                    "Checkpoint skipped: unmapped %s working directory (%s)",
+                    backend,
+                    requested_dir,
+                )
+            else:
+                logger.debug("Checkpoint skipped: working directory not found (%s)", checkpoint_dir)
+            return False
+        if not checkpoint_dir.is_dir():
+            logger.debug("Checkpoint skipped: not a directory (%s)", checkpoint_dir)
+            return False
+
+        abs_dir = str(checkpoint_dir)
 
         # Skip root, home, and other overly broad directories
         if abs_dir in {"/", str(Path.home())}:

@@ -236,6 +236,23 @@ class _FakePopen:
         return self.returncode
 
 
+class _RunningFakePopen:
+    def __init__(self):
+        self.terminated = False
+        self.killed = False
+        self.waits = 0
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        return 0
+
+
 def _make_execute_only_env(forward_env=None):
     env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
     env.cwd = "/root"
@@ -255,6 +272,30 @@ def _make_execute_only_env(forward_env=None):
     env._last_sync_time = None
     env._init_env_args = []
     return env
+
+
+def test_kill_process_terminates_in_container_tree(monkeypatch):
+    """Docker timeout cleanup must kill the in-container command tree, not only docker exec."""
+    env = _make_execute_only_env()
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    proc = _RunningFakePopen()
+    env._kill_process(proc)
+
+    assert proc.terminated
+    assert proc.waits >= 1
+    assert calls, "docker exec cleanup should be attempted"
+    cmd, kwargs = calls[0]
+    assert cmd[:3] == ["/usr/bin/docker", "exec", "-e"]
+    assert f"HERMES_KILL_PATTERN={env._snapshot_path}" in cmd
+    assert "kill_tree_term" in cmd[-1]
+    assert kwargs["timeout"] == 6
 
 
 def test_init_env_args_uses_hermes_dotenv_for_allowlisted_env(monkeypatch):

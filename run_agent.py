@@ -33,6 +33,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import base64
+from collections import Counter
 import concurrent.futures
 import contextvars
 import copy
@@ -51,6 +52,7 @@ import threading
 from types import SimpleNamespace
 import urllib.request
 import uuid
+import zlib
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, parse_qs, urlunparse
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
@@ -99,6 +101,131 @@ class _OpenAIProxy:
 
 
 OpenAI = _OpenAIProxy()
+
+
+class _RunawayOutputDetected(Exception):
+    """Raised internally when a stream enters a repeated-output loop."""
+
+    def __init__(self, snapshot: dict[str, Any]):
+        self.snapshot = snapshot
+        super().__init__(snapshot.get("reason") or "runaway output detected")
+
+
+class _StreamingRepetitionWatchdog:
+    """Cheap rolling detector for pathological repeated assistant output.
+
+    The detector intentionally waits for a few thousand characters and requires
+    repeated evidence before firing.  Long but legitimate answers should pass;
+    repeated paragraphs, repeated lines, or very compressible loops should not
+    be allowed to consume minutes of runtime.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_chars: int = 6000,
+        window_chars: int = 2048,
+        check_every_chars: int = 512,
+        confirm_hits: int = 2,
+    ) -> None:
+        self.min_chars = min_chars
+        self.window_chars = window_chars
+        self.check_every_chars = check_every_chars
+        self.confirm_hits = confirm_hits
+        self.total_chars = 0
+        self._window = ""
+        self._chars_since_check = 0
+        self._suspicious_hits = 0
+
+    def observe(self, text: str) -> dict[str, Any] | None:
+        if not isinstance(text, str) or not text:
+            return None
+        self.total_chars += len(text)
+        self._chars_since_check += len(text)
+        self._window = (self._window + text)[-self.window_chars:]
+        if self.total_chars < self.min_chars:
+            return None
+        if self._chars_since_check < self.check_every_chars:
+            return None
+        self._chars_since_check = 0
+
+        reason, metrics = self._analyze_window()
+        if reason:
+            self._suspicious_hits += 1
+        else:
+            self._suspicious_hits = max(0, self._suspicious_hits - 1)
+            return None
+
+        if self._suspicious_hits < self.confirm_hits:
+            return None
+
+        return {
+            "reason": reason,
+            "output_chars": self.total_chars,
+            "window_chars": len(self._window),
+            "suspicious_hits": self._suspicious_hits,
+            "metrics": metrics,
+        }
+
+    def _analyze_window(self) -> tuple[str | None, dict[str, Any]]:
+        raw = self._window
+        collapsed = re.sub(r"\s+", " ", raw).strip().lower()
+        raw_bytes = raw.encode("utf-8", errors="ignore")
+        compressed = zlib.compress(raw_bytes, level=1) if raw_bytes else b""
+        compression_ratio = (
+            len(compressed) / max(1, len(raw_bytes))
+            if raw_bytes
+            else 1.0
+        )
+
+        lines = [
+            re.sub(r"\s+", " ", line).strip().lower()
+            for line in raw.splitlines()
+        ]
+        lines = [line for line in lines if len(line) >= 20]
+        repeated_line_ratio = 0.0
+        if len(lines) >= 8:
+            line_counts = Counter(lines)
+            repeated_line_ratio = sum(
+                count - 1 for count in line_counts.values() if count > 1
+            ) / max(1, len(lines))
+
+        words = re.findall(r"[a-z0-9_][a-z0-9_'-]*", collapsed)
+        repeated_ngram_ratio = 0.0
+        ngram_count = 0
+        if len(words) >= 80:
+            n = 8
+            ngrams = [
+                tuple(words[index:index + n])
+                for index in range(0, max(0, len(words) - n + 1))
+            ]
+            ngram_count = len(ngrams)
+            if ngram_count >= 40:
+                ngram_counts = Counter(ngrams)
+                repeated_ngram_ratio = sum(
+                    count - 1 for count in ngram_counts.values() if count > 1
+                ) / max(1, ngram_count)
+
+        metrics = {
+            "compression_ratio": round(compression_ratio, 4),
+            "repeated_line_ratio": round(repeated_line_ratio, 4),
+            "repeated_ngram_ratio": round(repeated_ngram_ratio, 4),
+            "line_count": len(lines),
+            "ngram_count": ngram_count,
+        }
+
+        if repeated_line_ratio >= 0.50:
+            return "repeated_lines", metrics
+        if repeated_ngram_ratio >= 0.42:
+            return "repeated_ngrams", metrics
+        if compression_ratio <= 0.18 and self.total_chars >= 10000:
+            return "low_compression_ratio", metrics
+        if (
+            compression_ratio <= 0.24
+            and (repeated_line_ratio >= 0.35 or repeated_ngram_ratio >= 0.30)
+        ):
+            return "compression_plus_repetition", metrics
+        return None, metrics
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -6985,6 +7112,13 @@ class AIAgent:
             # OpenAI SDK to retry timed-out localhost requests and duplicate
             # in-flight generations.
             client_kwargs["max_retries"] = 0
+            # The OpenAI SDK has its own default read timeout even when we do
+            # not pass a timeout in config.  For localhost model servers that
+            # timeout is the wrong owner of liveness: a long prefill can be
+            # healthy, and timing it out creates duplicate in-flight local
+            # generations.  Explicit provider/model timeout config still wins
+            # because it arrives here as an existing "timeout" key.
+            client_kwargs.setdefault("timeout", None)
         if "http_client" not in client_kwargs:
             keepalive_http = self._build_keepalive_http_client(client_kwargs.get("base_url", ""))
             if keepalive_http is not None:
@@ -7308,6 +7442,49 @@ class AIAgent:
         if changed:
             final_response.output = merged
 
+    def _codex_runaway_output_response(self, snapshot: dict[str, Any]):
+        """Return a compact synthetic response after aborting repeated output."""
+        metrics = snapshot.get("metrics") if isinstance(snapshot, dict) else None
+        if isinstance(snapshot, dict):
+            reason = str(snapshot.get("reason") or "repeated output")
+            output_chars = int(snapshot.get("output_chars", 0) or 0)
+        else:
+            reason = "repeated output"
+            output_chars = 0
+        logger.warning(
+            "Aborted Codex stream after repeated output loop "
+            "(reason=%s, output_chars=%s, metrics=%s). %s",
+            reason,
+            output_chars,
+            metrics,
+            self._client_log_context(),
+        )
+        self._trace_update_active_api(
+            status="runaway_output_aborted",
+            runaway_output_aborted=True,
+            runaway_output_reason=reason,
+            runaway_output_chars=output_chars,
+            runaway_output_metrics=metrics or {},
+        )
+        text = (
+            "Hermes stopped this response because the model began repeating output. "
+            "Please retry the request or ask for a concise continuation."
+        )
+        return SimpleNamespace(
+            id="",
+            model=self.model,
+            status="completed",
+            output_text=text,
+            hermes_runaway_output_detected=True,
+            hermes_runaway_output_snapshot=snapshot,
+            output=[SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text=text)],
+            )],
+        )
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
@@ -7324,6 +7501,7 @@ class AIAgent:
             if self._interrupt_requested:
                 raise InterruptedError("Agent interrupted before Codex stream retry")
             collected_output_items: list = []
+            runaway_watchdog = _StreamingRepetitionWatchdog()
             stream_open_started = time.perf_counter()
             stream_read_started = None
             stream_chunks = 0
@@ -7355,6 +7533,9 @@ class AIAgent:
                             if delta_text:
                                 self._codex_streamed_text_parts.append(delta_text)
                             if delta_text and not has_tool_calls:
+                                runaway_snapshot = runaway_watchdog.observe(delta_text)
+                                if runaway_snapshot is not None:
+                                    raise _RunawayOutputDetected(runaway_snapshot)
                                 if not first_delta_fired:
                                     first_delta_fired = True
                                     if on_first_delta:
@@ -7428,6 +7609,8 @@ class AIAgent:
                                 len(self._codex_streamed_text_parts), len(assembled),
                             )
                     return final_response
+            except _RunawayOutputDetected as exc:
+                return self._codex_runaway_output_response(exc.snapshot)
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
@@ -7477,6 +7660,7 @@ class AIAgent:
         if not hasattr(stream_or_response, "__iter__"):
             return stream_or_response
 
+        runaway_watchdog = _StreamingRepetitionWatchdog()
         terminal_response = None
         collected_output_items: list = []
         collected_text_deltas: list = []
@@ -7500,6 +7684,9 @@ class AIAgent:
                         delta = event.get("delta", "")
                     if delta:
                         collected_text_deltas.append(delta)
+                        runaway_snapshot = runaway_watchdog.observe(delta)
+                        if runaway_snapshot is not None:
+                            return self._codex_runaway_output_response(runaway_snapshot)
 
                 if event_type not in {"response.completed", "response.incomplete", "response.failed"}:
                     continue

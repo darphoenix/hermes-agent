@@ -59,13 +59,14 @@ def set_interrupt(active: bool, thread_id: int | None = None) -> None:
         )
 
 
-def is_interrupted() -> bool:
-    """Check if an interrupt has been requested for the current thread.
+def is_interrupted(thread_id: int | None = None) -> bool:
+    """Check if an interrupt has been requested for a thread.
 
-    Safe to call from any thread — each thread only sees its own
-    interrupt state.
+    Safe to call from any thread. By default each thread only sees its own
+    interrupt state. Passing ``thread_id`` lets helper/offload threads poll
+    the parent agent thread they are doing work for.
     """
-    tid = threading.current_thread().ident
+    tid = thread_id if thread_id is not None else threading.current_thread().ident
     with _lock:
         return tid in _interrupted_threads
 

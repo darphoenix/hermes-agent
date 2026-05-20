@@ -135,7 +135,7 @@ def test_second_create_does_not_wrap_closed_transport_from_first():
             )
 
 
-def test_local_openai_client_disables_sdk_retries_without_mutating_kwargs():
+def test_local_openai_client_disables_sdk_retries_and_timeout_without_mutating_kwargs():
     agent = _make_agent()
     constructed: list = []
     fake_openai = _make_fake_openai_factory(constructed)
@@ -148,7 +148,27 @@ def test_local_openai_client_disables_sdk_retries_without_mutating_kwargs():
         agent._create_openai_client(kwargs, reason="local", shared=True)
 
     assert constructed[0]._kwargs["max_retries"] == 0
+    assert constructed[0]._kwargs["timeout"] is None
     assert "max_retries" not in kwargs
+    assert "timeout" not in kwargs
+
+
+def test_local_openai_client_preserves_explicit_timeout():
+    agent = _make_agent()
+    constructed: list = []
+    fake_openai = _make_fake_openai_factory(constructed)
+    kwargs = {
+        "api_key": "test-key-value",
+        "base_url": "http://127.0.0.1:1237/v1",
+        "timeout": 123.0,
+    }
+
+    with patch("run_agent.OpenAI", fake_openai):
+        agent._create_openai_client(kwargs, reason="local", shared=True)
+
+    assert constructed[0]._kwargs["max_retries"] == 0
+    assert constructed[0]._kwargs["timeout"] == 123.0
+    assert kwargs["timeout"] == 123.0
 
 
 def test_local_api_call_timeout_uses_no_per_request_timeout(monkeypatch):

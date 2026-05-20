@@ -1,0 +1,4 @@
+name: mtplx
+kind: model-provider
+version: 1
+description: Local MTPLX OpenAI-compatible server with SessionBank cache headers.

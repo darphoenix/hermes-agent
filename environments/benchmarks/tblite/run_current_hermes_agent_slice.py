@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import io
 import json
 import os
@@ -67,6 +68,7 @@ def _patch_isolated_terminal_config(
     backend: str,
     timeout: int,
     lifetime_seconds: int,
+    max_foreground_timeout: int,
 ) -> None:
     """Make the copied config authoritative for the benchmark terminal backend.
 
@@ -88,6 +90,34 @@ def _patch_isolated_terminal_config(
     terminal["docker_mount_cwd_to_workspace"] = False
     terminal.pop("cwd", None)
     config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    # The copied user .env is loaded with override=True by run_agent.py.  Keep
+    # its terminal values in sync with the isolated benchmark config so later
+    # dotenv reloads cannot revert the sandbox lifetime back to the user's
+    # interactive defaults.
+    env_path = hermes_home / ".env"
+    existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    terminal_env = {
+        "TERMINAL_ENV": backend,
+        "TERMINAL_TIMEOUT": str(timeout),
+        "TERMINAL_LIFETIME_SECONDS": str(lifetime_seconds),
+        "TERMINAL_MAX_FOREGROUND_TIMEOUT": str(max_foreground_timeout),
+        "TERMINAL_CONTAINER_PERSISTENT": "true",
+        "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE": "false",
+    }
+    lines = []
+    seen = set()
+    for line in existing.splitlines():
+        key = line.split("=", 1)[0].strip()
+        if key in terminal_env:
+            lines.append(f"{key}={terminal_env[key]}")
+            seen.add(key)
+        else:
+            lines.append(line)
+    for key, value in terminal_env.items():
+        if key not in seen:
+            lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def _safe_extract_tar(tar: tarfile.TarFile, target_dir: Path) -> None:
@@ -344,6 +374,7 @@ def run_task(
         "tool_call_counts": turn_summary["tool_call_counts"],
         "verification": verification,
         "messages": messages,
+        "request_trace": result.get("request_trace") or [],
     }
 
 
@@ -355,6 +386,62 @@ def _write_json(path: Path, payload: Any) -> None:
 def _append_jsonl(path: Path, payload: Any) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n")
+
+
+def _write_trace_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    preferred = [
+        "task_name",
+        "task_id",
+        "passed",
+        "kind",
+        "actor",
+        "request_id",
+        "api_call_index",
+        "status",
+        "api_duration_s",
+        "model_call_s",
+        "request_build_s",
+        "stream_open_s",
+        "stream_time_to_first_event_s",
+        "stream_read_s",
+        "response_parse_s",
+        "duration_s",
+        "tool_name",
+        "execution_mode",
+        "prompt_tokens",
+        "completion_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "approx_input_tokens",
+        "request_char_count",
+        "model",
+        "provider",
+        "api_mode",
+        "base_url",
+        "session_id",
+        "turn_id",
+        "created_at_s",
+    ]
+    all_fields = set()
+    for row in rows:
+        all_fields.update(row.keys())
+    fieldnames = [name for name in preferred if name in all_fields]
+    fieldnames.extend(sorted(name for name in all_fields if name not in fieldnames))
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            clean: Dict[str, Any] = {}
+            for key in fieldnames:
+                value = row.get(key)
+                if isinstance(value, (dict, list, tuple)):
+                    clean[key] = json.dumps(value, ensure_ascii=False, default=_json_default)
+                else:
+                    clean[key] = value
+            writer.writerow(clean)
 
 
 def main() -> int:
@@ -390,11 +477,13 @@ def main() -> int:
         backend="docker",
         timeout=args.terminal_timeout,
         lifetime_seconds=args.task_timeout + 120,
+        max_foreground_timeout=max(args.terminal_timeout, args.test_timeout),
     )
     os.environ["HERMES_HOME"] = str(isolated_home)
     os.environ["TERMINAL_ENV"] = "docker"
     os.environ["TERMINAL_TIMEOUT"] = str(args.terminal_timeout)
     os.environ["TERMINAL_LIFETIME_SECONDS"] = str(args.task_timeout + 120)
+    os.environ["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = str(max(args.terminal_timeout, args.test_timeout))
     os.environ["TERMINAL_CONTAINER_PERSISTENT"] = "true"
     os.environ["HERMES_SESSION_SOURCE"] = "tblite-current-hermes-agent"
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -424,12 +513,18 @@ def main() -> int:
         "terminal_backend": "docker",
         "terminal_timeout": args.terminal_timeout,
         "model": config.get("model", {}),
+        "request_trace_jsonl": str(output_dir / "request_trace.jsonl"),
+        "request_trace_csv": str(output_dir / "request_trace.csv"),
     }
     _write_json(output_dir / "run_config.json", run_config)
 
     samples_path = output_dir / "samples.jsonl"
     if samples_path.exists():
         samples_path.unlink()
+    trace_jsonl_path = output_dir / "request_trace.jsonl"
+    trace_csv_path = output_dir / "request_trace.csv"
+    if trace_jsonl_path.exists():
+        trace_jsonl_path.unlink()
 
     print(f"Output: {output_dir}")
     print(f"Model: {(config.get('model', {}) or {}).get('default')}")
@@ -439,6 +534,7 @@ def main() -> int:
     print("")
 
     results: List[Dict[str, Any]] = []
+    trace_rows: List[Dict[str, Any]] = []
     started = time.time()
     for index, item in enumerate(tasks, 1):
         name = item["task_name"]
@@ -454,6 +550,14 @@ def main() -> int:
         )
         results.append(result)
         _append_jsonl(samples_path, result)
+        for trace_row in result.get("request_trace") or []:
+            enriched = dict(trace_row)
+            enriched.setdefault("task_name", result.get("task_name"))
+            enriched.setdefault("task_id", result.get("task_id"))
+            enriched.setdefault("passed", result.get("passed"))
+            enriched.setdefault("task_elapsed_s", result.get("elapsed_s"))
+            trace_rows.append(enriched)
+            _append_jsonl(trace_jsonl_path, enriched)
         status = "PASS" if result["passed"] else "FAIL"
         print(
             f"[{index}/{len(tasks)}] {status} {name} "
@@ -487,6 +591,7 @@ def main() -> int:
         },
     }
     _write_json(output_dir / "metrics.json", metrics)
+    _write_trace_csv(trace_csv_path, trace_rows)
     print("")
     print(json.dumps(metrics["results"]["all"], indent=2))
     return 0 if passed == total else 1
