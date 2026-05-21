@@ -229,10 +229,22 @@ class ConscienceMonitor:
             entry["last_result_event_index"] = event_index
             if "success" in payload:
                 entry["last_result_success"] = bool(payload.get("success"))
+            if "exit_code" in payload:
+                entry["last_exit_code"] = payload.get("exit_code")
+            if "result_preview_truncated" in payload:
+                entry["last_result_preview_truncated"] = bool(payload.get("result_preview_truncated"))
+            if "output_preview_truncated" in payload:
+                entry["last_output_preview_truncated"] = bool(payload.get("output_preview_truncated"))
+            if "output_chars" in payload:
+                entry["last_output_chars"] = payload.get("output_chars")
             if payload.get("error"):
                 entry["last_result_error"] = _text_head_tail(str(payload.get("error")), 500)
+            if payload.get("tool_error"):
+                entry["last_tool_error"] = _text_head_tail(str(payload.get("tool_error")), 500)
             if payload.get("result_preview"):
                 entry["last_result_preview"] = _text_head_tail(str(payload.get("result_preview")), 900)
+            if payload.get("output_tail"):
+                entry["last_output_tail"] = _text_head_tail(str(payload.get("output_tail")), 900)
 
     def _issue_fingerprint(self, ticket: CritiqueTicket, review_type: str = "") -> str:
         raw = "|".join(
@@ -321,7 +333,14 @@ class ConscienceMonitor:
             field_limit = 1600 if restart_profile else 3600
             if event.event_type in {TOOL_CALL, TOOL_RESULT} and key == "tool_args":
                 field_limit = 900 if restart_profile else 1800
-            elif event.event_type == TOOL_RESULT and key in {"result_preview", "output", "stdout", "stderr"}:
+            elif event.event_type == TOOL_RESULT and key in {
+                "result_preview",
+                "output",
+                "stdout",
+                "stderr",
+                "output_head",
+                "output_tail",
+            }:
                 field_limit = 1600 if restart_profile else 4200
             elif event.event_type in {DRAFT_ANSWER, INTENT_TO_STOP}:
                 field_limit = 2400 if restart_profile else 3600
@@ -373,12 +392,27 @@ class ConscienceMonitor:
                     row["args"] = _text_head_tail(tool_args, 240 if restart_profile else 500)
                 if event.event_type == TOOL_RESULT:
                     row["success"] = payload.get("success")
+                    if "exit_code" in payload:
+                        row["exit_code"] = payload.get("exit_code")
                     row["duration_seconds"] = payload.get("duration_seconds")
+                    if "result_preview_truncated" in payload:
+                        row["result_preview_truncated"] = bool(payload.get("result_preview_truncated"))
+                    if "output_preview_truncated" in payload:
+                        row["output_preview_truncated"] = bool(payload.get("output_preview_truncated"))
+                    if "output_chars" in payload:
+                        row["output_chars"] = payload.get("output_chars")
                     if payload.get("error"):
                         row["error"] = _text_head_tail(str(payload.get("error")), 240 if restart_profile else 500)
+                    if payload.get("tool_error"):
+                        row["tool_error"] = _text_head_tail(str(payload.get("tool_error")), 240 if restart_profile else 500)
                     if payload.get("result_preview"):
                         row["result_preview"] = _text_head_tail(
                             str(payload.get("result_preview")),
+                            360 if restart_profile else 900,
+                        )
+                    if payload.get("output_tail"):
+                        row["output_tail"] = _text_head_tail(
+                            str(payload.get("output_tail")),
                             360 if restart_profile else 900,
                         )
             elif event.event_type == ARTIFACT_UPDATED:
@@ -806,7 +840,10 @@ class ConscienceMonitor:
             "If the draft contains caveats, admissions, or scope limits showing something was not inspected, replayed, verified, confirmed, or judged, treat those as evidence of incompleteness unless clearly irrelevant. "
             "Do not let a draft pass merely because it starts with 'yes' or includes run metadata. Ask whether the actor can actually stand behind the answer. "
             "If there are places where the request is not fully satisfied, name those missing parts explicitly and trigger repair so the actor completes the request fully before stopping. "
-            "Your job is not only to technically check whether the answer is complete, but also to think about whether there are obvious additional steps that would materially improve the final result in the spirit of the original request; if so, treat those steps as still missing and trigger them before allowing stop. "
+            "Allow harmless surplus: if the draft directly answers the user's request and has no clear factual error, contradiction, missing required action, unsafe advice, or materially misleading extra instruction, allow stop. "
+            "Do not block merely because the draft is more detailed than necessary, includes caveats, mentions optional next steps, or asks a harmless follow-up. Treat that as a style issue, not a completion failure. "
+            "Intervene on surplus only when it would likely confuse the user, change the answer, create wrong expectations, or send the user toward an unnecessary or risky action. "
+            "Only treat additional steps as missing when they are required for correctness or for satisfying the user's explicit request; do not require optional polish, consolidation, cleanup, or broader improvements. "
             "For claims about testing, validation, success, readiness, correctness, or whether something worked, lack of full inspection of the substantive result is usually a reason to intervene. "
             "Intervene when the actor should not be allowed to stop because the request is not fully satisfied under a careful, trust-preserving reading. "
             "Do not rely on fixed heuristics, regex rules, or hand-crafted trigger categories. Infer directly from the evidence whether intervention is warranted right now. "

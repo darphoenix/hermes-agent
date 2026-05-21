@@ -11292,6 +11292,28 @@ class AIAgent:
         except Exception as exc:
             logger.debug("Conscience event recording failed for %s: %s", event_type, exc)
 
+    @staticmethod
+    def _conscience_head_tail_preview(value: Any, limit: int = 8_000) -> tuple[str, bool, int, str, str]:
+        text = "" if value is None else str(value)
+        limit = max(256, int(limit or 8_000))
+        if len(text) <= limit:
+            return text, False, 0, text, text
+
+        omitted = len(text) - limit
+        while True:
+            marker = f"\n... [truncated {omitted} chars] ...\n"
+            keep = max(0, limit - len(marker))
+            head_len = keep // 2
+            tail_len = keep - head_len
+            new_omitted = len(text) - head_len - tail_len
+            if new_omitted == omitted:
+                break
+            omitted = new_omitted
+
+        head = text[:head_len]
+        tail = text[-tail_len:] if tail_len else ""
+        return f"{head}{marker}{tail}", True, omitted, head, tail
+
     def _conscience_tool_result_payload(
         self,
         *,
@@ -11302,14 +11324,51 @@ class AIAgent:
         call_id: str | None = None,
     ) -> dict:
         is_error, failure_reason = _detect_tool_failure(tool_name, tool_result)
+        result_preview, result_truncated, result_omitted, _, _ = self._conscience_head_tail_preview(tool_result)
         payload = {
             "tool_name": tool_name,
             "tool_args": asdict_safe(tool_args),
             "tool_call_id": call_id,
             "success": not is_error,
             "duration_seconds": duration,
-            "result_preview": tool_result[:1000],
+            "result_preview": result_preview,
+            "result_preview_truncated": result_truncated,
         }
+        if result_truncated:
+            payload["result_omitted_chars"] = result_omitted
+
+        parsed_result = None
+        if isinstance(tool_result, str):
+            try:
+                loaded_result = json.loads(tool_result)
+            except Exception:
+                loaded_result = None
+            if isinstance(loaded_result, dict):
+                parsed_result = loaded_result
+
+        if parsed_result is not None:
+            for exit_key in ("exit_code", "returncode"):
+                if exit_key in parsed_result:
+                    payload["exit_code"] = parsed_result.get(exit_key)
+                    break
+            output = parsed_result.get("output")
+            if isinstance(output, str):
+                (
+                    _output_preview,
+                    output_truncated,
+                    output_omitted,
+                    output_head,
+                    output_tail,
+                ) = self._conscience_head_tail_preview(output)
+                payload["output_chars"] = len(output)
+                payload["output_preview_truncated"] = output_truncated
+                payload["output_head"] = output_head
+                if output_truncated:
+                    payload["output_tail"] = output_tail
+                    payload["output_omitted_chars"] = output_omitted
+            parsed_error = parsed_result.get("error")
+            if parsed_error not in (None, ""):
+                payload["tool_error"] = str(parsed_error)
         if is_error and failure_reason:
             payload["error"] = failure_reason
         return payload
@@ -14041,7 +14100,20 @@ class AIAgent:
                     if self.api_mode == "codex_responses":
                         _ct_v = self._get_transport()
                         if not _ct_v.validate_response(response):
-                            if response is None:
+                            _wrapper_runaway_snapshot = (
+                                self._codex_runaway_snapshot_from_response(response)
+                                if response is not None
+                                else None
+                            )
+                            if _wrapper_runaway_snapshot is not None:
+                                logger.warning(
+                                    "Codex response accepted as controlled runaway abort "
+                                    "(reason=%s, output_chars=%s). %s",
+                                    _wrapper_runaway_snapshot.get("reason"),
+                                    _wrapper_runaway_snapshot.get("output_chars"),
+                                    self._client_log_context(),
+                                )
+                            elif response is None:
                                 response_invalid = True
                                 error_details.append("response is None")
                             else:
@@ -14252,14 +14324,20 @@ class AIAgent:
                     # Check finish_reason before proceeding
                     if self.api_mode == "codex_responses":
                         status = getattr(response, "status", None)
-                        incomplete_details = getattr(response, "incomplete_details", None)
-                        incomplete_reason = None
-                        if isinstance(incomplete_details, dict):
-                            incomplete_reason = incomplete_details.get("reason")
-                        else:
-                            incomplete_reason = getattr(incomplete_details, "reason", None)
+                        incomplete_reason = self._codex_incomplete_reason(response)
                         if status == "incomplete" and incomplete_reason in {"max_output_tokens", "length"}:
                             finish_reason = "length"
+                        elif status == "incomplete" and incomplete_reason in {
+                            "runaway_output_aborted",
+                            "repeated_output",
+                            "runaway_output",
+                        }:
+                            finish_reason = "runaway_output_aborted"
+                            response = self._codex_runaway_output_response(
+                                self._codex_runaway_snapshot_from_response(response)
+                                or {"reason": incomplete_reason}
+                            )
+                            finish_reason = "stop"
                         else:
                             finish_reason = "stop"
                     elif self.api_mode == "anthropic_messages":

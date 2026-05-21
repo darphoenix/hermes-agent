@@ -620,13 +620,27 @@ def test_intervention_ledger_marks_attempted_and_records_tool_result():
         {
             "tool_name": "terminal",
             "success": False,
+            "exit_code": 1,
+            "result_preview_truncated": True,
+            "output_preview_truncated": True,
+            "output_chars": 12_345,
+            "output_tail": "ValueError: parser failed on book block",
             "error": "parser failed on book block",
             "result_preview": "ValueError: parser failed on book block",
         },
     )
     assert entry["last_result_event_index"] == len(monitor.state.events) - 1
     assert entry["last_result_success"] is False
+    assert entry["last_exit_code"] == 1
+    assert entry["last_output_preview_truncated"] is True
+    assert entry["last_output_chars"] == 12_345
     assert "parser failed" in entry["last_result_error"]
+    assert "parser failed" in entry["last_output_tail"]
+    action_row = monitor._action_ledger_payload(limit=1)[0]
+    assert action_row["exit_code"] == 1
+    assert action_row["output_preview_truncated"] is True
+    assert action_row["output_chars"] == 12_345
+    assert "parser failed" in action_row["output_tail"]
 
 
 def test_llm_review_updates_intervention_outcome_without_new_intervention():

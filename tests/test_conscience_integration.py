@@ -94,6 +94,32 @@ def _require_live_codex_auth() -> None:
         pytest.skip("OpenAI Codex auth not configured for live conscience call")
 
 
+def test_conscience_tool_result_payload_keeps_terminal_exit_code_and_tail(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="shadow")
+    terminal_output = (
+        "Running validation\n"
+        + ("checked intermediate row\n" * 500)
+        + "ALL CONSTRAINTS SATISFIED!\n"
+    )
+    tool_result = json.dumps({"output": terminal_output, "exit_code": 0, "error": None})
+
+    payload = agent._conscience_tool_result_payload(
+        tool_name="terminal",
+        tool_args={"command": "python /workdir/validate.py"},
+        tool_result=tool_result,
+        duration=1.25,
+        call_id="call_validate",
+    )
+
+    assert payload["exit_code"] == 0
+    assert payload["result_preview_truncated"] is True
+    assert len(payload["result_preview"]) <= 8_000
+    assert "ALL CONSTRAINTS SATISFIED!" in payload["result_preview"]
+    assert payload["output_preview_truncated"] is True
+    assert payload["output_chars"] == len(terminal_output)
+    assert "ALL CONSTRAINTS SATISFIED!" in payload["output_tail"]
+
+
 def test_run_conversation_emits_conscience_artifacts_in_shadow_mode(tmp_path):
     agent = _make_agent(tmp_path, conscience_mode="shadow")
     agent.client.chat.completions.create.return_value = _mock_response("Implemented the fix")
