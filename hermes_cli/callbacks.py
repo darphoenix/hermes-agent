@@ -15,6 +15,38 @@ from hermes_cli.config import save_env_value_secure
 from hermes_constants import display_hermes_home
 
 
+def _print_approval_notice(command: str, description: str, choices: list[str], timeout: int) -> None:
+    """Print a scrollback-visible fallback for approval prompts."""
+    labels = {
+        "once": "allow once",
+        "session": "allow for this session",
+        "always": "add to permanent allowlist",
+        "deny": "deny",
+        "view": "show full command",
+    }
+    max_preview = 900
+    command_preview = command
+    if len(command_preview) > max_preview:
+        command_preview = command_preview[:max_preview].rstrip() + "\n... (command truncated; choose view for full command)"
+
+    numbered = "  ".join(
+        f"{idx}={labels.get(choice, choice)}"
+        for idx, choice in enumerate(choices, start=1)
+    )
+    lines = [
+        "",
+        f"APPROVAL REQUIRED ({timeout}s)",
+        f"Reason: {description or 'dangerous command'}",
+        "Command:",
+    ]
+    lines.extend(f"  {line}" for line in command_preview.splitlines() or [""])
+    lines.extend([
+        f"Choices: {numbered}",
+        "Press a number, or use arrows then Enter, in this terminal.",
+    ])
+    cprint("\n".join(lines))
+
+
 def clarify_callback(cli, question, choices):
     """Prompt for clarifying question through the TUI.
 
@@ -207,36 +239,52 @@ def approval_callback(cli, command: str, description: str) -> str:
         if len(command) > 70:
             choices.append("view")
 
-        cli._approval_state = {
+        approval_state = {
             "command": command,
             "description": description,
             "choices": choices,
             "selected": 0,
             "response_queue": response_queue,
         }
-        cli._approval_deadline = _time.monotonic() + timeout
+        approval_deadline = _time.monotonic() + timeout
 
-        if hasattr(cli, "_app") and cli._app:
-            cli._app.invalidate()
+        if hasattr(cli, "_activate_approval_prompt"):
+            ui_active = cli._activate_approval_prompt(approval_state, approval_deadline)
+        else:
+            cli._approval_state = approval_state
+            cli._approval_deadline = approval_deadline
+            ui_active = bool(getattr(getattr(cli, "_app", None), "is_running", False))
+            if hasattr(cli, "_app") and cli._app:
+                cli._app.invalidate()
+        if not ui_active:
+            _print_approval_notice(command, description, choices, timeout)
 
         while True:
             try:
                 result = response_queue.get(timeout=1)
-                cli._approval_state = None
-                cli._approval_deadline = 0
-                if hasattr(cli, "_app") and cli._app:
-                    cli._app.invalidate()
+                if hasattr(cli, "_clear_approval_prompt"):
+                    cli._clear_approval_prompt()
+                else:
+                    cli._approval_state = None
+                    cli._approval_deadline = 0
+                    if hasattr(cli, "_app") and cli._app:
+                        cli._app.invalidate()
                 return result
             except queue.Empty:
                 remaining = cli._approval_deadline - _time.monotonic()
                 if remaining <= 0:
                     break
-                if hasattr(cli, "_app") and cli._app:
+                if hasattr(cli, "_force_modal_repaint"):
+                    cli._force_modal_repaint()
+                elif hasattr(cli, "_app") and cli._app:
                     cli._app.invalidate()
 
-        cli._approval_state = None
-        cli._approval_deadline = 0
-        if hasattr(cli, "_app") and cli._app:
-            cli._app.invalidate()
-        cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
-        return "deny"
+        if hasattr(cli, "_clear_approval_prompt"):
+            cli._clear_approval_prompt()
+        else:
+            cli._approval_state = None
+            cli._approval_deadline = 0
+            if hasattr(cli, "_app") and cli._app:
+                cli._app.invalidate()
+        cprint(f"\n{_DIM}  ⏱ Timeout — approval request expired{_RST}")
+        return "timeout"

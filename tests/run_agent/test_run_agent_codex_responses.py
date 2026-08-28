@@ -1,5 +1,6 @@
 import sys
 import types
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -351,11 +352,97 @@ def test_build_api_kwargs_codex_preserves_internal_system_directives(monkeypatch
         ]
     )
 
-    assert kwargs["instructions"] == "You are Hermes."
+    assert kwargs["instructions"].startswith("You are Hermes.")
+    assert "Internal runtime directive" in kwargs["instructions"]
+    assert "You are in a loop. Use web_search now." in kwargs["instructions"]
     assert kwargs["input"][0] == {"role": "user", "content": "But who else sells NV Diamond?"}
-    assert kwargs["input"][1]["role"] == "user"
-    assert kwargs["input"][1]["content"].startswith("[INTERNAL DIRECTIVE: do not expose")
-    assert "You are in a loop. Use web_search now." in kwargs["input"][1]["content"]
+    assert all("INTERNAL CONSCIENCE STOP-GATE" not in str(item) for item in kwargs["input"])
+
+
+def test_stateful_stop_repair_uses_rejected_response_parent_without_user_leak(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._responses_previous_response_id = "resp_prev"
+    agent._responses_transient_repair_previous_response_id = "resp_rejected_draft"
+
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Original task"},
+            {"role": "assistant", "content": "Old branch", "responses_response_id": "resp_prev"},
+            {
+                "role": "system",
+                "content": "[INTERNAL CONSCIENCE STOP-GATE] You are in a loop. Think hard how to break out.",
+                "_hermes_internal_directive": True,
+            },
+        ]
+    )
+
+    assert kwargs["store"] is True
+    assert kwargs["previous_response_id"] == "resp_rejected_draft"
+    assert kwargs["input"] == []
+    assert kwargs["instructions"] == "You are Hermes."
+    assert "You are in a loop. Think hard how to break out." in (
+        kwargs["extra_body"]["hermes_runtime_instructions"]
+    )
+    assert all("INTERNAL CONSCIENCE STOP-GATE" not in str(item) for item in kwargs["input"])
+
+
+def test_stateful_stop_gate_repair_branches_from_rejected_draft_response(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent.conscience_mode = "enforce_observe"
+    agent._conscience_active = True
+    agent.conscience_chat_messages = False
+
+    draft = _codex_message_response("I already did it.")
+    draft.id = "resp_rejected_draft"
+    final = _codex_message_response("Fixed now.")
+    final.id = "resp_fixed"
+    responses = [draft, final]
+    requests = []
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    monkeypatch.setattr(
+        agent,
+        "_conscience_call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_intervene": len(requests) == 1,
+                                "verdict": "block",
+                                "reason": "draft stopped before doing the work",
+                                "evidence": ["only claimed completion"],
+                                "next_best_action": "repair the answer",
+                                "criterion_ids": ["criterion_001"],
+                                "confidence": "high",
+                            }
+                        )
+                    )
+                )
+            ]
+        ),
+    )
+
+    result = agent.run_conversation("Do the work")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Fixed now."
+    assert len(requests) == 2
+    assert requests[0].get("previous_response_id") is None
+    assert requests[1]["previous_response_id"] == "resp_rejected_draft"
+    assert requests[1]["input"] == []
+    assert requests[1]["instructions"] == requests[0]["instructions"]
+    runtime_instructions = requests[1]["extra_body"]["hermes_runtime_instructions"]
+    assert "repair the answer" in runtime_instructions
+    assert "only claimed completion" in runtime_instructions
+    assert all("INTERNAL CONSCIENCE STOP-GATE" not in str(item) for item in requests[1]["input"])
+    assert not any("INTERNAL CONSCIENCE" in str(msg.get("content", "")) for msg in result["messages"])
 
 
 def test_build_api_kwargs_consumes_conscience_tool_narrowing(monkeypatch):
@@ -638,6 +725,85 @@ def test_build_api_kwargs_stateful_custom_followup_uses_previous_response_id(mon
     assert kwargs["parallel_tool_calls"] is False
     assert kwargs["previous_response_id"] == "resp_prev"
     assert kwargs["input"] == [{"role": "user", "content": "Next"}]
+
+
+def test_stateful_custom_poisoned_resume_retries_full_prompt(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._responses_previous_response_id = "resp_prev"
+    messages = [
+        {"role": "system", "content": "You are Hermes."},
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "Ack", "responses_response_id": "resp_prev"},
+        {"role": "user", "content": "Next"},
+    ]
+
+    first_kwargs = agent._build_api_kwargs(messages)
+    assert first_kwargs["previous_response_id"] == "resp_prev"
+    assert first_kwargs["input"] == [{"role": "user", "content": "Next"}]
+    assert agent._should_reset_stateful_responses_after_error(
+        RuntimeError("Poisoned previous_response_id cache_poisoned: resp_prev")
+    )
+
+    blocked_response_id = agent._active_responses_previous_response_id(first_kwargs)
+    agent._clear_responses_stateful_chain(
+        reason="test_poisoned_previous_response_id",
+        blocked_response_id=blocked_response_id,
+        force_fresh_until_success=True,
+    )
+    retry_kwargs = agent._build_api_kwargs(messages)
+
+    assert "previous_response_id" not in retry_kwargs
+    assert retry_kwargs["input"][0] == {"role": "user", "content": "First"}
+    assert retry_kwargs["input"][-1] == {"role": "user", "content": "Next"}
+
+
+def test_stateful_custom_poisoned_resume_does_not_fall_back_to_older_history_id(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._responses_previous_response_id = "resp_new"
+    messages = [
+        {"role": "system", "content": "You are Hermes."},
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "Old answer", "responses_response_id": "resp_old"},
+        {"role": "user", "content": "Second"},
+        {"role": "assistant", "content": "New answer", "responses_response_id": "resp_new"},
+        {"role": "user", "content": "Third"},
+    ]
+
+    first_kwargs = agent._build_api_kwargs(messages)
+    assert first_kwargs["previous_response_id"] == "resp_new"
+    assert first_kwargs["input"] == [{"role": "user", "content": "Third"}]
+
+    blocked_response_id = agent._active_responses_previous_response_id(first_kwargs)
+    agent._clear_responses_stateful_chain(
+        reason="test_poisoned_previous_response_id",
+        blocked_response_id=blocked_response_id,
+        force_fresh_until_success=True,
+    )
+    retry_kwargs = agent._build_api_kwargs(messages)
+
+    assert "previous_response_id" not in retry_kwargs
+    assert retry_kwargs["input"][0] == {"role": "user", "content": "First"}
+    assert retry_kwargs["input"][-1] == {"role": "user", "content": "Third"}
+    assert agent._responses_force_fresh_until_success is True
+
+    agent._remember_responses_response_id("resp_fresh")
+    assert agent._responses_force_fresh_until_success is False
+
+
+def test_stateful_custom_terminal_stream_failure_preserves_resume_parent(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+
+    assert not agent._should_reset_stateful_responses_after_error(
+        RuntimeError("Responses create(stream=True) fallback did not emit a terminal response.")
+    )
+
+
+def test_stateful_custom_previous_response_poison_resets_resume(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+
+    assert agent._should_reset_stateful_responses_after_error(
+        RuntimeError("Poisoned previous_response_id cache_poisoned: resp_prev")
+    )
 
 
 def test_compress_context_resets_stateful_responses_chain(monkeypatch):
@@ -2301,9 +2467,8 @@ def test_stateful_empty_after_tools_replays_synthetic_empty_delta(monkeypatch):
         msg for msg in result["messages"]
         if msg.get("role") == "assistant" and msg.get("content") == "(empty)"
     ]
-    assert len(empty_messages) == 1
-    assert empty_messages[0].get("responses_response_id") == "resp_empty"
-    assert not empty_messages[0].get("tool_calls")
+    assert empty_messages == []
+    assert not any(msg.get("_empty_recovery_synthetic") for msg in result["messages"])
     assert requests[1].get("previous_response_id") == "resp_tool"
     assert requests[2].get("previous_response_id") == "resp_tool"
     assert requests[2]["input"][0]["type"] == "function_call_output"

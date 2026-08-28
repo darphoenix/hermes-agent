@@ -147,6 +147,26 @@ class TestTirithAllowDangerous:
         # allow_permanent should be True (no tirith warning)
         assert cb.call_args[1]["allow_permanent"] is True
 
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_dangerous_only_cli_timeout_not_reported_as_user_deny(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="timeout")
+        result = check_all_command_guards("python3 -c 'print(1)'", "local", approval_callback=cb)
+        assert result["approved"] is False
+        assert result["approval_outcome"] == "timeout"
+        assert "timed out/no response" in result["message"]
+        assert "User denied" not in result["message"]
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_dangerous_only_cli_unavailable_not_reported_as_user_deny(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="approval_unavailable")
+        result = check_all_command_guards("python3 -c 'print(1)'", "local", approval_callback=cb)
+        assert result["approved"] is False
+        assert result["approval_outcome"] == "approval_unavailable"
+        assert "Approval UI unavailable" in result["message"]
+        assert "User denied" not in result["message"]
+
 
 # ---------------------------------------------------------------------------
 # tirith warn + safe command

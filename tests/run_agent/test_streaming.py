@@ -1022,6 +1022,43 @@ class TestCodexStreamCallbacks:
 
         assert touch_calls.count("receiving stream response") == len(events)
 
+    def test_codex_create_stream_fallback_surfaces_error_event(self):
+        from run_agent import AIAgent, _StreamErrorEvent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+
+        class _FakeCreateStream:
+            def __iter__(self_inner):
+                return iter([
+                    {
+                        "type": "error",
+                        "message": "branch_poisoned stream failed",
+                        "code": "stream_failed",
+                    }
+                ])
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _FakeCreateStream()
+
+        with pytest.raises(_StreamErrorEvent, match="branch_poisoned stream failed") as raised:
+            agent._run_codex_create_stream_fallback(
+                {"model": "test/model", "instructions": "hi", "input": []},
+                client=mock_client,
+            )
+
+        assert raised.value.code == "stream_failed"
+
 
 class TestAnthropicStreamCallbacks:
     """Verify Anthropic streaming refreshes activity on every event."""

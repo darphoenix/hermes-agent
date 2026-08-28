@@ -709,7 +709,8 @@ def prompt_dangerous_approval(command: str, description: str,
             prompt_toolkit integration. Signature:
             (command, description, *, allow_permanent=True) -> str.
 
-    Returns: 'once', 'session', 'always', or 'deny'
+    Returns: 'once', 'session', 'always', 'deny', 'timeout', or
+        'approval_unavailable'.  Only 'deny' means an explicit user rejection.
     """
     if timeout_seconds is None:
         timeout_seconds = _get_approval_timeout()
@@ -720,7 +721,7 @@ def prompt_dangerous_approval(command: str, description: str,
                                      allow_permanent=allow_permanent)
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
-            return "deny"
+            return "approval_unavailable"
 
     # Fail-closed guard: if prompt_toolkit owns the terminal (interactive
     # CLI session) and no approval callback is registered on this thread,
@@ -738,11 +739,11 @@ def prompt_dangerous_approval(command: str, description: str,
         if get_app_or_none() is not None:
             logger.warning(
                 "Dangerous-command approval requested on a thread with no "
-                "approval callback while prompt_toolkit is active; denying "
-                "to avoid stdin deadlock. command=%r description=%r",
+                "approval callback while prompt_toolkit is active; failing "
+                "closed to avoid stdin deadlock. command=%r description=%r",
                 command, description,
             )
-            return "deny"
+            return "approval_unavailable"
     except Exception:
         # prompt_toolkit not installed, or detection failed -- fall through
         # to the legacy input() path (safe in non-TUI contexts: scripts,
@@ -766,14 +767,15 @@ def prompt_dangerous_approval(command: str, description: str,
             print()
             sys.stdout.flush()
 
-            result = {"choice": ""}
+            result = {"choice": "", "read_error": None}
 
             def get_input():
                 try:
                     prompt = t("approval.prompt_long") if allow_permanent else t("approval.prompt_short")
                     result["choice"] = input(prompt).strip().lower()
-                except (EOFError, OSError):
+                except (EOFError, OSError) as exc:
                     result["choice"] = ""
+                    result["read_error"] = exc
 
             thread = threading.Thread(target=get_input, daemon=True)
             thread.start()
@@ -781,9 +783,19 @@ def prompt_dangerous_approval(command: str, description: str,
 
             if thread.is_alive():
                 print("\n" + t("approval.timeout"))
-                return "deny"
+                logger.warning(
+                    "Dangerous-command approval timed out after %ss. command=%r description=%r",
+                    timeout_seconds, command, description,
+                )
+                return "timeout"
 
             choice = result["choice"]
+            if result.get("read_error") is not None:
+                logger.warning(
+                    "Dangerous-command approval unavailable (%s). command=%r description=%r",
+                    result["read_error"], command, description,
+                )
+                return "approval_unavailable"
             if choice in {'o', 'once'}:
                 print(t("approval.allowed_once"))
                 return "once"
@@ -808,6 +820,35 @@ def prompt_dangerous_approval(command: str, description: str,
             del os.environ["HERMES_SPINNER_PAUSE"]
         print()
         sys.stdout.flush()
+
+
+def _approval_block_message(choice: str | None, description: str) -> tuple[str, str]:
+    """Return (normalized_outcome, model-facing block message)."""
+    outcome = (choice or "timeout").strip().lower()
+    if outcome == "timeout":
+        return (
+            "timeout",
+            "BLOCKED: Approval timed out/no response. Do NOT retry this command "
+            "unless the user explicitly asks you to continue.",
+        )
+    if outcome in {"approval_unavailable", "callback_error", "callback_missing"}:
+        return (
+            "approval_unavailable",
+            "BLOCKED: Approval UI unavailable; command was not approved. "
+            "Do NOT retry this command unless the user explicitly approves it.",
+        )
+    if outcome == "deny":
+        return (
+            "deny",
+            f"BLOCKED: User denied this potentially dangerous command "
+            f"(matched '{description}' pattern). Do NOT retry this command - "
+            "the user has explicitly rejected it.",
+        )
+    return (
+        outcome,
+        "BLOCKED: Command was not approved. Do NOT retry this command unless "
+        "the user explicitly approves it.",
+    )
 
 
 def _normalize_approval_mode(mode) -> str:
@@ -991,12 +1032,18 @@ def check_dangerous_command(command: str, env_type: str,
     choice = prompt_dangerous_approval(command, description,
                                        approval_callback=approval_callback)
 
-    if choice == "deny":
+    if choice in {"deny", "timeout", "approval_unavailable", "callback_error", "callback_missing", None}:
+        outcome, message = _approval_block_message(choice, description)
+        logger.warning(
+            "Dangerous-command approval blocked: outcome=%s command=%r description=%r",
+            outcome, command, description,
+        )
         return {
             "approved": False,
-            "message": f"BLOCKED: User denied this potentially dangerous command (matched '{description}' pattern). Do NOT retry this command - the user has explicitly rejected it.",
+            "message": message,
             "pattern_key": pattern_key,
             "description": description,
+            "approval_outcome": outcome,
         }
 
     if choice == "session":
@@ -1300,11 +1347,17 @@ def check_all_command_guards(command: str, env_type: str,
 
             if not resolved or choice is None or choice == "deny":
                 reason = "timed out" if not resolved else "denied by user"
+                outcome = "timeout" if not resolved or choice is None else "deny"
+                logger.warning(
+                    "Gateway approval blocked: outcome=%s command=%r description=%r",
+                    outcome, command, combined_desc,
+                )
                 return {
                     "approved": False,
                     "message": f"BLOCKED: Command {reason}. Do NOT retry this command.",
                     "pattern_key": primary_key,
                     "description": combined_desc,
+                    "approval_outcome": outcome,
                 }
 
             # User approved — persist based on scope (same logic as CLI)
@@ -1366,12 +1419,18 @@ def check_all_command_guards(command: str, env_type: str,
         choice=choice,
     )
 
-    if choice == "deny":
+    if choice in {"deny", "timeout", "approval_unavailable", "callback_error", "callback_missing", None}:
+        outcome, message = _approval_block_message(choice, combined_desc)
+        logger.warning(
+            "CLI approval blocked: outcome=%s command=%r description=%r",
+            outcome, command, combined_desc,
+        )
         return {
             "approved": False,
-            "message": "BLOCKED: User denied. Do NOT retry.",
+            "message": message,
             "pattern_key": primary_key,
             "description": combined_desc,
+            "approval_outcome": outcome,
         }
 
     # Persist approval for each warning individually

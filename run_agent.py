@@ -111,6 +111,33 @@ class _RunawayOutputDetected(Exception):
         super().__init__(snapshot.get("reason") or "runaway output detected")
 
 
+class _StreamErrorEvent(RuntimeError):
+    """Raised when a Responses SSE stream emits an explicit error frame."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[str] = None,
+        param: Optional[str] = None,
+        status_code: Optional[int] = None,
+    ) -> None:
+        clean_message = str(message or "stream emitted error event").strip()
+        super().__init__(clean_message)
+        self.message = clean_message
+        self.code = code
+        self.param = param
+        self.status_code = status_code
+        self.body = {
+            "error": {
+                "message": clean_message,
+                "type": "stream_error",
+                "code": code,
+                "param": param,
+            }
+        }
+
+
 class _StreamingRepetitionWatchdog:
     """Cheap rolling detector for pathological repeated assistant output.
 
@@ -1419,6 +1446,9 @@ class AIAgent:
         self.responses_stateful = bool(responses_stateful)
         self._responses_previous_response_id: Optional[str] = None
         self._responses_blocked_response_id: Optional[str] = None
+        self._responses_blocked_response_ids: set[str] = set()
+        self._responses_force_fresh_until_success = False
+        self._responses_transient_repair_previous_response_id: Optional[str] = None
         if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
             self.api_mode = api_mode
         elif self.provider == "openai-codex":
@@ -2184,6 +2214,8 @@ class AIAgent:
         self._conscience_repair_tool_names = None
         self._conscience_repair_turns_remaining = 0
         self._conscience_repair_override_active = False
+        self._pending_conscience_internal_messages: list[dict[str, Any]] = []
+        self._active_conscience_internal_messages: list[dict[str, Any]] = []
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -4677,6 +4709,84 @@ class AIAgent:
             scrubbed.append(clean)
         return scrubbed
 
+    @staticmethod
+    def _bounded_background_review_history(
+        messages: List[Dict],
+        *,
+        max_tokens: int,
+    ) -> List[Dict]:
+        """Return a recent, bounded snapshot for optional background review.
+
+        This is a resource guard, not a semantic filter: keep the recent
+        trajectory, trim old history first, and truncate a single oversized
+        newest message only when needed. The full foreground transcript stays
+        untouched.
+        """
+
+        if max_tokens <= 0 or not messages:
+            return list(messages or [])
+        try:
+            current_tokens = estimate_messages_tokens_rough(messages)
+        except Exception:
+            current_tokens = 0
+        if current_tokens and current_tokens <= max_tokens:
+            return list(messages)
+
+        budget_chars = max(4096, max_tokens * 4)
+        note = {
+            "role": "system",
+            "content": (
+                "[BACKGROUND REVIEW NOTE] This optional self-improvement "
+                f"review received a bounded recent snapshot of the session "
+                f"under about {max_tokens:,} tokens. Older or oversized "
+                "content may be omitted; do not infer absence from omitted "
+                "history."
+            ),
+        }
+
+        kept_reversed: List[Dict] = []
+        used_chars = len(str(note["content"]))
+        original_count = len(messages)
+
+        for msg in reversed(messages):
+            if not isinstance(msg, dict):
+                continue
+            clean = copy.deepcopy(msg)
+            content = clean.get("content", "")
+            content_chars = len(str(content))
+            overhead = 256
+            message_chars = content_chars + overhead
+            remaining = budget_chars - used_chars
+            if message_chars <= remaining:
+                kept_reversed.append(clean)
+                used_chars += message_chars
+                continue
+            if not kept_reversed and remaining > 1024:
+                max_content_chars = max(512, remaining - overhead)
+                if isinstance(content, str) and len(content) > max_content_chars:
+                    head_len = max_content_chars // 2
+                    tail_len = max_content_chars - head_len
+                    clean["content"] = (
+                        f"[BACKGROUND REVIEW TRUNCATED MESSAGE: original_chars={len(content)}]\n"
+                        f"{content[:head_len]}\n\n"
+                        "[... middle omitted from optional background review ...]\n"
+                        f"{content[-tail_len:]}"
+                    )
+                    kept_reversed.append(clean)
+                    used_chars = budget_chars
+                break
+            break
+
+        kept_reversed.reverse()
+        logger.info(
+            "Background review bounded snapshot messages=%d/%d approx_tokens=%s max_tokens=%d",
+            len(kept_reversed),
+            original_count,
+            current_tokens or "unknown",
+            max_tokens,
+        )
+        return [note] + kept_reversed
+
     def _spawn_background_review(
         self,
         messages_snapshot: List[Dict],
@@ -4691,6 +4801,32 @@ class AIAgent:
         Never modifies the main conversation history or produces user-visible output.
         """
         import threading
+
+        try:
+            from hermes_cli.background_runtime import foreground_activity_snapshot
+
+            _active_foreground = foreground_activity_snapshot()
+        except Exception:
+            _active_foreground = {}
+        if _active_foreground:
+            logger.info(
+                "Background review skipped: foreground turn active active=%d",
+                len(_active_foreground),
+            )
+            return
+
+        try:
+            _max_snapshot_tokens = int(
+                os.getenv("HERMES_BACKGROUND_REVIEW_MAX_SNAPSHOT_TOKENS", "80000")
+            )
+        except (TypeError, ValueError):
+            _max_snapshot_tokens = 80000
+        _review_history = self._background_review_history_for_sidecar(messages_snapshot)
+        if _max_snapshot_tokens > 0:
+            _review_history = self._bounded_background_review_history(
+                _review_history,
+                max_tokens=_max_snapshot_tokens,
+            )
 
         # Pick the right prompt based on which triggers fired
         if review_memory and review_skills:
@@ -4754,6 +4890,18 @@ class AIAgent:
                         return
                     except Exception:
                         logger.debug("Background review sidecar routing failed", exc_info=True)
+                    try:
+                        from hermes_cli.background_runtime import foreground_activity_snapshot
+
+                        _active_foreground = foreground_activity_snapshot()
+                    except Exception:
+                        _active_foreground = {}
+                    if _active_foreground:
+                        logger.info(
+                            "Background review abandoned: foreground turn became active active=%d",
+                            len(_active_foreground),
+                        )
+                        return
                     review_agent = AIAgent(
                         model=_review_model,
                         max_iterations=16,
@@ -4767,6 +4915,7 @@ class AIAgent:
                         credential_pool=_review_credential_pool,
                         parent_session_id=self.session_id,
                         enabled_toolsets=["memory", "skills"],
+                        skip_memory=True,
                     )
                     review_agent._memory_write_origin = "background_review"
                     review_agent._memory_write_context = "background_review"
@@ -4775,6 +4924,7 @@ class AIAgent:
                     review_agent._user_profile_enabled = self._user_profile_enabled
                     review_agent._memory_nudge_interval = 0
                     review_agent._skill_nudge_interval = 0
+                    review_agent._api_max_retries = 1
                     # Suppress all status/warning emits from the fork so the
                     # user only sees the final successful-action summary.
                     # Without this, mid-review "Iteration budget exhausted",
@@ -4786,7 +4936,7 @@ class AIAgent:
 
                     review_agent.run_conversation(
                         user_message=prompt,
-                        conversation_history=self._background_review_history_for_sidecar(messages_snapshot),
+                        conversation_history=_review_history,
                     )
 
                 # Scan the review agent's messages for successful tool actions
@@ -4895,6 +5045,10 @@ class AIAgent:
         Ensures conversations are never lost, even on errors or early returns.
         """
         self._drop_trailing_empty_response_scaffolding(messages)
+        if self._drop_hidden_conscience_messages(messages):
+            self._last_flushed_db_idx = min(self._last_flushed_db_idx, len(messages))
+        if conversation_history and self._drop_hidden_conscience_messages(conversation_history):
+            self._last_flushed_db_idx = min(self._last_flushed_db_idx, len(messages))
         self._apply_persist_user_message_override(messages)
         self._session_messages = messages
         self._save_session_log(messages)
@@ -4952,6 +5106,38 @@ class AIAgent:
             and messages[-1].get("tool_calls")
         ):
             messages.pop()
+
+    @staticmethod
+    def _is_hidden_conscience_message(msg: Any) -> bool:
+        if not isinstance(msg, dict):
+            return False
+        role = msg.get("role")
+        if role not in {"system", "developer"}:
+            return False
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text = "\n".join(
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict) and part.get("type") in {"text", "input_text"}
+            )
+        else:
+            text = str(content or "")
+        return text.lstrip().startswith("[INTERNAL CONSCIENCE ")
+
+    def _drop_hidden_conscience_messages(self, messages: Optional[List[Dict]]) -> int:
+        if not messages:
+            return 0
+        original_len = len(messages)
+        messages[:] = [msg for msg in messages if not self._is_hidden_conscience_message(msg)]
+        dropped = original_len - len(messages)
+        if dropped:
+            logger.info(
+                "Dropped %s hidden conscience message(s) from durable transcript (session=%s)",
+                dropped,
+                self.session_id or "-",
+            )
+        return dropped
 
     def _repair_message_sequence(self, messages: List[Dict]) -> int:
         """Collapse malformed role-alternation left in the live history.
@@ -6838,6 +7024,7 @@ class AIAgent:
         *,
         reason: str = "",
         blocked_response_id: Optional[str] = None,
+        force_fresh_until_success: bool = False,
     ) -> None:
         blocked = (
             blocked_response_id.strip()
@@ -6845,12 +7032,24 @@ class AIAgent:
             else None
         )
         current = getattr(self, "_responses_previous_response_id", None)
+        transient = getattr(self, "_responses_transient_repair_previous_response_id", None)
         if blocked is None and isinstance(current, str) and current.strip():
             blocked = current.strip()
-        had_state = bool(blocked or current)
+        had_state = bool(blocked or current or transient)
         if blocked:
             self._responses_blocked_response_id = blocked
+            blocked_ids = getattr(self, "_responses_blocked_response_ids", None)
+            if not isinstance(blocked_ids, set):
+                blocked_ids = set()
+                self._responses_blocked_response_ids = blocked_ids
+            blocked_ids.add(blocked)
+            if force_fresh_until_success:
+                # A rejected/poisoned resume means the next retry must rebuild
+                # from the full prompt. Otherwise history fallback can pick an
+                # older stale response_id and loop through poisoned branches.
+                self._responses_force_fresh_until_success = True
         self._responses_previous_response_id = None
+        self._responses_transient_repair_previous_response_id = None
         if reason and blocked:
             logger.info("Cleared stateful Responses chain (%s): %s", reason, blocked)
         elif reason and had_state:
@@ -6860,19 +7059,57 @@ class AIAgent:
         if not isinstance(response_id, str) or not response_id.strip():
             return
         self._responses_previous_response_id = response_id.strip()
+        self._responses_transient_repair_previous_response_id = None
         self._responses_blocked_response_id = None
+        self._responses_force_fresh_until_success = False
+
+    def _remember_transient_responses_repair_parent(
+        self,
+        response_id: Any,
+        *,
+        reason: str = "",
+    ) -> None:
+        if not self._responses_stateful_enabled():
+            return
+        if not isinstance(response_id, str) or not response_id.strip():
+            logger.debug(
+                "Could not attach transient Responses repair parent (%s): missing response_id",
+                reason or "unknown",
+            )
+            return
+        normalized = response_id.strip()
+        self._responses_transient_repair_previous_response_id = normalized
+        logger.info(
+            "Using transient Responses repair parent for next actor call (%s): %s",
+            reason or "repair",
+            normalized,
+        )
+
+    def _clear_transient_responses_repair_parent(self, reason: str) -> None:
+        current = getattr(self, "_responses_transient_repair_previous_response_id", None)
+        self._responses_transient_repair_previous_response_id = None
+        if isinstance(current, str) and current.strip():
+            logger.info(
+                "Cleared transient Responses repair parent (%s): %s",
+                reason,
+                current.strip(),
+            )
 
     def _get_responses_previous_response_id(
         self,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[str]:
         blocked = getattr(self, "_responses_blocked_response_id", None)
+        blocked_ids = getattr(self, "_responses_blocked_response_ids", None)
+        if not isinstance(blocked_ids, set):
+            blocked_ids = set()
+            self._responses_blocked_response_ids = blocked_ids
         current = getattr(self, "_responses_previous_response_id", None)
         if isinstance(current, str):
             current = current.strip() or None
         else:
             current = None
-        if current and current != blocked:
+        if current and current != blocked and current not in blocked_ids:
             return current
 
         for msg in reversed(messages or []):
@@ -6882,9 +7119,35 @@ class AIAgent:
             if not isinstance(candidate, str):
                 continue
             candidate = candidate.strip()
-            if candidate and candidate != blocked:
+            if candidate and candidate != blocked and candidate not in blocked_ids:
                 self._responses_previous_response_id = candidate
                 return candidate
+        return None
+
+    def _responses_previous_response_id_from_kwargs(
+        self,
+        api_kwargs: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        if not isinstance(api_kwargs, dict):
+            return None
+        candidate = api_kwargs.get("previous_response_id")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+        return None
+
+    def _active_responses_previous_response_id(
+        self,
+        api_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        from_kwargs = self._responses_previous_response_id_from_kwargs(api_kwargs)
+        if from_kwargs:
+            return from_kwargs
+        transient = getattr(self, "_responses_transient_repair_previous_response_id", None)
+        if isinstance(transient, str) and transient.strip():
+            return transient.strip()
+        current = getattr(self, "_responses_previous_response_id", None)
+        if isinstance(current, str) and current.strip():
+            return current.strip()
         return None
 
     @staticmethod
@@ -6906,6 +7169,25 @@ class AIAgent:
         self,
         messages: List[Dict[str, Any]],
     ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        if bool(getattr(self, "_responses_force_fresh_until_success", False)):
+            logger.info(
+                "Building fresh Responses request after rejected/poisoned stateful resume"
+            )
+            return self._chat_messages_to_responses_input(messages), None
+
+        transient_repair_parent = getattr(
+            self,
+            "_responses_transient_repair_previous_response_id",
+            None,
+        )
+        if isinstance(transient_repair_parent, str) and transient_repair_parent.strip():
+            previous_response_id = transient_repair_parent.strip()
+            logger.info(
+                "Building Responses stop-repair request from transient parent: %s",
+                previous_response_id,
+            )
+            return self._chat_messages_to_responses_input([]), previous_response_id
+
         previous_response_id = self._get_responses_previous_response_id(messages)
         if not previous_response_id:
             return self._chat_messages_to_responses_input(messages), None
@@ -6927,6 +7209,18 @@ class AIAgent:
         message = str(exc or "").lower()
         if not message:
             return False
+        # Only clear the durable parent when the provider explicitly rejected
+        # that previous_response_id.  A child stream can fail or time out after
+        # a valid resume; treating that as parent poison throws away the best
+        # cache anchor and forces a huge full-prompt rebuild.
+        poison_markers = (
+            "cache_poisoned",
+            "stored_response_cache_poisoned",
+            "poisoned previous_response_id",
+            "poisoned previous response",
+        )
+        if any(marker in message for marker in poison_markers):
+            return True
         if "previous_response_id" in message and ("not found" in message or "unknown" in message or "404" in message):
             return True
         if "previous response" in message and "not found" in message:
@@ -6935,6 +7229,87 @@ class AIAgent:
 
     def _chat_messages_to_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return _codex_chat_messages_to_responses_input(messages)
+
+    @staticmethod
+    def _message_content_plain_text(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                    else:
+                        nested = part.get("content")
+                        if isinstance(nested, str):
+                            parts.append(nested)
+            return "".join(parts)
+        return str(content)
+
+    def _split_codex_runtime_instructions(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], list[str]]:
+        """Lift runtime system/developer directives out of Responses input.
+
+        Local stateful Responses wrappers may render non-leading system
+        messages as user input. Stop-gates and other runtime directives should
+        steer the next call, not become user-visible transcript content.
+        """
+        if not messages:
+            return messages, []
+
+        base_system_idx = 0 if isinstance(messages[0], dict) and messages[0].get("role") == "system" else None
+        cleaned: list[dict[str, Any]] = []
+        directives: list[str] = []
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role in {"system", "developer"} and idx != base_system_idx:
+                content = self._message_content_plain_text(msg.get("content", "")).strip()
+                if content:
+                    directives.append(content)
+                continue
+            cleaned.append(msg)
+        return cleaned, directives
+
+    def _codex_instructions_with_runtime_directives(
+        self,
+        messages: List[Dict[str, Any]],
+        directives: list[str],
+    ) -> Optional[str]:
+        if not directives:
+            return None
+        base = self._codex_base_instructions(messages)
+        directive_block = self._codex_runtime_directive_text(directives)
+        if not directive_block:
+            return base
+        return (
+            f"{base}\n\n"
+            "[Internal runtime directive for this actor call only. Do not expose or quote it.]\n"
+            f"{directive_block}"
+        ).strip()
+
+    def _codex_base_instructions(self, messages: List[Dict[str, Any]]) -> str:
+        base = ""
+        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            base = self._message_content_plain_text(messages[0].get("content", "")).strip()
+        if not base:
+            base = DEFAULT_AGENT_IDENTITY
+        return base
+
+    @staticmethod
+    def _codex_runtime_directive_text(directives: list[str]) -> str:
+        return "\n\n".join(
+            d.strip() for d in directives if d and d.strip()
+        ).strip()
 
     def _responses_tools(self, tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
         return _codex_responses_tools(tools if tools is not None else self.tools)
@@ -7485,6 +7860,31 @@ class AIAgent:
             )],
         )
 
+    def _codex_incomplete_reason(self, response: Any) -> str | None:
+        incomplete_details = getattr(response, "incomplete_details", None)
+        if isinstance(incomplete_details, dict):
+            raw = incomplete_details.get("reason")
+        else:
+            raw = getattr(incomplete_details, "reason", None)
+        return str(raw) if raw is not None else None
+
+    def _codex_runaway_snapshot_from_response(self, response: Any) -> dict[str, Any] | None:
+        if str(getattr(response, "status", "") or "").lower() != "incomplete":
+            return None
+        reason = self._codex_incomplete_reason(response)
+        if reason not in {"runaway_output_aborted", "repeated_output", "runaway_output"}:
+            return None
+        metadata = getattr(response, "metadata", None)
+        snapshot = None
+        if isinstance(metadata, dict):
+            raw_snapshot = metadata.get("runaway_output")
+            if isinstance(raw_snapshot, dict):
+                snapshot = dict(raw_snapshot)
+        if snapshot is None:
+            snapshot = {}
+        snapshot.setdefault("reason", reason)
+        return snapshot
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
@@ -7527,6 +7927,24 @@ class AIAgent:
                         if self._interrupt_requested:
                             break
                         event_type = getattr(event, "type", "")
+                        if not event_type and isinstance(event, dict):
+                            event_type = event.get("type", "")
+                        if event_type == "error":
+                            err_message = getattr(event, "message", None)
+                            if not err_message and isinstance(event, dict):
+                                err_message = event.get("message")
+                            err_code = getattr(event, "code", None)
+                            if not err_code and isinstance(event, dict):
+                                err_code = event.get("code")
+                            err_param = getattr(event, "param", None)
+                            if not err_param and isinstance(event, dict):
+                                err_param = event.get("param")
+                            err_message = (err_message or "stream emitted error event").strip()
+                            raise _StreamErrorEvent(
+                                err_message,
+                                code=err_code,
+                                param=err_param,
+                            )
                         # Fire callbacks on text content deltas (suppress during tool calls)
                         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
                             delta_text = getattr(event, "delta", "")
@@ -7664,12 +8082,34 @@ class AIAgent:
         terminal_response = None
         collected_output_items: list = []
         collected_text_deltas: list = []
+        event_count = 0
+        event_type_counts: Counter[str] = Counter()
+        last_event_types: list[str] = []
         try:
             for event in stream_or_response:
                 self._touch_activity("receiving stream response")
+                event_count += 1
                 event_type = getattr(event, "type", None)
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")
+                event_type = str(event_type or "unknown")
+                event_type_counts[event_type] += 1
+                last_event_types.append(event_type)
+                if len(last_event_types) > 8:
+                    last_event_types.pop(0)
+
+                if event_type == "error":
+                    err_message = getattr(event, "message", None)
+                    if not err_message and isinstance(event, dict):
+                        err_message = event.get("message")
+                    err_code = getattr(event, "code", None)
+                    if not err_code and isinstance(event, dict):
+                        err_code = event.get("code")
+                    err_param = getattr(event, "param", None)
+                    if not err_param and isinstance(event, dict):
+                        err_param = event.get("param")
+                    err_message = (err_message or "stream emitted error event").strip()
+                    raise _StreamErrorEvent(err_message, code=err_code, param=err_param)
 
                 # Collect output items and text deltas for backfill
                 if event_type == "response.output_item.done":
@@ -7694,6 +8134,19 @@ class AIAgent:
                 terminal_response = getattr(event, "response", None)
                 if terminal_response is None and isinstance(event, dict):
                     terminal_response = event.get("response")
+                if terminal_response is None and event_type == "response.failed":
+                    error_obj = getattr(event, "error", None)
+                    if error_obj is None and isinstance(event, dict):
+                        error_obj = event.get("error")
+                    if isinstance(error_obj, dict):
+                        err_message = str(error_obj.get("message") or "response.failed without response").strip()
+                        err_code = error_obj.get("code")
+                        err_param = error_obj.get("param")
+                    else:
+                        err_message = str(error_obj or "response.failed without response").strip()
+                        err_code = None
+                        err_param = None
+                    raise _StreamErrorEvent(err_message, code=err_code, param=err_param)
                 if terminal_response is not None:
                     # Backfill empty output from collected stream events
                     _out = getattr(terminal_response, "output", None)
@@ -7732,16 +8185,52 @@ class AIAgent:
 
         if terminal_response is not None:
             return terminal_response
-        raise RuntimeError("Responses create(stream=True) fallback did not emit a terminal response.")
+        text_chars = sum(len(part) for part in collected_text_deltas)
+        logger.warning(
+            "Codex fallback stream ended without terminal response "
+            "(events=%d, event_types=%s, last_events=%s, output_items=%d, "
+            "text_chars=%d, previous_response_id=%s). %s",
+            event_count,
+            dict(event_type_counts),
+            last_event_types,
+            len(collected_output_items),
+            text_chars,
+            fallback_kwargs.get("previous_response_id") or "",
+            self._client_log_context(),
+        )
+        raise RuntimeError(
+            "Responses create(stream=True) fallback did not emit a terminal response "
+            f"(events={event_count}, event_types={dict(event_type_counts)}, "
+            f"output_items={len(collected_output_items)}, text_chars={text_chars}, "
+            f"previous_response_id={fallback_kwargs.get('previous_response_id') or ''})."
+        )
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
-        if self.api_mode != "codex_responses" or self.provider != "openai-codex":
+        if self.api_mode != "codex_responses" or self.provider not in {
+            "openai-codex",
+            "xai-oauth",
+        }:
             return False
 
         try:
-            from hermes_cli.auth import resolve_codex_runtime_credentials
+            if self.provider == "xai-oauth":
+                from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
 
-            creds = resolve_codex_runtime_credentials(force_refresh=force)
+                singleton = resolve_xai_oauth_runtime_credentials(
+                    force_refresh=False,
+                    refresh_if_expiring=False,
+                )
+                singleton_key = str(singleton.get("api_key") or "").strip()
+                if not singleton_key or singleton_key != str(self.api_key or "").strip():
+                    return False
+                creds = resolve_xai_oauth_runtime_credentials(
+                    force_refresh=force,
+                    refresh_if_expiring=True,
+                )
+            else:
+                from hermes_cli.auth import resolve_codex_runtime_credentials
+
+                creds = resolve_codex_runtime_credentials(force_refresh=force)
         except Exception as exc:
             logger.debug("Codex credential refresh failed: %s", exc)
             return False
@@ -7758,7 +8247,12 @@ class AIAgent:
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
 
-        if not self._replace_primary_openai_client(reason="codex_credential_refresh"):
+        refresh_reason = (
+            "xai_oauth_credential_refresh"
+            if self.provider == "xai-oauth"
+            else "codex_credential_refresh"
+        )
+        if not self._replace_primary_openai_client(reason=refresh_reason):
             return False
 
         return True
@@ -9805,11 +10299,20 @@ class AIAgent:
         them natively (for vision-capable models).
         """
         try:
-            from agent.models_dev import get_model_capabilities
             provider = (getattr(self, "provider", "") or "").strip()
             model = (getattr(self, "model", "") or "").strip()
             if not provider or not model:
                 return False
+            try:
+                from agent.image_routing import decide_image_input_mode
+                from hermes_cli.config import load_config
+
+                if decide_image_input_mode(provider, model, load_config()) == "native":
+                    return True
+            except Exception:
+                pass
+
+            from agent.models_dev import get_model_capabilities
             caps = get_model_capabilities(provider, model)
             if caps is None:
                 return False
@@ -10351,27 +10854,50 @@ class AIAgent:
                 )
             )
             is_xai_responses = self.provider == "xai" or self._base_url_hostname == "api.x.ai"
-            _msgs_for_codex = self._prepare_messages_for_non_vision_model(api_messages)
+            _codex_api_messages, _codex_runtime_directives = self._split_codex_runtime_instructions(api_messages)
+            _codex_runtime_instructions = ""
+            if _codex_runtime_directives and is_local_endpoint(self.base_url):
+                # Local stateful wrappers can preserve the durable system-prefix
+                # identity while applying one-call repair policy at the prompt
+                # tail. Keep this structured instead of concatenating transient
+                # conscience text into Responses `instructions`.
+                _codex_instructions = self._codex_base_instructions(_codex_api_messages)
+                _codex_runtime_instructions = self._codex_runtime_directive_text(
+                    _codex_runtime_directives
+                )
+            else:
+                _codex_instructions = self._codex_instructions_with_runtime_directives(
+                    _codex_api_messages,
+                    _codex_runtime_directives,
+                )
+            _msgs_for_codex = self._prepare_messages_for_non_vision_model(_codex_api_messages)
             stateful_responses = self._responses_stateful_enabled()
             stateful_input = None
             previous_response_id = None
             if stateful_responses:
                 stateful_input, previous_response_id = self._build_stateful_responses_input(_msgs_for_codex)
+            _codex_kwargs_params = {
+                "reasoning_config": self.reasoning_config,
+                "session_id": getattr(self, "session_id", None),
+                "max_tokens": self.max_tokens,
+                "request_overrides": self.request_overrides,
+                "is_github_responses": is_github_responses,
+                "is_codex_backend": is_codex_backend,
+                "is_xai_responses": is_xai_responses,
+                "github_reasoning_extra": self._github_models_reasoning_extra_body() if is_github_responses else None,
+                "stateful_responses": stateful_responses,
+                "stateful_input": stateful_input,
+                "previous_response_id": previous_response_id,
+            }
+            if _codex_instructions is not None:
+                _codex_kwargs_params["instructions"] = _codex_instructions
+            if _codex_runtime_instructions:
+                _codex_kwargs_params["runtime_instructions"] = _codex_runtime_instructions
             return self._apply_conscience_repair_overrides(_ct.build_kwargs(
                 model=self.model,
                 messages=_msgs_for_codex,
                 tools=tools_for_api,
-                reasoning_config=self.reasoning_config,
-                session_id=getattr(self, "session_id", None),
-                max_tokens=self.max_tokens,
-                request_overrides=self.request_overrides,
-                is_github_responses=is_github_responses,
-                is_codex_backend=is_codex_backend,
-                is_xai_responses=is_xai_responses,
-                github_reasoning_extra=self._github_models_reasoning_extra_body() if is_github_responses else None,
-                stateful_responses=stateful_responses,
-                stateful_input=stateful_input,
-                previous_response_id=previous_response_id,
+                **_codex_kwargs_params,
             ))
 
         # ── chat_completions (default) ─────────────────────────────────────
@@ -11479,6 +12005,28 @@ class AIAgent:
         except Exception as exc:
             logger.debug("Conscience event recording failed for %s: %s", event_type, exc)
 
+    @staticmethod
+    def _conscience_head_tail_preview(value: Any, limit: int = 8_000) -> tuple[str, bool, int, str, str]:
+        text = "" if value is None else str(value)
+        limit = max(256, int(limit or 8_000))
+        if len(text) <= limit:
+            return text, False, 0, text, text
+
+        omitted = len(text) - limit
+        while True:
+            marker = f"\n... [truncated {omitted} chars] ...\n"
+            keep = max(0, limit - len(marker))
+            head_len = keep // 2
+            tail_len = keep - head_len
+            new_omitted = len(text) - head_len - tail_len
+            if new_omitted == omitted:
+                break
+            omitted = new_omitted
+
+        head = text[:head_len]
+        tail = text[-tail_len:] if tail_len else ""
+        return f"{head}{marker}{tail}", True, omitted, head, tail
+
     def _conscience_tool_result_payload(
         self,
         *,
@@ -11489,14 +12037,51 @@ class AIAgent:
         call_id: str | None = None,
     ) -> dict:
         is_error, failure_reason = _detect_tool_failure(tool_name, tool_result)
+        result_preview, result_truncated, result_omitted, _, _ = self._conscience_head_tail_preview(tool_result)
         payload = {
             "tool_name": tool_name,
             "tool_args": asdict_safe(tool_args),
             "tool_call_id": call_id,
             "success": not is_error,
             "duration_seconds": duration,
-            "result_preview": tool_result[:1000],
+            "result_preview": result_preview,
+            "result_preview_truncated": result_truncated,
         }
+        if result_truncated:
+            payload["result_omitted_chars"] = result_omitted
+
+        parsed_result = None
+        if isinstance(tool_result, str):
+            try:
+                loaded_result = json.loads(tool_result)
+            except Exception:
+                loaded_result = None
+            if isinstance(loaded_result, dict):
+                parsed_result = loaded_result
+
+        if parsed_result is not None:
+            for exit_key in ("exit_code", "returncode"):
+                if exit_key in parsed_result:
+                    payload["exit_code"] = parsed_result.get(exit_key)
+                    break
+            output = parsed_result.get("output")
+            if isinstance(output, str):
+                (
+                    _output_preview,
+                    output_truncated,
+                    output_omitted,
+                    output_head,
+                    output_tail,
+                ) = self._conscience_head_tail_preview(output)
+                payload["output_chars"] = len(output)
+                payload["output_preview_truncated"] = output_truncated
+                payload["output_head"] = output_head
+                if output_truncated:
+                    payload["output_tail"] = output_tail
+                    payload["output_omitted_chars"] = output_omitted
+            parsed_error = parsed_result.get("error")
+            if parsed_error not in (None, ""):
+                payload["tool_error"] = str(parsed_error)
         if is_error and failure_reason:
             payload["error"] = failure_reason
         return payload
@@ -11672,6 +12257,62 @@ class AIAgent:
             lines.append("Act now; do not explain this instruction.")
 
         return "\n".join(lines)
+
+    def _queue_conscience_internal_message(self, label: str, ticket: CritiqueTicket) -> None:
+        content = self._format_conscience_internal_message(label, ticket)
+        if not content.strip():
+            return
+        event = {
+            "id": f"conscience_{label.lower()}_{uuid.uuid4().hex[:12]}",
+            "label": label,
+            "content": content,
+            "created_at": time.time(),
+        }
+        self._pending_conscience_internal_messages.append(event)
+        logger.info(
+            "Queued hidden conscience %s directive for next actor request (session=%s event_id=%s)",
+            label,
+            self.session_id or "-",
+            event["id"],
+        )
+
+    def _consume_conscience_internal_messages_for_api(self) -> list[dict[str, Any]]:
+        pending = list(getattr(self, "_pending_conscience_internal_messages", []) or [])
+        self._pending_conscience_internal_messages = []
+        self._active_conscience_internal_messages = pending
+        if not pending:
+            return []
+        logger.info(
+            "Injecting %s hidden conscience directive(s) into next actor request only (session=%s)",
+            len(pending),
+            self.session_id or "-",
+        )
+        return [
+            {
+                "role": "system",
+                "content": str(item.get("content") or ""),
+                "_hermes_internal_directive": True,
+                "_hermes_internal_directive_id": str(item.get("id") or ""),
+                "_hermes_internal_directive_label": str(item.get("label") or ""),
+            }
+            for item in pending
+            if str(item.get("content") or "").strip()
+        ]
+
+    def _clear_conscience_internal_messages(self, reason: str) -> None:
+        pending = len(getattr(self, "_pending_conscience_internal_messages", []) or [])
+        active = len(getattr(self, "_active_conscience_internal_messages", []) or [])
+        self._pending_conscience_internal_messages = []
+        self._active_conscience_internal_messages = []
+        self._clear_transient_responses_repair_parent(f"hidden_directive_clear:{reason}")
+        if pending or active:
+            logger.info(
+                "Cleared hidden conscience directives (%s): pending=%s active=%s session=%s",
+                reason,
+                pending,
+                active,
+                self.session_id or "-",
+            )
 
     def _prepare_conscience_tool_narrowing(self, ticket: CritiqueTicket) -> None:
         if not self.tools or not self.valid_tool_names:
@@ -12072,12 +12713,7 @@ class AIAgent:
 
         if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
             self._prepare_conscience_tool_narrowing(verdict.critique_ticket)
-            messages.append(
-                {
-                    "role": "system",
-                    "content": self._format_conscience_internal_message("MIDTASK", verdict.critique_ticket),
-                }
-            )
+            self._queue_conscience_internal_message("MIDTASK", verdict.critique_ticket)
         return True
 
     @staticmethod
@@ -13353,6 +13989,7 @@ class AIAgent:
             self.platform or "unknown", len(conversation_history or []),
             _msg_preview,
         )
+        self._clear_conscience_internal_messages("new_turn")
         _foreground_activity_token = None
         if self._should_register_foreground_activity():
             try:
@@ -13367,6 +14004,9 @@ class AIAgent:
                 logger.debug("Could not register foreground activity", exc_info=True)
 
         # Initialize conversation (copy to avoid mutating the caller's list)
+        if conversation_history:
+            conversation_history = list(conversation_history)
+            self._drop_hidden_conscience_messages(conversation_history)
         messages = list(conversation_history) if conversation_history else []
         if not conversation_history:
             self._clear_responses_stateful_chain(reason="fresh_conversation")
@@ -13685,6 +14325,7 @@ class AIAgent:
             if self._interrupt_requested:
                 interrupted = True
                 _turn_exit_reason = "interrupted_by_user"
+                self._clear_conscience_internal_messages("interrupt_before_request")
                 if not self.quiet_mode:
                     self._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
                 break
@@ -13866,6 +14507,13 @@ class AIAgent:
                 # The signature field helps maintain reasoning continuity
                 api_messages.append(api_msg)
 
+            # Hidden conscience repair directives are model-state, not durable
+            # chat history.  Inject them into exactly the next actor request so
+            # they influence the response_id branch, then discard them.  This
+            # preserves cache correctness for the branch while preventing hidden
+            # repairs from becoming normal session history after interrupts.
+            api_messages.extend(self._consume_conscience_internal_messages_for_api())
+
             # Build the final system message: cached prompt + ephemeral system prompt.
             # Ephemeral additions are API-call-time only (not persisted to session DB).
             # External recall context is injected into the user message, not the system
@@ -14038,6 +14686,8 @@ class AIAgent:
             image_shrink_retry_attempted = False
             oauth_1m_beta_retry_attempted = False
             llama_cpp_grammar_retry_attempted = False
+            wrapper_restart_recovery_deadline = 0.0
+            wrapper_restart_extra_retries_used = 0
             has_retried_429 = False
             restart_with_compressed_messages = False
             restart_with_length_continuation = False
@@ -14228,7 +14878,20 @@ class AIAgent:
                     if self.api_mode == "codex_responses":
                         _ct_v = self._get_transport()
                         if not _ct_v.validate_response(response):
-                            if response is None:
+                            _wrapper_runaway_snapshot = (
+                                self._codex_runaway_snapshot_from_response(response)
+                                if response is not None
+                                else None
+                            )
+                            if _wrapper_runaway_snapshot is not None:
+                                logger.warning(
+                                    "Codex response accepted as controlled runaway abort "
+                                    "(reason=%s, output_chars=%s). %s",
+                                    _wrapper_runaway_snapshot.get("reason"),
+                                    _wrapper_runaway_snapshot.get("output_chars"),
+                                    self._client_log_context(),
+                                )
+                            elif response is None:
                                 response_invalid = True
                                 error_details.append("response is None")
                             else:
@@ -14439,14 +15102,20 @@ class AIAgent:
                     # Check finish_reason before proceeding
                     if self.api_mode == "codex_responses":
                         status = getattr(response, "status", None)
-                        incomplete_details = getattr(response, "incomplete_details", None)
-                        incomplete_reason = None
-                        if isinstance(incomplete_details, dict):
-                            incomplete_reason = incomplete_details.get("reason")
-                        else:
-                            incomplete_reason = getattr(incomplete_details, "reason", None)
+                        incomplete_reason = self._codex_incomplete_reason(response)
                         if status == "incomplete" and incomplete_reason in {"max_output_tokens", "length"}:
                             finish_reason = "length"
+                        elif status == "incomplete" and incomplete_reason in {
+                            "runaway_output_aborted",
+                            "repeated_output",
+                            "runaway_output",
+                        }:
+                            finish_reason = "runaway_output_aborted"
+                            response = self._codex_runaway_output_response(
+                                self._codex_runaway_snapshot_from_response(response)
+                                or {"reason": incomplete_reason}
+                            )
+                            finish_reason = "stop"
                         else:
                             finish_reason = "stop"
                     elif self.api_mode == "anthropic_messages":
@@ -15188,7 +15857,7 @@ class AIAgent:
 
                     if (
                         self.api_mode == "codex_responses"
-                        and self.provider == "openai-codex"
+                        and self.provider in {"openai-codex", "xai-oauth"}
                         and status_code == 401
                         and not codex_auth_retry_attempted
                     ):
@@ -15290,15 +15959,43 @@ class AIAgent:
                         )
                         continue
 
+                    if getattr(self, "_memory_write_origin", None) == "background_review":
+                        _background_summary = self._summarize_api_error(api_error)
+                        logger.warning(
+                            "Background review API failed without retry %s summary=%s",
+                            self._client_log_context(),
+                            _background_summary,
+                        )
+                        try:
+                            blocked_response_id = self._active_responses_previous_response_id(api_kwargs)
+                            self._clear_responses_stateful_chain(
+                                reason="background_review_api_error",
+                                blocked_response_id=blocked_response_id,
+                                force_fresh_until_success=True,
+                            )
+                        except Exception:
+                            pass
+                        return {
+                            "final_response": None,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _background_summary,
+                        }
+
                     if self._should_reset_stateful_responses_after_error(api_error):
+                        blocked_response_id = self._active_responses_previous_response_id(api_kwargs)
                         self._clear_responses_stateful_chain(
-                            reason="previous_response_id_rejected",
-                            blocked_response_id=getattr(self, "_responses_previous_response_id", None),
+                            reason="previous_response_id_rejected_or_poisoned",
+                            blocked_response_id=blocked_response_id,
+                            force_fresh_until_success=True,
                         )
                         retry_count += 1
                         if retry_count < max_retries:
                             logger.info(
-                                "Retrying Responses request without previous_response_id after server rejection"
+                                "Retrying Responses request without previous_response_id after stateful resume rejection/poison: %s",
+                                blocked_response_id or "<unknown>",
                             )
                             continue
 
@@ -15354,6 +16051,30 @@ class AIAgent:
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
                     _error_summary = self._summarize_api_error(api_error)
+                    _error_body_for_restart = getattr(api_error, "body", None)
+                    try:
+                        _wrapper_restart_wait_s = float(
+                            os.environ.get("HERMES_WRAPPER_RESTART_WAIT_SECONDS", "30")
+                            or 30
+                        )
+                    except (TypeError, ValueError):
+                        _wrapper_restart_wait_s = 30.0
+                    _wrapper_restart_reason = str(
+                        error_context.get("reason") or ""
+                    ).strip()
+                    _wrapper_restart_signal = (
+                        _wrapper_restart_reason == "wrapper_restarting"
+                        or "wrapper_restarting" in str(_error_body_for_restart)
+                    )
+                    _wrapper_restart_followup = (
+                        time.time() < wrapper_restart_recovery_deadline
+                        and error_type in {"APIConnectionError", "APITimeoutError"}
+                    )
+                    if _wrapper_restart_signal:
+                        wrapper_restart_recovery_deadline = max(
+                            wrapper_restart_recovery_deadline,
+                            time.time() + max(1.0, _wrapper_restart_wait_s),
+                        )
                     logger.warning(
                         "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
                         retry_count,
@@ -15882,6 +16603,21 @@ class AIAgent:
                             "error": str(api_error),
                         }
 
+                    if (
+                        retry_count >= max_retries
+                        and (_wrapper_restart_signal or _wrapper_restart_followup)
+                        and wrapper_restart_extra_retries_used < 2
+                    ):
+                        wrapper_restart_extra_retries_used += 1
+                        retry_count = max_retries - 1
+                        logger.warning(
+                            "%sExtending API retry budget for wrapper restart recovery "
+                            "(extra %s/2, wait_deadline_in=%.1fs)",
+                            self.log_prefix,
+                            wrapper_restart_extra_retries_used,
+                            max(0.0, wrapper_restart_recovery_deadline - time.time()),
+                        )
+
                     if retry_count >= max_retries:
                         # Before falling back, try rebuilding the primary
                         # client once for transient transport errors (stale
@@ -15977,8 +16713,19 @@ class AIAgent:
                                 except (TypeError, ValueError):
                                     pass
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    if _wrapper_restart_signal or _wrapper_restart_followup:
+                        restart_wait_remaining = max(
+                            1.0,
+                            wrapper_restart_recovery_deadline - time.time(),
+                        )
+                        wait_time = max(wait_time, restart_wait_remaining)
                     if is_rate_limited:
                         self._emit_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
+                    elif _wrapper_restart_signal or _wrapper_restart_followup:
+                        self._emit_status(
+                            f"⏳ Wrapper restarting. Waiting {wait_time:.1f}s "
+                            f"(attempt {retry_count}/{max_retries})..."
+                        )
                     else:
                         self._emit_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                     logger.warning(
@@ -16018,7 +16765,9 @@ class AIAgent:
             # If the API call was interrupted, skip response processing
             if interrupted:
                 _turn_exit_reason = "interrupted_during_api_call"
+                self._clear_conscience_internal_messages("interrupt_during_request")
                 break
+            self._active_conscience_internal_messages = []
 
             if restart_with_compressed_messages:
                 api_call_count -= 1
@@ -17057,13 +17806,14 @@ class AIAgent:
                             if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
                                 self._conscience_blocked_stop_count += 1
                                 self._prepare_conscience_tool_narrowing(verdict.critique_ticket)
-                                messages.append({
-                                    "role": "system",
-                                    "content": self._format_conscience_internal_message(
-                                        "STOP-GATE",
-                                        verdict.critique_ticket,
-                                    ),
-                                })
+                                self._remember_transient_responses_repair_parent(
+                                    getattr(assistant_message, "responses_response_id", None),
+                                    reason="conscience_stop_gate",
+                                )
+                                self._queue_conscience_internal_message(
+                                    "STOP-GATE",
+                                    verdict.critique_ticket,
+                                )
                                 final_response = None
                                 continue
                     

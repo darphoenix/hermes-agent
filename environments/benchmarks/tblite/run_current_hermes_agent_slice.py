@@ -14,6 +14,7 @@ import csv
 import io
 import json
 import os
+import shlex
 import shutil
 import signal
 import sys
@@ -157,6 +158,95 @@ def _extract_base64_tar(b64_data: str, target_dir: Path) -> None:
         _safe_extract_tar(tar, target_dir)
 
 
+class _VerifierToolContext:
+    """Small self-contained tool context for benchmark verification.
+
+    Upstream Hermes removed the old Atropos ``environments.tool_context``
+    package. The TBLite smoke still needs verifier access to the same task
+    sandbox the actor used, so keep the few required calls local to this
+    benchmark runner.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+
+    def _call_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        from model_tools import handle_function_call
+
+        raw = handle_function_call(name, args, task_id=self.task_id)
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {"result": parsed}
+        except Exception:
+            return {"exit_code": -1, "output": str(raw)}
+
+    def terminal(self, command: str, timeout: int = 180) -> Dict[str, Any]:
+        return self._call_tool("terminal", {"command": command, "timeout": timeout})
+
+    def write_file(self, path: str, content: str) -> Dict[str, Any]:
+        return self._call_tool("write_file", {"path": path, "content": content})
+
+    def upload_dir(self, local_dir: str, remote_dir: str) -> Dict[str, Any]:
+        local = Path(local_dir)
+        if not local.is_dir():
+            return {"exit_code": -1, "output": f"Local directory not found: {local_dir}"}
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for path in sorted(local.rglob("*")):
+                if path.is_file():
+                    tar.add(path, arcname=str(path.relative_to(local)))
+
+        archive_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        remote_b64 = f"/tmp/hermes_verifier_upload_{uuid.uuid4().hex}.tar.gz.b64"
+        remote_tar = remote_b64[:-4]
+        chunk_size = 60_000
+        self.terminal(f"mkdir -p {shlex.quote(remote_dir)} && : > {shlex.quote(remote_b64)}", timeout=30)
+        for idx in range(0, len(archive_b64), chunk_size):
+            chunk = archive_b64[idx : idx + chunk_size]
+            result = self.terminal(
+                f"printf %s {shlex.quote(chunk)} >> {shlex.quote(remote_b64)}",
+                timeout=30,
+            )
+            if int(result.get("exit_code", -1)) != 0:
+                return result
+        return self.terminal(
+            "base64 -d {b64} > {tar} && tar -xzf {tar} -C {dest} && rm -f {b64} {tar}".format(
+                b64=shlex.quote(remote_b64),
+                tar=shlex.quote(remote_tar),
+                dest=shlex.quote(remote_dir),
+            ),
+            timeout=120,
+        )
+
+    def download_dir(self, remote_dir: str, local_dir: str) -> Dict[str, Any]:
+        remote_tar = f"/tmp/hermes_verifier_download_{uuid.uuid4().hex}.tar.gz"
+        result = self.terminal(
+            "cd {src} && tar -czf {tar} . && base64 -w 0 {tar} && rm -f {tar}".format(
+                src=shlex.quote(remote_dir),
+                tar=shlex.quote(remote_tar),
+            ),
+            timeout=120,
+        )
+        if int(result.get("exit_code", -1)) != 0:
+            return result
+
+        encoded = "".join(str(result.get("output", "")).split())
+        try:
+            raw = base64.b64decode(encoded)
+        except Exception as exc:
+            return {"success": False, "error": f"failed to decode verifier archive: {exc}"}
+
+        target = Path(local_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+                _safe_extract_tar(tar, target)
+        except Exception as exc:
+            return {"success": False, "error": f"failed to extract verifier archive: {exc}"}
+        return {"success": True, "bytes": len(raw)}
+
+
 class _AlarmTimeout:
     def __init__(self, seconds: int):
         self.seconds = seconds
@@ -195,9 +285,7 @@ def _load_selected_tasks(task_names: List[str], dataset_name: str, split: str) -
 
 
 def _run_tests(item: Dict[str, Any], task_id: str, test_timeout: int) -> Dict[str, Any]:
-    from environments.tool_context import ToolContext
-
-    ctx = ToolContext(task_id)
+    ctx = _VerifierToolContext(task_id)
     task_name = item.get("task_name", "unknown")
     tests_tar = item.get("tests_tar", "")
     test_sh = item.get("test_sh", "")

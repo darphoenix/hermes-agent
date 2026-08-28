@@ -2872,6 +2872,7 @@ class HermesCLI:
         # Agent will be initialized on first use
         self.agent: Optional[AIAgent] = None
         self._app = None  # prompt_toolkit Application (set in run())
+        self._input_area = None  # prompt_toolkit TextArea (set in run())
         
         # Conversation state
         self.conversation_history: List[Dict[str, Any]] = []
@@ -10763,26 +10764,36 @@ class HermesCLI:
 
         with self._approval_lock:
             timeout = int(CLI_CONFIG.get("approvals", {}).get("timeout", 60))
+            if getattr(self, "_app", None) is None:
+                from tools.approval import prompt_dangerous_approval as _prompt_dangerous_approval
+                return _prompt_dangerous_approval(
+                    command,
+                    description,
+                    timeout_seconds=timeout,
+                    allow_permanent=allow_permanent,
+                    approval_callback=None,
+                )
+
             response_queue = queue.Queue()
 
-            self._approval_state = {
+            approval_state = {
                 "command": command,
                 "description": description,
                 "choices": self._approval_choices(command, allow_permanent=allow_permanent),
                 "selected": 0,
                 "response_queue": response_queue,
             }
-            self._approval_deadline = _time.monotonic() + timeout
+            approval_deadline = _time.monotonic() + timeout
 
-            self._invalidate()
+            ui_active = self._activate_approval_prompt(approval_state, approval_deadline)
+            if not ui_active:
+                self._print_approval_notice(command, description, approval_state["choices"], timeout)
 
             _last_countdown_refresh = _time.monotonic()
             while True:
                 try:
                     result = response_queue.get(timeout=1)
-                    self._approval_state = None
-                    self._approval_deadline = 0
-                    self._invalidate()
+                    self._clear_approval_prompt()
                     return result
                 except queue.Empty:
                     remaining = self._approval_deadline - _time.monotonic()
@@ -10791,13 +10802,11 @@ class HermesCLI:
                     now = _time.monotonic()
                     if now - _last_countdown_refresh >= 5.0:
                         _last_countdown_refresh = now
-                        self._invalidate()
+                        self._force_modal_repaint()
 
-            self._approval_state = None
-            self._approval_deadline = 0
-            self._invalidate()
-            _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
-            return "deny"
+            self._clear_approval_prompt()
+            _cprint(f"\n{_DIM}  ⏱ Timeout — approval request expired{_RST}")
+            return "timeout"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True) -> list[str]:
         """Return approval choices for a dangerous command prompt."""
@@ -10805,6 +10814,143 @@ class HermesCLI:
         if len(command) > 70:
             choices.append("view")
         return choices
+
+    def _call_on_prompt_toolkit_thread(self, func, *, timeout: float = 1.0) -> bool:
+        """Run *func* on prompt_toolkit's event loop when it is live."""
+        app = getattr(self, "_app", None)
+        loop = getattr(app, "loop", None) if app is not None else None
+        is_running = bool(getattr(app, "is_running", False)) if app is not None else False
+        if not app or not loop or not is_running:
+            func()
+            return False
+
+        try:
+            import asyncio as _asyncio
+            current_loop = _asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        except Exception:
+            current_loop = None
+
+        if current_loop is loop:
+            func()
+            return True
+
+        done = threading.Event()
+        errors: list[BaseException] = []
+
+        def _wrapped():
+            try:
+                func()
+            except BaseException as exc:  # pragma: no cover - re-raised below
+                errors.append(exc)
+            finally:
+                done.set()
+
+        try:
+            loop.call_soon_threadsafe(_wrapped)
+        except Exception:
+            func()
+            return False
+
+        if not done.wait(timeout):
+            logger.warning("prompt_toolkit modal activation did not run within %.1fs", timeout)
+            return False
+        if errors:
+            raise errors[0]
+        return True
+
+    def _force_modal_repaint(self) -> None:
+        """Force prompt_toolkit to repaint a modal state without throttle."""
+        def _paint():
+            self._last_invalidate = 0.0
+            app = getattr(self, "_app", None)
+            if app:
+                app.invalidate()
+
+        try:
+            self._call_on_prompt_toolkit_thread(_paint, timeout=0.5)
+        except Exception:
+            self._invalidate(min_interval=0.0)
+
+    def _activate_approval_prompt(self, state: dict, deadline: float) -> bool:
+        """Activate the dangerous-command approval modal on the TUI thread."""
+        def _activate():
+            self._capture_modal_input_snapshot()
+            self._approval_state = state
+            self._approval_deadline = deadline
+
+            app = getattr(self, "_app", None)
+            if app is not None:
+                try:
+                    app.current_buffer.reset()
+                except Exception:
+                    pass
+                input_area = getattr(self, "_input_area", None)
+                if input_area is not None:
+                    try:
+                        app.layout.focus(input_area)
+                    except Exception:
+                        pass
+                app.invalidate()
+
+        ui_active = self._call_on_prompt_toolkit_thread(_activate, timeout=1.0)
+        logger.info(
+            "CLI approval prompt activated: ui_active=%s choices=%s description=%r",
+            ui_active,
+            state.get("choices"),
+            state.get("description"),
+        )
+        return ui_active
+
+    def _clear_approval_prompt(self) -> None:
+        """Clear approval modal state and restore any interrupted draft."""
+        def _clear():
+            self._approval_state = None
+            self._approval_deadline = 0
+            self._restore_modal_input_snapshot()
+            app = getattr(self, "_app", None)
+            if app is not None:
+                app.invalidate()
+
+        try:
+            self._call_on_prompt_toolkit_thread(_clear, timeout=1.0)
+        except Exception:
+            self._approval_state = None
+            self._approval_deadline = 0
+            self._invalidate(min_interval=0.0)
+
+    def _print_approval_notice(self, command: str, description: str,
+                               choices: list[str], timeout: int) -> None:
+        """Print a scrollback-visible fallback for approval prompts."""
+        labels = {
+            "once": "allow once",
+            "session": "allow for this session",
+            "always": "add to permanent allowlist",
+            "deny": "deny",
+            "view": "show full command",
+        }
+        max_preview = 900
+        command_preview = command
+        if len(command_preview) > max_preview:
+            command_preview = command_preview[:max_preview].rstrip() + "\n... (command truncated; choose view for full command)"
+
+        numbered = "  ".join(
+            f"{idx}={labels.get(choice, choice)}"
+            for idx, choice in enumerate(choices, start=1)
+        )
+        lines = [
+            "",
+            f"{_BOLD}APPROVAL REQUIRED{_RST} ({timeout}s)",
+            f"Reason: {description or 'dangerous command'}",
+            "Command:",
+        ]
+        lines.extend(f"  {line}" for line in command_preview.splitlines() or [""])
+        lines.extend([
+            f"Choices: {numbered}",
+            "Press a number, or use arrows then Enter, in this terminal.",
+        ])
+        _cprint("\n".join(lines))
 
     def _computer_use_approval_callback(self, action: str, args: dict, summary: str) -> str:
         """Adapt the generic approval UI for the computer_use tool.
@@ -10846,12 +10992,11 @@ class HermesCLI:
             state["choices"] = [choice for choice in choices if choice != "view"]
             if state["selected"] >= len(state["choices"]):
                 state["selected"] = max(0, len(state["choices"]) - 1)
-            self._invalidate()
+            self._force_modal_repaint()
             return
 
         state["response_queue"].put(chosen)
-        self._approval_state = None
-        self._invalidate()
+        self._clear_approval_prompt()
 
     def _get_approval_display_fragments(self):
         """Render the dangerous-command approval panel for the prompt_toolkit UI.
@@ -11064,6 +11209,69 @@ class HermesCLI:
                 self._app.current_buffer.reset()
             except Exception:
                 pass
+
+    @staticmethod
+    def _turn_was_interrupted(result: Optional[dict], interrupt_msg) -> bool:
+        """Return True when a submitted busy-mode interrupt affected this turn."""
+        return bool(interrupt_msg is not None or (result and result.get("interrupted")))
+
+    @staticmethod
+    def _pending_interrupt_message(result: Optional[dict], interrupt_msg):
+        """Resolve the user message that should run after an interrupted turn."""
+        if interrupt_msg is not None:
+            if result and result.get("interrupt_message"):
+                return result.get("interrupt_message")
+            return interrupt_msg
+        if result and result.get("interrupted"):
+            return result.get("interrupt_message")
+        return None
+
+    @staticmethod
+    def _split_input_payload(payload):
+        """Return (text, images) for plain text or the CLI's (text, images) payload."""
+        if isinstance(payload, tuple) and len(payload) == 2:
+            text, images = payload
+            return str(text or ""), list(images or [])
+        return str(payload or ""), []
+
+    def _queue_interrupt_followup(self, pending_message) -> bool:
+        """Queue an interrupt follow-up, including any later interrupt messages."""
+        if not pending_message or not hasattr(self, '_pending_input'):
+            return False
+
+        all_texts = []
+        all_images = []
+        n = 0
+
+        text, images = self._split_input_payload(pending_message)
+        if text:
+            all_texts.append(text)
+        all_images.extend(images)
+        n += 1
+
+        if hasattr(self, '_interrupt_queue'):
+            while not self._interrupt_queue.empty():
+                try:
+                    extra = self._interrupt_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if not extra:
+                    continue
+                text, images = self._split_input_payload(extra)
+                if text:
+                    all_texts.append(text)
+                all_images.extend(images)
+                n += 1
+
+        combined_text = "\n".join(all_texts)
+        combined_payload = (combined_text, all_images) if all_images else combined_text
+        preview = combined_text[:50] + ("..." if len(combined_text) > 50 else "")
+        if n > 1:
+            print(f"\n⚡ Sending {n} messages after interrupt: '{preview}'")
+        else:
+            print(f"\n⚡ Sending after interrupt: '{preview}'")
+        self._pending_input.put(combined_payload)
+        return True
 
     def chat(self, message, images: list = None) -> Optional[str]:
         """
@@ -11286,6 +11494,8 @@ class HermesCLI:
                     "2-3 sentences max. No code blocks or markdown.] "
                 )
 
+            agent_ref = self.agent
+
             def run_agent():
                 nonlocal result
                 # Set callbacks inside the agent thread so thread-local storage
@@ -11313,12 +11523,12 @@ class HermesCLI:
                     agent_message = _srn + "\n\n" + agent_message
                     self._pending_skills_reload_note = None
                 try:
-                    self.agent.interim_assistant_callback = (
+                    agent_ref.interim_assistant_callback = (
                         self._on_interim_assistant_message
                         if self.interim_assistant_messages_enabled
                         else None
                     )
-                    result = self.agent.run_conversation(
+                    result = agent_ref.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
                         stream_callback=stream_callback,
@@ -11327,7 +11537,7 @@ class HermesCLI:
                     )
                 except Exception as exc:
                     logging.error("run_conversation raised: %s", exc, exc_info=True)
-                    _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)
+                    _summary = getattr(agent_ref, '_summarize_api_error', lambda e: str(e)[:300])(exc)
                     result = {
                         "final_response": f"Error: {_summary}",
                         "messages": [],
@@ -11377,7 +11587,7 @@ class HermesCLI:
                             # Signal TTS to stop on interrupt
                             if stop_event is not None:
                                 stop_event.set()
-                            self.agent.interrupt(interrupt_msg)
+                            agent_ref.interrupt(interrupt_msg)
                             # Debug: log to file (stdout may be devnull from redirect_stdout)
                             try:
                                 _dbg = _hermes_home / "interrupt_debug.log"
@@ -11424,6 +11634,12 @@ class HermesCLI:
                         "on exit.",
                         agent_thread.ident,
                     )
+                    # The consumed interrupt message is a real user turn.
+                    # If the old worker did not finish quickly, abandon this
+                    # agent instance for future turns so the follow-up cannot
+                    # race on the same mutable AIAgent object.
+                    if self.agent is agent_ref:
+                        self.agent = None
             else:
                 # Normal completion: agent thread should be done already,
                 # but guard against edge cases.
@@ -11524,12 +11740,12 @@ class HermesCLI:
 
             # Handle interrupt - check if we were interrupted
             pending_message = None
-            _interrupted_this_turn = bool(result and result.get("interrupted"))
+            _interrupted_this_turn = self._turn_was_interrupted(result, interrupt_msg)
             # Expose the flag for post-turn hooks (e.g. goal continuation)
             # so they can skip themselves when the turn was user-cancelled.
             self._last_turn_interrupted = _interrupted_this_turn
             if _interrupted_this_turn:
-                pending_message = result.get("interrupt_message") or interrupt_msg
+                pending_message = self._pending_interrupt_message(result, interrupt_msg)
                 # Add indicator that we were interrupted
                 if response and pending_message:
                     response = response + "\n\n---\n_[Interrupted - processing new message]_"
@@ -11625,23 +11841,8 @@ class HermesCLI:
             # Only reached when busy_input_mode == "interrupt" (the default).
             # In "queue" mode Enter routes directly to _pending_input so this
             # block is never hit.
-            if pending_message and hasattr(self, '_pending_input'):
-                all_parts = [pending_message]
-                while not self._interrupt_queue.empty():
-                    try:
-                        extra = self._interrupt_queue.get_nowait()
-                        if extra:
-                            all_parts.append(extra)
-                    except queue.Empty:
-                        break
-                combined = "\n".join(all_parts)
-                n = len(all_parts)
-                preview = combined[:50] + ("..." if len(combined) > 50 else "")
-                if n > 1:
-                    print(f"\n⚡ Sending {n} messages after interrupt: '{preview}'")
-                else:
-                    print(f"\n⚡ Sending after interrupt: '{preview}'")
-                self._pending_input.put(combined)
+            if pending_message:
+                self._queue_interrupt_followup(pending_message)
 
             # If a /steer was left over (agent finished before another tool
             # batch could absorb it), deliver it as the next user turn.
@@ -13027,6 +13228,7 @@ class HermesCLI:
                 completer=_completer,
             ),
         )
+        self._input_area = input_area
         # Keep prompt_toolkit on its simple tempfile path. Setting
         # buffer.tempfile = "prompt.md" triggers its complex-tempfile branch,
         # which tries to mkdir() the mkdtemp() directory again and raises

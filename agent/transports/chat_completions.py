@@ -127,6 +127,9 @@ class ChatCompletionsTransport(ProviderTransport):
                 "codex_reasoning_items" in msg
                 or "codex_message_items" in msg
                 or "responses_response_id" in msg
+                or "_hermes_internal_directive" in msg
+                or "_hermes_internal_directive_id" in msg
+                or "_hermes_internal_directive_label" in msg
             ):
                 needs_sanitize = True
                 break
@@ -151,6 +154,9 @@ class ChatCompletionsTransport(ProviderTransport):
             msg.pop("codex_reasoning_items", None)
             msg.pop("codex_message_items", None)
             msg.pop("responses_response_id", None)
+            msg.pop("_hermes_internal_directive", None)
+            msg.pop("_hermes_internal_directive_id", None)
+            msg.pop("_hermes_internal_directive_label", None)
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:

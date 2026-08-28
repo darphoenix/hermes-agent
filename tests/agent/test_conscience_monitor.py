@@ -77,6 +77,14 @@ def test_stop_contract_keeps_full_review_reporting():
     assert "Do not explain why you are observing." not in prompt
 
 
+def test_stop_contract_allows_harmless_surplus():
+    prompt = ConscienceMonitor._stop_review_system_prompt()
+
+    assert "Allow harmless surplus" in prompt
+    assert "optional polish, consolidation, cleanup, or broader improvements" in prompt
+    assert "Treat that as a style issue, not a completion failure" in prompt
+
+
 def test_stateful_contract_separates_midtask_and_stop_sections():
     prompt = ConscienceMonitor._stateful_review_system_prompt()
 

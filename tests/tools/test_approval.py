@@ -589,6 +589,22 @@ class TestFullCommandAlwaysShown:
             result = prompt_dangerous_approval(short_cmd, "recursive delete")
         assert result == "deny"
 
+    def test_input_timeout_is_distinct_from_deny(self):
+        """A missed approval prompt must not be represented as explicit denial."""
+        import time
+
+        def slow_input(_prompt):
+            time.sleep(0.2)
+            return "o"
+
+        with mock_patch("builtins.input", side_effect=slow_input):
+            result = prompt_dangerous_approval(
+                "rm -rf /tmp",
+                "recursive delete",
+                timeout_seconds=0.01,
+            )
+        assert result == "timeout"
+
 
 class TestForkBombDetection:
     """The fork bomb regex must match the classic :(){ :|:& };: pattern."""
@@ -913,12 +929,12 @@ class TestFailClosedUnderPromptToolkit:
 
     When prompt_toolkit owns the terminal and no approval callback is
     registered on the calling thread, prompt_dangerous_approval() must
-    deny fast instead of falling through to the input() fallback -- which
+    fail closed instead of falling through to the input() fallback -- which
     deadlocks because the user's keystrokes go to prompt_toolkit's raw-mode
     stdin capture, not to input().
     """
 
-    def test_denies_when_prompt_toolkit_active_and_no_callback(self):
+    def test_unavailable_when_prompt_toolkit_active_and_no_callback(self):
         import threading
         import prompt_toolkit.application.current as ptc
 
@@ -943,7 +959,7 @@ class TestFailClosedUnderPromptToolkit:
                 "prompt_dangerous_approval deadlocked under prompt_toolkit "
                 "with no callback -- fail-closed guard is broken"
             )
-            assert result == ["deny"]
+            assert result == ["approval_unavailable"]
         finally:
             ptc.get_app_or_none = orig
 
