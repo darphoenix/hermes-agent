@@ -612,11 +612,60 @@ def test_conscience_chat_messages_emit_stop_gate_interim(tmp_path):
     assert "still only intent" in seen[0][0]
     assistant_messages = [m.get("content", "") for m in result["messages"] if m.get("role") == "assistant"]
     assert not any(str(m).startswith("[Conscience]") for m in assistant_messages)
-    assert any(
+    assert not any(
         "[INTERNAL CONSCIENCE STOP-GATE" in str(m.get("content", ""))
         for m in result["messages"]
         if m.get("role") == "system"
     )
+
+    actor_calls = agent.client.chat.completions.create.call_args_list
+    assert len(actor_calls) >= 2
+    repair_messages = actor_calls[1].kwargs["messages"]
+    assert any(
+        "[INTERNAL CONSCIENCE STOP-GATE" in str(m.get("content", ""))
+        for m in repair_messages
+        if m.get("role") == "system"
+    )
+
+
+def test_hidden_conscience_repair_is_discarded_on_interrupt_before_repair_call(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    agent.client.chat.completions.create.return_value = _mock_response("Which website?")
+
+    def _audit_and_interrupt(**_kwargs):
+        agent._interrupt_requested = True
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_intervene": True,
+                                "verdict": "repair",
+                                "reason": "asked for a URL instead of picking one",
+                                "evidence": ["user asked for some website"],
+                                "next_best_action": "Pick a public website and use browser_vision.",
+                                "recommended_tools": ["browser_navigate", "browser_vision"],
+                                "criterion_ids": ["criterion_001"],
+                                "confidence": "high",
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+
+    with patch.object(agent, "_conscience_call_llm", side_effect=_audit_and_interrupt):
+        result = agent.run_conversation("Can u check if vision works on some website?")
+
+    assert result["interrupted"] is True
+    assert agent._pending_conscience_internal_messages == []
+    assert agent._active_conscience_internal_messages == []
+    assert not any(
+        "[INTERNAL CONSCIENCE" in str(m.get("content", ""))
+        for m in result["messages"]
+    )
+    assert agent.client.chat.completions.create.call_count == 1
 
 
 def test_enforce_stop_gate_fails_closed_when_repair_limit_exhausts(tmp_path):

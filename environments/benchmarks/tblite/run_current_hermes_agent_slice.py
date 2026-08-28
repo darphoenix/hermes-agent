@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import io
 import json
 import os
+import shlex
 import shutil
 import signal
 import sys
@@ -67,6 +69,7 @@ def _patch_isolated_terminal_config(
     backend: str,
     timeout: int,
     lifetime_seconds: int,
+    max_foreground_timeout: int,
 ) -> None:
     """Make the copied config authoritative for the benchmark terminal backend.
 
@@ -88,6 +91,34 @@ def _patch_isolated_terminal_config(
     terminal["docker_mount_cwd_to_workspace"] = False
     terminal.pop("cwd", None)
     config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    # The copied user .env is loaded with override=True by run_agent.py.  Keep
+    # its terminal values in sync with the isolated benchmark config so later
+    # dotenv reloads cannot revert the sandbox lifetime back to the user's
+    # interactive defaults.
+    env_path = hermes_home / ".env"
+    existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    terminal_env = {
+        "TERMINAL_ENV": backend,
+        "TERMINAL_TIMEOUT": str(timeout),
+        "TERMINAL_LIFETIME_SECONDS": str(lifetime_seconds),
+        "TERMINAL_MAX_FOREGROUND_TIMEOUT": str(max_foreground_timeout),
+        "TERMINAL_CONTAINER_PERSISTENT": "true",
+        "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE": "false",
+    }
+    lines = []
+    seen = set()
+    for line in existing.splitlines():
+        key = line.split("=", 1)[0].strip()
+        if key in terminal_env:
+            lines.append(f"{key}={terminal_env[key]}")
+            seen.add(key)
+        else:
+            lines.append(line)
+    for key, value in terminal_env.items():
+        if key not in seen:
+            lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def _safe_extract_tar(tar: tarfile.TarFile, target_dir: Path) -> None:
@@ -125,6 +156,95 @@ def _extract_base64_tar(b64_data: str, target_dir: Path) -> None:
     raw = base64.b64decode(b64_data)
     with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
         _safe_extract_tar(tar, target_dir)
+
+
+class _VerifierToolContext:
+    """Small self-contained tool context for benchmark verification.
+
+    Upstream Hermes removed the old Atropos ``environments.tool_context``
+    package. The TBLite smoke still needs verifier access to the same task
+    sandbox the actor used, so keep the few required calls local to this
+    benchmark runner.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+
+    def _call_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        from model_tools import handle_function_call
+
+        raw = handle_function_call(name, args, task_id=self.task_id)
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {"result": parsed}
+        except Exception:
+            return {"exit_code": -1, "output": str(raw)}
+
+    def terminal(self, command: str, timeout: int = 180) -> Dict[str, Any]:
+        return self._call_tool("terminal", {"command": command, "timeout": timeout})
+
+    def write_file(self, path: str, content: str) -> Dict[str, Any]:
+        return self._call_tool("write_file", {"path": path, "content": content})
+
+    def upload_dir(self, local_dir: str, remote_dir: str) -> Dict[str, Any]:
+        local = Path(local_dir)
+        if not local.is_dir():
+            return {"exit_code": -1, "output": f"Local directory not found: {local_dir}"}
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for path in sorted(local.rglob("*")):
+                if path.is_file():
+                    tar.add(path, arcname=str(path.relative_to(local)))
+
+        archive_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        remote_b64 = f"/tmp/hermes_verifier_upload_{uuid.uuid4().hex}.tar.gz.b64"
+        remote_tar = remote_b64[:-4]
+        chunk_size = 60_000
+        self.terminal(f"mkdir -p {shlex.quote(remote_dir)} && : > {shlex.quote(remote_b64)}", timeout=30)
+        for idx in range(0, len(archive_b64), chunk_size):
+            chunk = archive_b64[idx : idx + chunk_size]
+            result = self.terminal(
+                f"printf %s {shlex.quote(chunk)} >> {shlex.quote(remote_b64)}",
+                timeout=30,
+            )
+            if int(result.get("exit_code", -1)) != 0:
+                return result
+        return self.terminal(
+            "base64 -d {b64} > {tar} && tar -xzf {tar} -C {dest} && rm -f {b64} {tar}".format(
+                b64=shlex.quote(remote_b64),
+                tar=shlex.quote(remote_tar),
+                dest=shlex.quote(remote_dir),
+            ),
+            timeout=120,
+        )
+
+    def download_dir(self, remote_dir: str, local_dir: str) -> Dict[str, Any]:
+        remote_tar = f"/tmp/hermes_verifier_download_{uuid.uuid4().hex}.tar.gz"
+        result = self.terminal(
+            "cd {src} && tar -czf {tar} . && base64 -w 0 {tar} && rm -f {tar}".format(
+                src=shlex.quote(remote_dir),
+                tar=shlex.quote(remote_tar),
+            ),
+            timeout=120,
+        )
+        if int(result.get("exit_code", -1)) != 0:
+            return result
+
+        encoded = "".join(str(result.get("output", "")).split())
+        try:
+            raw = base64.b64decode(encoded)
+        except Exception as exc:
+            return {"success": False, "error": f"failed to decode verifier archive: {exc}"}
+
+        target = Path(local_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+                _safe_extract_tar(tar, target)
+        except Exception as exc:
+            return {"success": False, "error": f"failed to extract verifier archive: {exc}"}
+        return {"success": True, "bytes": len(raw)}
 
 
 class _AlarmTimeout:
@@ -165,9 +285,7 @@ def _load_selected_tasks(task_names: List[str], dataset_name: str, split: str) -
 
 
 def _run_tests(item: Dict[str, Any], task_id: str, test_timeout: int) -> Dict[str, Any]:
-    from environments.tool_context import ToolContext
-
-    ctx = ToolContext(task_id)
+    ctx = _VerifierToolContext(task_id)
     task_name = item.get("task_name", "unknown")
     tests_tar = item.get("tests_tar", "")
     test_sh = item.get("test_sh", "")
@@ -344,6 +462,7 @@ def run_task(
         "tool_call_counts": turn_summary["tool_call_counts"],
         "verification": verification,
         "messages": messages,
+        "request_trace": result.get("request_trace") or [],
     }
 
 
@@ -355,6 +474,62 @@ def _write_json(path: Path, payload: Any) -> None:
 def _append_jsonl(path: Path, payload: Any) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, default=_json_default) + "\n")
+
+
+def _write_trace_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    preferred = [
+        "task_name",
+        "task_id",
+        "passed",
+        "kind",
+        "actor",
+        "request_id",
+        "api_call_index",
+        "status",
+        "api_duration_s",
+        "model_call_s",
+        "request_build_s",
+        "stream_open_s",
+        "stream_time_to_first_event_s",
+        "stream_read_s",
+        "response_parse_s",
+        "duration_s",
+        "tool_name",
+        "execution_mode",
+        "prompt_tokens",
+        "completion_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "approx_input_tokens",
+        "request_char_count",
+        "model",
+        "provider",
+        "api_mode",
+        "base_url",
+        "session_id",
+        "turn_id",
+        "created_at_s",
+    ]
+    all_fields = set()
+    for row in rows:
+        all_fields.update(row.keys())
+    fieldnames = [name for name in preferred if name in all_fields]
+    fieldnames.extend(sorted(name for name in all_fields if name not in fieldnames))
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            clean: Dict[str, Any] = {}
+            for key in fieldnames:
+                value = row.get(key)
+                if isinstance(value, (dict, list, tuple)):
+                    clean[key] = json.dumps(value, ensure_ascii=False, default=_json_default)
+                else:
+                    clean[key] = value
+            writer.writerow(clean)
 
 
 def main() -> int:
@@ -390,11 +565,13 @@ def main() -> int:
         backend="docker",
         timeout=args.terminal_timeout,
         lifetime_seconds=args.task_timeout + 120,
+        max_foreground_timeout=max(args.terminal_timeout, args.test_timeout),
     )
     os.environ["HERMES_HOME"] = str(isolated_home)
     os.environ["TERMINAL_ENV"] = "docker"
     os.environ["TERMINAL_TIMEOUT"] = str(args.terminal_timeout)
     os.environ["TERMINAL_LIFETIME_SECONDS"] = str(args.task_timeout + 120)
+    os.environ["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = str(max(args.terminal_timeout, args.test_timeout))
     os.environ["TERMINAL_CONTAINER_PERSISTENT"] = "true"
     os.environ["HERMES_SESSION_SOURCE"] = "tblite-current-hermes-agent"
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -424,12 +601,18 @@ def main() -> int:
         "terminal_backend": "docker",
         "terminal_timeout": args.terminal_timeout,
         "model": config.get("model", {}),
+        "request_trace_jsonl": str(output_dir / "request_trace.jsonl"),
+        "request_trace_csv": str(output_dir / "request_trace.csv"),
     }
     _write_json(output_dir / "run_config.json", run_config)
 
     samples_path = output_dir / "samples.jsonl"
     if samples_path.exists():
         samples_path.unlink()
+    trace_jsonl_path = output_dir / "request_trace.jsonl"
+    trace_csv_path = output_dir / "request_trace.csv"
+    if trace_jsonl_path.exists():
+        trace_jsonl_path.unlink()
 
     print(f"Output: {output_dir}")
     print(f"Model: {(config.get('model', {}) or {}).get('default')}")
@@ -439,6 +622,7 @@ def main() -> int:
     print("")
 
     results: List[Dict[str, Any]] = []
+    trace_rows: List[Dict[str, Any]] = []
     started = time.time()
     for index, item in enumerate(tasks, 1):
         name = item["task_name"]
@@ -454,6 +638,14 @@ def main() -> int:
         )
         results.append(result)
         _append_jsonl(samples_path, result)
+        for trace_row in result.get("request_trace") or []:
+            enriched = dict(trace_row)
+            enriched.setdefault("task_name", result.get("task_name"))
+            enriched.setdefault("task_id", result.get("task_id"))
+            enriched.setdefault("passed", result.get("passed"))
+            enriched.setdefault("task_elapsed_s", result.get("elapsed_s"))
+            trace_rows.append(enriched)
+            _append_jsonl(trace_jsonl_path, enriched)
         status = "PASS" if result["passed"] else "FAIL"
         print(
             f"[{index}/{len(tasks)}] {status} {name} "
@@ -487,6 +679,7 @@ def main() -> int:
         },
     }
     _write_json(output_dir / "metrics.json", metrics)
+    _write_trace_csv(trace_csv_path, trace_rows)
     print("")
     print(json.dumps(metrics["results"]["all"], indent=2))
     return 0 if passed == total else 1

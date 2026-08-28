@@ -1,5 +1,6 @@
 import sys
 import types
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -351,11 +352,97 @@ def test_build_api_kwargs_codex_preserves_internal_system_directives(monkeypatch
         ]
     )
 
-    assert kwargs["instructions"] == "You are Hermes."
+    assert kwargs["instructions"].startswith("You are Hermes.")
+    assert "Internal runtime directive" in kwargs["instructions"]
+    assert "You are in a loop. Use web_search now." in kwargs["instructions"]
     assert kwargs["input"][0] == {"role": "user", "content": "But who else sells NV Diamond?"}
-    assert kwargs["input"][1]["role"] == "user"
-    assert kwargs["input"][1]["content"].startswith("[INTERNAL DIRECTIVE: do not expose")
-    assert "You are in a loop. Use web_search now." in kwargs["input"][1]["content"]
+    assert all("INTERNAL CONSCIENCE STOP-GATE" not in str(item) for item in kwargs["input"])
+
+
+def test_stateful_stop_repair_uses_rejected_response_parent_without_user_leak(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._responses_previous_response_id = "resp_prev"
+    agent._responses_transient_repair_previous_response_id = "resp_rejected_draft"
+
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Original task"},
+            {"role": "assistant", "content": "Old branch", "responses_response_id": "resp_prev"},
+            {
+                "role": "system",
+                "content": "[INTERNAL CONSCIENCE STOP-GATE] You are in a loop. Think hard how to break out.",
+                "_hermes_internal_directive": True,
+            },
+        ]
+    )
+
+    assert kwargs["store"] is True
+    assert kwargs["previous_response_id"] == "resp_rejected_draft"
+    assert kwargs["input"] == []
+    assert kwargs["instructions"] == "You are Hermes."
+    assert "You are in a loop. Think hard how to break out." in (
+        kwargs["extra_body"]["hermes_runtime_instructions"]
+    )
+    assert all("INTERNAL CONSCIENCE STOP-GATE" not in str(item) for item in kwargs["input"])
+
+
+def test_stateful_stop_gate_repair_branches_from_rejected_draft_response(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent.conscience_mode = "enforce_observe"
+    agent._conscience_active = True
+    agent.conscience_chat_messages = False
+
+    draft = _codex_message_response("I already did it.")
+    draft.id = "resp_rejected_draft"
+    final = _codex_message_response("Fixed now.")
+    final.id = "resp_fixed"
+    responses = [draft, final]
+    requests = []
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    monkeypatch.setattr(
+        agent,
+        "_conscience_call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_intervene": len(requests) == 1,
+                                "verdict": "block",
+                                "reason": "draft stopped before doing the work",
+                                "evidence": ["only claimed completion"],
+                                "next_best_action": "repair the answer",
+                                "criterion_ids": ["criterion_001"],
+                                "confidence": "high",
+                            }
+                        )
+                    )
+                )
+            ]
+        ),
+    )
+
+    result = agent.run_conversation("Do the work")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Fixed now."
+    assert len(requests) == 2
+    assert requests[0].get("previous_response_id") is None
+    assert requests[1]["previous_response_id"] == "resp_rejected_draft"
+    assert requests[1]["input"] == []
+    assert requests[1]["instructions"] == requests[0]["instructions"]
+    runtime_instructions = requests[1]["extra_body"]["hermes_runtime_instructions"]
+    assert "repair the answer" in runtime_instructions
+    assert "only claimed completion" in runtime_instructions
+    assert all("INTERNAL CONSCIENCE STOP-GATE" not in str(item) for item in requests[1]["input"])
+    assert not any("INTERNAL CONSCIENCE" in str(msg.get("content", "")) for msg in result["messages"])
 
 
 def test_build_api_kwargs_consumes_conscience_tool_narrowing(monkeypatch):
@@ -640,6 +727,85 @@ def test_build_api_kwargs_stateful_custom_followup_uses_previous_response_id(mon
     assert kwargs["input"] == [{"role": "user", "content": "Next"}]
 
 
+def test_stateful_custom_poisoned_resume_retries_full_prompt(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._responses_previous_response_id = "resp_prev"
+    messages = [
+        {"role": "system", "content": "You are Hermes."},
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "Ack", "responses_response_id": "resp_prev"},
+        {"role": "user", "content": "Next"},
+    ]
+
+    first_kwargs = agent._build_api_kwargs(messages)
+    assert first_kwargs["previous_response_id"] == "resp_prev"
+    assert first_kwargs["input"] == [{"role": "user", "content": "Next"}]
+    assert agent._should_reset_stateful_responses_after_error(
+        RuntimeError("Poisoned previous_response_id cache_poisoned: resp_prev")
+    )
+
+    blocked_response_id = agent._active_responses_previous_response_id(first_kwargs)
+    agent._clear_responses_stateful_chain(
+        reason="test_poisoned_previous_response_id",
+        blocked_response_id=blocked_response_id,
+        force_fresh_until_success=True,
+    )
+    retry_kwargs = agent._build_api_kwargs(messages)
+
+    assert "previous_response_id" not in retry_kwargs
+    assert retry_kwargs["input"][0] == {"role": "user", "content": "First"}
+    assert retry_kwargs["input"][-1] == {"role": "user", "content": "Next"}
+
+
+def test_stateful_custom_poisoned_resume_does_not_fall_back_to_older_history_id(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._responses_previous_response_id = "resp_new"
+    messages = [
+        {"role": "system", "content": "You are Hermes."},
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "Old answer", "responses_response_id": "resp_old"},
+        {"role": "user", "content": "Second"},
+        {"role": "assistant", "content": "New answer", "responses_response_id": "resp_new"},
+        {"role": "user", "content": "Third"},
+    ]
+
+    first_kwargs = agent._build_api_kwargs(messages)
+    assert first_kwargs["previous_response_id"] == "resp_new"
+    assert first_kwargs["input"] == [{"role": "user", "content": "Third"}]
+
+    blocked_response_id = agent._active_responses_previous_response_id(first_kwargs)
+    agent._clear_responses_stateful_chain(
+        reason="test_poisoned_previous_response_id",
+        blocked_response_id=blocked_response_id,
+        force_fresh_until_success=True,
+    )
+    retry_kwargs = agent._build_api_kwargs(messages)
+
+    assert "previous_response_id" not in retry_kwargs
+    assert retry_kwargs["input"][0] == {"role": "user", "content": "First"}
+    assert retry_kwargs["input"][-1] == {"role": "user", "content": "Third"}
+    assert agent._responses_force_fresh_until_success is True
+
+    agent._remember_responses_response_id("resp_fresh")
+    assert agent._responses_force_fresh_until_success is False
+
+
+def test_stateful_custom_terminal_stream_failure_preserves_resume_parent(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+
+    assert not agent._should_reset_stateful_responses_after_error(
+        RuntimeError("Responses create(stream=True) fallback did not emit a terminal response.")
+    )
+
+
+def test_stateful_custom_previous_response_poison_resets_resume(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+
+    assert agent._should_reset_stateful_responses_after_error(
+        RuntimeError("Poisoned previous_response_id cache_poisoned: resp_prev")
+    )
+
+
 def test_compress_context_resets_stateful_responses_chain(monkeypatch):
     agent = _build_stateful_custom_agent(monkeypatch)
     agent._session_db = None
@@ -897,6 +1063,197 @@ def test_run_conversation_codex_refreshes_after_401_and_retries(monkeypatch):
     assert result["final_response"] == "Recovered after refresh"
 
 
+def _build_xai_oauth_agent(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="grok-4.3",
+        provider="xai-oauth",
+        api_mode="codex_responses",
+        base_url="https://api.x.ai/v1",
+        api_key="xai-oauth-token",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cleanup_task_resources = lambda task_id: None
+    agent._persist_session = lambda messages, history=None: None
+    agent._save_trajectory = lambda messages, user_message, completed: None
+    agent._save_session_log = lambda messages: None
+    return agent
+
+
+def test_build_api_kwargs_xai_oauth_sends_cache_key_via_extra_body(monkeypatch):
+    """xai-oauth + codex_responses must route prompt caching via the
+    ``prompt_cache_key`` body field on /v1/responses (xAI's documented
+    Responses-API cache key — see docs.x.ai prompt-caching/maximizing-
+    cache-hits).
+
+    We pass it through ``extra_body`` rather than as a top-level kwarg so
+    the body field is serialized into JSON regardless of whether the
+    installed openai SDK build still accepts ``prompt_cache_key`` on
+    ``Responses.stream()``. Older or trimmed SDK builds drop it from the
+    signature and would otherwise raise ``TypeError`` before the request
+    reaches api.x.ai. The ``x-grok-conv-id`` header is retained as a
+    belt-and-braces fallback for clients/proxies that route on headers."""
+    agent = _build_xai_oauth_agent(monkeypatch)
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ]
+    )
+
+    assert kwargs.get("model") == "grok-4.3"
+    # Top-level kwarg must NOT be set — that's the openai SDK
+    # incompatibility this whole indirection exists to dodge.
+    assert "prompt_cache_key" not in kwargs
+    extra_body = kwargs.get("extra_body") or {}
+    assert extra_body.get("prompt_cache_key"), (
+        "xAI prompt-cache routing must travel via extra_body.prompt_cache_key "
+        "for /v1/responses — body field is the documented surface."
+    )
+    headers = kwargs.get("extra_headers") or {}
+    assert "x-grok-conv-id" in headers, (
+        "x-grok-conv-id header kept as belt-and-braces fallback for clients "
+        "that route on headers."
+    )
+
+
+def test_run_conversation_xai_oauth_refreshes_after_401_and_retries(monkeypatch):
+    """xai-oauth speaks the Responses API just like codex.  When the access
+    token is rejected mid-call (401), the same proactive refresh-and-retry
+    handler that fires for openai-codex must also fire for xai-oauth — the
+    bug it caught: the gating condition checked only ``provider == "openai-codex"``,
+    so xai-oauth 401s leaked straight to non-retryable abort path with no
+    chance to swap in a freshly refreshed access token."""
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0, "refresh": 0}
+
+    class _UnauthorizedError(RuntimeError):
+        def __init__(self):
+            super().__init__("Error code: 401 - unauthorized")
+            self.status_code = 401
+
+    def _fake_api_call(api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _UnauthorizedError()
+        return _codex_message_response("Recovered after xAI refresh")
+
+    def _fake_refresh(*, force=True):
+        calls["refresh"] += 1
+        assert force is True
+        return True
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _fake_refresh)
+
+    result = agent.run_conversation("Say OK")
+
+    assert calls["api"] == 2
+    assert calls["refresh"] == 1
+    assert result["completed"] is True
+    assert result["final_response"] == "Recovered after xAI refresh"
+
+
+def test_try_refresh_codex_client_credentials_handles_xai_oauth(monkeypatch):
+    """``_try_refresh_codex_client_credentials`` must rebuild the OpenAI
+    client with freshly resolved xAI OAuth credentials when the active
+    provider is xai-oauth.  The function name is shared between codex and
+    xai-oauth (both speak codex_responses) — covering both cases prevents
+    silent regressions where the function gets gated to a single provider."""
+    agent = _build_xai_oauth_agent(monkeypatch)
+    closed = {"value": False}
+    rebuilt = {"kwargs": None}
+
+    class _ExistingClient:
+        def close(self):
+            closed["value"] = True
+
+    class _RebuiltClient:
+        pass
+
+    def _fake_openai(**kwargs):
+        rebuilt["kwargs"] = kwargs
+        return _RebuiltClient()
+
+    def _fake_resolve(force_refresh=False, refresh_if_expiring=True, **_):
+        # The pre-refresh guard reads the singleton with refresh_if_expiring=False
+        # to verify that the agent's active key still matches; the actual
+        # refresh later passes force_refresh=True.  Both calls must succeed.
+        return {
+            "api_key": "fresh-xai-token" if force_refresh else agent.api_key,
+            "base_url": "https://api.x.ai/v1",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_xai_oauth_runtime_credentials",
+        _fake_resolve,
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", _fake_openai)
+
+    agent.client = _ExistingClient()
+    ok = agent._try_refresh_codex_client_credentials(force=True)
+
+    assert ok is True
+    assert closed["value"] is True
+    assert rebuilt["kwargs"]["api_key"] == "fresh-xai-token"
+    assert rebuilt["kwargs"]["base_url"] == "https://api.x.ai/v1"
+    assert isinstance(agent.client, _RebuiltClient)
+    assert agent.api_key == "fresh-xai-token"
+
+
+def test_try_refresh_codex_client_credentials_skips_xai_oauth_when_singleton_differs(monkeypatch):
+    """An xai-oauth agent constructed with a non-singleton credential
+    (e.g. a manual pool entry whose tokens belong to a different account
+    than the loopback_pkce singleton, or an explicit ``api_key=`` arg)
+    MUST NOT silently adopt the singleton's tokens on a 401 reactive
+    refresh.  Otherwise a 401 mid-conversation would re-route the rest
+    of the conversation onto a different account, with no user feedback.
+
+    The credential pool's reactive recovery is the right channel for
+    pool-managed credentials; this fallback path is for the singleton-
+    only case and must short-circuit when the active key differs."""
+    agent = _build_xai_oauth_agent(monkeypatch)
+    # Agent is using "xai-oauth-token" (per the builder); singleton holds
+    # a *different* account's token.  No force_refresh should fire.
+    refresh_calls = {"count": 0}
+
+    def _fake_resolve(force_refresh=False, refresh_if_expiring=True, **_):
+        if force_refresh:
+            refresh_calls["count"] += 1
+            return {
+                "api_key": "singleton-account-token",
+                "base_url": "https://api.x.ai/v1",
+            }
+        # The pre-refresh guard read — return the singleton's view of the
+        # singleton's token, which is NOT what the agent is currently using.
+        return {
+            "api_key": "singleton-account-token",
+            "base_url": "https://api.x.ai/v1",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_xai_oauth_runtime_credentials",
+        _fake_resolve,
+    )
+
+    pre_refresh_key = agent.api_key
+    ok = agent._try_refresh_codex_client_credentials(force=True)
+
+    assert ok is False, (
+        "must not refresh when the active credential isn't the singleton; "
+        "otherwise the conversation silently swaps accounts mid-flight."
+    )
+    assert refresh_calls["count"] == 0, (
+        "force_refresh must not run — that would mutate the singleton's "
+        "tokens on disk and consume its single-use refresh_token for an "
+        "agent that wasn't even using the singleton."
+    )
+    assert agent.api_key == pre_refresh_key
+
+
 def test_run_conversation_copilot_refreshes_after_401_and_retries(monkeypatch):
     agent = _build_copilot_agent(monkeypatch)
     calls = {"api": 0, "refresh": 0}
@@ -943,12 +1300,18 @@ def test_try_refresh_codex_client_credentials_rebuilds_client(monkeypatch):
         rebuilt["kwargs"] = kwargs
         return _RebuiltClient()
 
+    def _fake_resolve(force_refresh=False, refresh_if_expiring=True, **_):
+        # Pre-refresh guard reads the singleton (refresh_if_expiring=False).
+        # It must report the agent's current api_key so the equality check
+        # passes; only then does the actual force_refresh run.
+        return {
+            "api_key": "new-codex-token" if force_refresh else agent.api_key,
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        }
+
     monkeypatch.setattr(
         "hermes_cli.auth.resolve_codex_runtime_credentials",
-        lambda force_refresh=True: {
-            "api_key": "new-codex-token",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-        },
+        _fake_resolve,
     )
     monkeypatch.setattr(run_agent, "OpenAI", _fake_openai)
 
@@ -2104,9 +2467,8 @@ def test_stateful_empty_after_tools_replays_synthetic_empty_delta(monkeypatch):
         msg for msg in result["messages"]
         if msg.get("role") == "assistant" and msg.get("content") == "(empty)"
     ]
-    assert len(empty_messages) == 1
-    assert empty_messages[0].get("responses_response_id") == "resp_empty"
-    assert not empty_messages[0].get("tool_calls")
+    assert empty_messages == []
+    assert not any(msg.get("_empty_recovery_synthetic") for msg in result["messages"])
     assert requests[1].get("previous_response_id") == "resp_tool"
     assert requests[2].get("previous_response_id") == "resp_tool"
     assert requests[2]["input"][0]["type"] == "function_call_output"

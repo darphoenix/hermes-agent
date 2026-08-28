@@ -23,12 +23,26 @@ def _make_cli_stub():
     cli._approval_state = None
     cli._approval_deadline = 0
     cli._approval_lock = threading.Lock()
+    cli._input_area = None
     cli._sudo_state = None
     cli._sudo_deadline = 0
     cli._modal_input_snapshot = None
+    cli._last_invalidate = 0.0
     cli._invalidate = MagicMock()
     cli._app = SimpleNamespace(invalidate=MagicMock(), current_buffer=_FakeBuffer())
     return cli
+
+
+class _FakeLoop:
+    def __init__(self):
+        self.calls = 0
+
+    def is_running(self):
+        return True
+
+    def call_soon_threadsafe(self, callback):
+        self.calls += 1
+        callback()
 
 
 def _make_background_cli_stub():
@@ -117,6 +131,129 @@ class TestCliApprovalUi:
         cli._approval_state["response_queue"].put("deny")
         thread.join(timeout=2)
         assert result["value"] == "deny"
+
+    def test_approval_callback_prints_scrollback_fallback_notice(self):
+        cli = _make_cli_stub()
+        command = "python3 -c 'print(1)'"
+        result = {}
+        printed = []
+
+        def _run_callback():
+            result["value"] = cli._approval_callback(command, "script execution")
+
+        with patch.object(cli_module, "_cprint", side_effect=printed.append):
+            thread = threading.Thread(target=_run_callback, daemon=True)
+            thread.start()
+
+            deadline = time.time() + 2
+            while cli._approval_state is None and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert cli._approval_state is not None
+            deadline = time.time() + 2
+            while not printed and time.time() < deadline:
+                time.sleep(0.01)
+            assert printed
+            notice = printed[0]
+            assert "APPROVAL REQUIRED" in notice
+            assert "Reason: script execution" in notice
+            assert command in notice
+            assert "1=allow once" in notice
+            assert "4=deny" in notice
+            assert "Press a number" in notice
+
+            cli._approval_state["response_queue"].put("deny")
+            thread.join(timeout=2)
+
+        assert result["value"] == "deny"
+
+    def test_approval_callback_activates_on_prompt_toolkit_loop(self):
+        cli = _make_cli_stub()
+        loop = _FakeLoop()
+        input_area = object()
+        cli._input_area = input_area
+        cli._app = SimpleNamespace(
+            is_running=True,
+            loop=loop,
+            invalidate=MagicMock(),
+            current_buffer=_FakeBuffer("draft interrupt", cursor_position=5),
+            layout=SimpleNamespace(focus=MagicMock()),
+        )
+        result = {}
+        printed = []
+
+        def _run_callback():
+            result["value"] = cli._approval_callback("python3 -c 'print(1)'", "script execution")
+
+        with patch.object(cli_module, "_cprint", side_effect=printed.append):
+            thread = threading.Thread(target=_run_callback, daemon=True)
+            thread.start()
+
+            deadline = time.time() + 2
+            while cli._approval_state is None and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert cli._approval_state is not None
+            assert loop.calls >= 1
+            assert not printed
+            assert cli._app.current_buffer.text == ""
+            cli._app.layout.focus.assert_called_with(input_area)
+
+            cli._approval_state["response_queue"].put("deny")
+            thread.join(timeout=2)
+
+        assert result["value"] == "deny"
+        assert cli._app.current_buffer.text == "draft interrupt"
+        assert cli._app.current_buffer.cursor_position == 5
+
+    def test_approval_selection_restores_existing_draft(self):
+        cli = _make_cli_stub()
+        cli._app.current_buffer = _FakeBuffer("draft command", cursor_position=5)
+        response_queue = queue.Queue()
+        cli._activate_approval_prompt(
+            {
+                "command": "python3 -c 'print(1)'",
+                "description": "script execution",
+                "choices": ["once", "session", "always", "deny"],
+                "selected": 0,
+                "response_queue": response_queue,
+            },
+            time.monotonic() + 60,
+        )
+
+        assert cli._app.current_buffer.text == ""
+        cli._handle_approval_selection()
+
+        assert response_queue.get(timeout=1) == "once"
+        assert cli._approval_state is None
+        assert cli._app.current_buffer.text == "draft command"
+        assert cli._app.current_buffer.cursor_position == 5
+
+    def test_approval_callback_without_tui_uses_timed_stdin_fallback(self):
+        cli = _make_cli_stub()
+        cli._app = None
+
+        with patch("tools.approval.prompt_dangerous_approval", return_value="timeout") as prompt:
+            result = cli._approval_callback("python3 -c 'print(1)'", "script execution")
+
+        assert result == "timeout"
+        prompt.assert_called_once()
+        assert prompt.call_args.kwargs["approval_callback"] is None
+
+    def test_approval_callback_timeout_is_distinct_from_deny(self):
+        cli = _make_cli_stub()
+        result = {}
+
+        def _run_callback():
+            result["value"] = cli._approval_callback("python3 -c 'print(1)'", "script execution")
+
+        with patch.dict(cli_module.CLI_CONFIG, {"approvals": {"timeout": 0}}, clear=False):
+            thread = threading.Thread(target=_run_callback, daemon=True)
+            thread.start()
+            thread.join(timeout=2)
+
+        assert not thread.is_alive()
+        assert result["value"] == "timeout"
 
     def test_handle_approval_selection_view_expands_in_place(self):
         cli = _make_cli_stub()

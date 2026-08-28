@@ -21,6 +21,9 @@ def _bare_agent() -> AIAgent:
     agent._memory_store = object()
     agent._memory_enabled = True
     agent._user_profile_enabled = False
+    agent._cached_system_prompt = "test-cached-system-prompt"
+    import datetime as _dt
+    agent.session_start = _dt.datetime(2026, 1, 1, 12, 0, 0)
     agent._MEMORY_REVIEW_PROMPT = "review memory"
     agent._SKILL_REVIEW_PROMPT = "review skills"
     agent._COMBINED_REVIEW_PROMPT = "review both"
@@ -315,3 +318,124 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
     assert captured_bg_callback[0].startswith("💾 Self-improvement review:"), (
         captured_bg_callback[0]
     )
+
+
+def test_background_review_fork_skips_external_memory_plugins(monkeypatch):
+    """The background review fork must NOT touch external memory plugins.
+
+    Without skip_memory=True on the fork constructor, AIAgent.__init__
+    rebuilds its own _memory_manager from config, scoped to the parent's
+    session_id.  The review fork's run_conversation() then leaks the
+    harness prompt into the user's real memory namespace via three
+    ingestion sites: on_turn_start (cadence + turn message),
+    prefetch_all (recall query), and sync_all (harness prompt + review
+    output recorded as a (user, assistant) turn pair).  The fix is a
+    single kwarg on the fork constructor — this test guards it.
+    """
+    captured_kwargs: dict = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            pass
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    assert captured_kwargs.get("skip_memory") is True, (
+        "Background review fork must be constructed with skip_memory=True "
+        "so AIAgent.__init__ does not rebuild a _memory_manager wired to "
+        "external plugins (honcho, mem0, supermemory, ...).  Without this "
+        "the fork leaks harness prompts into the user's real memory "
+        "namespace via on_turn_start / prefetch_all / sync_all."
+    )
+
+
+def test_background_review_bounds_large_snapshots_without_skipping(monkeypatch):
+    events = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            events.append(("init", kwargs))
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            events.append(("run_conversation", kwargs))
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("HERMES_BACKGROUND_REVIEW_MAX_SNAPSHOT_TOKENS", "8")
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "x" * 10000}],
+        review_memory=True,
+    )
+
+    assert [name for name, _payload in events] == ["init", "run_conversation"]
+    run_kwargs = events[1][1]
+    history = run_kwargs["conversation_history"]
+    assert history[0]["role"] == "system"
+    assert "bounded recent snapshot" in history[0]["content"]
+    assert len(history[-1]["content"]) < 10000
+
+
+def test_background_review_skips_while_foreground_active(monkeypatch):
+    from hermes_cli.background_runtime import begin_foreground_activity, end_foreground_activity
+
+    events = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            events.append(("init", kwargs))
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            events.append(("run_conversation", kwargs))
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    token = begin_foreground_activity(session_id="foreground", platform="cli")
+    try:
+        AIAgent._spawn_background_review(
+            agent,
+            messages_snapshot=[{"role": "user", "content": "hello"}],
+            review_memory=True,
+        )
+    finally:
+        end_foreground_activity(token)
+
+    assert events == []

@@ -755,7 +755,7 @@ def _preflight_codex_api_kwargs(
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
-        "previous_response_id", "extra_headers",
+        "previous_response_id", "extra_headers", "extra_body",
     }
     normalized: Dict[str, Any] = {
         "model": model,
@@ -810,6 +810,12 @@ def _preflight_codex_api_kwargs(
             normalized_headers[key.strip()] = str(value)
         if normalized_headers:
             normalized["extra_headers"] = normalized_headers
+
+    extra_body = api_kwargs.get("extra_body")
+    if extra_body is not None:
+        if not isinstance(extra_body, dict):
+            raise ValueError("Codex Responses request 'extra_body' must be an object.")
+        normalized["extra_body"] = dict(extra_body)
 
     if allow_stream:
         stream = api_kwargs.get("stream")

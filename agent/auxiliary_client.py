@@ -621,6 +621,7 @@ class _CodexCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
+        parent_interrupt_thread_id = kwargs.pop("__interrupt_thread_id", None)
 
         # Separate system/instructions from conversation messages.
         # Convert chat.completions multimodal content blocks to Responses
@@ -743,7 +744,10 @@ class _CodexCompletionsAdapter:
                 raise TimeoutError(_timeout_message())
             try:
                 from tools.interrupt import is_interrupted
-                if is_interrupted():
+                if is_interrupted() or (
+                    parent_interrupt_thread_id is not None
+                    and is_interrupted(parent_interrupt_thread_id)
+                ):
                     raise InterruptedError("Codex auxiliary Responses stream interrupted")
             except InterruptedError:
                 raise
@@ -903,6 +907,9 @@ class _AsyncCodexCompletionsAdapter:
 
     async def create(self, **kwargs) -> Any:
         import asyncio
+        caller_thread_id = threading.current_thread().ident
+        if caller_thread_id is not None:
+            kwargs.setdefault("__interrupt_thread_id", caller_thread_id)
         return await asyncio.to_thread(self._sync.create, **kwargs)
 
 

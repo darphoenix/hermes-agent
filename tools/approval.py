@@ -19,7 +19,7 @@ import unicodedata
 from typing import Optional
 from hermes_cli.config import cfg_get
 
-from utils import is_truthy_value
+from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -108,9 +108,9 @@ def _is_gateway_approval_context() -> bool:
     fall through to the gateway branch would submit a pending approval
     with no listener and block the job indefinitely.
     """
-    if os.getenv("HERMES_CRON_SESSION"):
+    if env_var_enabled("HERMES_CRON_SESSION"):
         return False
-    if os.getenv("HERMES_GATEWAY_SESSION"):
+    if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return True
     return bool(_get_session_platform())
 
@@ -133,8 +133,19 @@ _CREDENTIAL_FILES = (
     r'(?:~|\$home|\$\{home\})/\.'
     r'(?:netrc|pgpass|npmrc|pypirc)\b'
 )
+# macOS: /etc, /var, /tmp, /home are symlinks to /private/{etc,var,tmp,home}.
+# A command written to target /private/etc/sudoers works identically to
+# /etc/sudoers on macOS but bypasses a plain "/etc/" pattern check. Match
+# both forms. Inspired by Claude Code 2.1.113's "dangerous path protection".
+_MACOS_PRIVATE_SYSTEM_PATH = r'/private/(?:etc|var|tmp|home)/'
+# System-config paths that should trigger approval for any write/edit,
+# collapsing /etc, its macOS /private/etc mirror, and /etc/sudoers.d/ into
+# one shared fragment so new DANGEROUS_PATTERNS stay consistent.
+_SYSTEM_CONFIG_PATH = (
+    rf'(?:/etc/|{_MACOS_PRIVATE_SYSTEM_PATH})'
+)
 _SENSITIVE_WRITE_TARGET = (
-    r'(?:/etc/|/dev/sd|'
+    rf'(?:{_SYSTEM_CONFIG_PATH}|/dev/sd|'
     rf'{_SSH_SENSITIVE_PATH}|'
     rf'{_HERMES_ENV_PATH}|'
     rf'{_SHELL_RC_FILES}|'
@@ -314,12 +325,21 @@ DANGEROUS_PATTERNS = [
     (r'\bdd\s+.*if=', "disk copy"),
     (r'>\s*/dev/sd', "write to block device"),
     (r'\bDROP\s+(TABLE|DATABASE)\b', "SQL DROP"),
-    (r'\bDELETE\s+FROM\b(?!.*\bWHERE\b)', "SQL DELETE without WHERE"),
+    # Use [^\n]* instead of .* so DOTALL mode does not cause a WHERE clause on the
+    # *next* line to satisfy the negative lookahead, silently allowing DELETE without WHERE.
+    (r'\bDELETE\s+FROM\b(?![^\n]*\bWHERE\b)', "SQL DELETE without WHERE"),
     (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
-    (r'>\s*/etc/', "overwrite system config"),
+    (rf'>\s*{_SYSTEM_CONFIG_PATH}', "overwrite system config"),
     (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
+    # killall with SIGKILL (parallel to pkill -9). Catches -9 / -KILL /
+    # -s KILL / -SIGKILL forms, and also `killall -r <regex>` broad sweeps
+    # that can wipe out unrelated processes by accident.
+    # Inspired by Claude Code 2.1.113 expanded deny rules.
+    (r'\bkillall\s+(-[^\s]*\s+)*-(9|KILL|SIGKILL)\b', "force kill processes (killall -KILL)"),
+    (r'\bkillall\s+(-[^\s]*\s+)*-s\s+(KILL|SIGKILL|9)\b', "force kill processes (killall -s KILL)"),
+    (r'\bkillall\s+(-[^\s]*\s+)*-r\b', "kill processes by regex (killall -r)"),
     (r':\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:', "fork bomb"),
     # Any shell invocation via -c or combined flags like -lc, -ic, etc.
     (r'\b(bash|sh|zsh|ksh)\s+-[^\s]*c(\s+|$)', "shell command via -c/-lc flag"),
@@ -331,7 +351,11 @@ DANGEROUS_PATTERNS = [
     (rf'\btee\b.*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config via tee"),
     (rf'>>?\s*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config via redirection"),
     (r'\bxargs\s+.*\brm\b', "xargs with rm"),
-    (r'\bfind\b.*-exec\s+(/\S*/)?rm\b', "find -exec rm"),
+    # find -exec rm / -execdir rm — the -execdir variant (same semantics,
+    # runs in the directory of each match) was previously missed. Claude
+    # Code 2.1.113 tightened their equivalent find rule to stop auto-
+    # approving -exec / -delete flags.
+    (r'\bfind\b.*-exec(?:dir)?\s+(/\S*/)?rm\b', "find -exec/-execdir rm"),
     (r'\bfind\b.*-delete\b', "find -delete"),
     # Gateway lifecycle protection: prevent the agent from killing its own
     # gateway process.  These commands trigger a gateway restart/stop that
@@ -349,11 +373,12 @@ DANGEROUS_PATTERNS = [
     # to regex at detection time. Catch the structural pattern instead.
     (r'\bkill\b.*\$\(\s*pgrep\b', "kill process via pgrep expansion (self-termination)"),
     (r'\bkill\b.*`\s*pgrep\b', "kill process via backtick pgrep expansion (self-termination)"),
-    # File copy/move/edit into sensitive system paths
-    (r'\b(cp|mv|install)\b.*\s/etc/', "copy/move file into /etc/"),
+    # File copy/move/edit into sensitive system paths (/etc/ and macOS
+    # /private/etc/ mirror).
+    (rf'\b(cp|mv|install)\b.*\s{_SYSTEM_CONFIG_PATH}', "copy/move file into system config path"),
     (rf'\b(cp|mv|install)\b.*\s["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config file"),
-    (r'\bsed\s+-[^\s]*i.*\s/etc/', "in-place edit of system config"),
-    (r'\bsed\s+--in-place\b.*\s/etc/', "in-place edit of system config (long flag)"),
+    (rf'\bsed\s+-[^\s]*i.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config"),
+    (rf'\bsed\s+--in-place\b.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config (long flag)"),
     # Script execution via heredoc — bypasses the -e/-c flag patterns above.
     # `python3 << 'EOF'` feeds arbitrary code via stdin without -c/-e flags.
     (r'\b(python[23]?|perl|ruby|node)\s+<<', "script execution via heredoc"),
@@ -684,7 +709,8 @@ def prompt_dangerous_approval(command: str, description: str,
             prompt_toolkit integration. Signature:
             (command, description, *, allow_permanent=True) -> str.
 
-    Returns: 'once', 'session', 'always', or 'deny'
+    Returns: 'once', 'session', 'always', 'deny', 'timeout', or
+        'approval_unavailable'.  Only 'deny' means an explicit user rejection.
     """
     if timeout_seconds is None:
         timeout_seconds = _get_approval_timeout()
@@ -695,7 +721,7 @@ def prompt_dangerous_approval(command: str, description: str,
                                      allow_permanent=allow_permanent)
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
-            return "deny"
+            return "approval_unavailable"
 
     # Fail-closed guard: if prompt_toolkit owns the terminal (interactive
     # CLI session) and no approval callback is registered on this thread,
@@ -713,11 +739,11 @@ def prompt_dangerous_approval(command: str, description: str,
         if get_app_or_none() is not None:
             logger.warning(
                 "Dangerous-command approval requested on a thread with no "
-                "approval callback while prompt_toolkit is active; denying "
-                "to avoid stdin deadlock. command=%r description=%r",
+                "approval callback while prompt_toolkit is active; failing "
+                "closed to avoid stdin deadlock. command=%r description=%r",
                 command, description,
             )
-            return "deny"
+            return "approval_unavailable"
     except Exception:
         # prompt_toolkit not installed, or detection failed -- fall through
         # to the legacy input() path (safe in non-TUI contexts: scripts,
@@ -741,14 +767,15 @@ def prompt_dangerous_approval(command: str, description: str,
             print()
             sys.stdout.flush()
 
-            result = {"choice": ""}
+            result = {"choice": "", "read_error": None}
 
             def get_input():
                 try:
                     prompt = t("approval.prompt_long") if allow_permanent else t("approval.prompt_short")
                     result["choice"] = input(prompt).strip().lower()
-                except (EOFError, OSError):
+                except (EOFError, OSError) as exc:
                     result["choice"] = ""
+                    result["read_error"] = exc
 
             thread = threading.Thread(target=get_input, daemon=True)
             thread.start()
@@ -756,9 +783,19 @@ def prompt_dangerous_approval(command: str, description: str,
 
             if thread.is_alive():
                 print("\n" + t("approval.timeout"))
-                return "deny"
+                logger.warning(
+                    "Dangerous-command approval timed out after %ss. command=%r description=%r",
+                    timeout_seconds, command, description,
+                )
+                return "timeout"
 
             choice = result["choice"]
+            if result.get("read_error") is not None:
+                logger.warning(
+                    "Dangerous-command approval unavailable (%s). command=%r description=%r",
+                    result["read_error"], command, description,
+                )
+                return "approval_unavailable"
             if choice in {'o', 'once'}:
                 print(t("approval.allowed_once"))
                 return "once"
@@ -783,6 +820,35 @@ def prompt_dangerous_approval(command: str, description: str,
             del os.environ["HERMES_SPINNER_PAUSE"]
         print()
         sys.stdout.flush()
+
+
+def _approval_block_message(choice: str | None, description: str) -> tuple[str, str]:
+    """Return (normalized_outcome, model-facing block message)."""
+    outcome = (choice or "timeout").strip().lower()
+    if outcome == "timeout":
+        return (
+            "timeout",
+            "BLOCKED: Approval timed out/no response. Do NOT retry this command "
+            "unless the user explicitly asks you to continue.",
+        )
+    if outcome in {"approval_unavailable", "callback_error", "callback_missing"}:
+        return (
+            "approval_unavailable",
+            "BLOCKED: Approval UI unavailable; command was not approved. "
+            "Do NOT retry this command unless the user explicitly approves it.",
+        )
+    if outcome == "deny":
+        return (
+            "deny",
+            f"BLOCKED: User denied this potentially dangerous command "
+            f"(matched '{description}' pattern). Do NOT retry this command - "
+            "the user has explicitly rejected it.",
+        )
+    return (
+        outcome,
+        "BLOCKED: Command was not approved. Do NOT retry this command unless "
+        "the user explicitly approves it.",
+    )
 
 
 def _normalize_approval_mode(mode) -> str:
@@ -926,12 +992,12 @@ def check_dangerous_command(command: str, env_type: str,
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
-    is_cli = os.getenv("HERMES_INTERACTIVE")
+    is_cli = env_var_enabled("HERMES_INTERACTIVE")
     is_gateway = _is_gateway_approval_context()
 
     if not is_cli and not is_gateway:
         # Cron sessions: respect cron_mode config
-        if os.getenv("HERMES_CRON_SESSION"):
+        if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
                 return {
                     "approved": False,
@@ -945,7 +1011,7 @@ def check_dangerous_command(command: str, env_type: str,
                 }
         return {"approved": True, "message": None}
 
-    if is_gateway or os.getenv("HERMES_EXEC_ASK"):
+    if is_gateway or env_var_enabled("HERMES_EXEC_ASK"):
         submit_pending(session_key, {
             "command": command,
             "pattern_key": pattern_key,
@@ -966,12 +1032,18 @@ def check_dangerous_command(command: str, env_type: str,
     choice = prompt_dangerous_approval(command, description,
                                        approval_callback=approval_callback)
 
-    if choice == "deny":
+    if choice in {"deny", "timeout", "approval_unavailable", "callback_error", "callback_missing", None}:
+        outcome, message = _approval_block_message(choice, description)
+        logger.warning(
+            "Dangerous-command approval blocked: outcome=%s command=%r description=%r",
+            outcome, command, description,
+        )
         return {
             "approved": False,
-            "message": f"BLOCKED: User denied this potentially dangerous command (matched '{description}' pattern). Do NOT retry this command - the user has explicitly rejected it.",
+            "message": message,
             "pattern_key": pattern_key,
             "description": description,
+            "approval_outcome": outcome,
         }
 
     if choice == "session":
@@ -1054,15 +1126,15 @@ def check_all_command_guards(command: str, env_type: str,
     if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
 
-    is_cli = os.getenv("HERMES_INTERACTIVE")
+    is_cli = env_var_enabled("HERMES_INTERACTIVE")
     is_gateway = _is_gateway_approval_context()
-    is_ask = os.getenv("HERMES_EXEC_ASK")
+    is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
         # Cron sessions: respect cron_mode config
-        if os.getenv("HERMES_CRON_SESSION"):
+        if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
@@ -1275,11 +1347,17 @@ def check_all_command_guards(command: str, env_type: str,
 
             if not resolved or choice is None or choice == "deny":
                 reason = "timed out" if not resolved else "denied by user"
+                outcome = "timeout" if not resolved or choice is None else "deny"
+                logger.warning(
+                    "Gateway approval blocked: outcome=%s command=%r description=%r",
+                    outcome, command, combined_desc,
+                )
                 return {
                     "approved": False,
                     "message": f"BLOCKED: Command {reason}. Do NOT retry this command.",
                     "pattern_key": primary_key,
                     "description": combined_desc,
+                    "approval_outcome": outcome,
                 }
 
             # User approved — persist based on scope (same logic as CLI)
@@ -1307,7 +1385,8 @@ def check_all_command_guards(command: str, env_type: str,
         return {
             "approved": False,
             "pattern_key": primary_key,
-            "status": "approval_required",
+            "status": "pending_approval",
+            "approval_pending": True,
             "command": command,
             "description": combined_desc,
             "message": (
@@ -1340,12 +1419,18 @@ def check_all_command_guards(command: str, env_type: str,
         choice=choice,
     )
 
-    if choice == "deny":
+    if choice in {"deny", "timeout", "approval_unavailable", "callback_error", "callback_missing", None}:
+        outcome, message = _approval_block_message(choice, combined_desc)
+        logger.warning(
+            "CLI approval blocked: outcome=%s command=%r description=%r",
+            outcome, command, combined_desc,
+        )
         return {
             "approved": False,
-            "message": "BLOCKED: User denied. Do NOT retry.",
+            "message": message,
             "pattern_key": primary_key,
             "description": combined_desc,
+            "approval_outcome": outcome,
         }
 
     # Persist approval for each warning individually

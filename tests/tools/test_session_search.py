@@ -400,6 +400,34 @@ class TestSessionSearch:
         assert result["sessions_searched"] == 1
         assert current_sid not in [r.get("session_id") for r in result.get("results", [])]
 
+    def test_interrupt_stops_summarization_without_retries(self):
+        """User interrupts should cancel session_search instead of retrying aux calls."""
+        from unittest.mock import AsyncMock, MagicMock, patch as _patch
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        sid = "20260303_100000_def456"
+        mock_db.search_messages.return_value = [
+            {"session_id": sid, "content": "match", "source": "cli",
+             "session_started": 1709400000, "model": "test"},
+        ]
+        mock_db.get_session.return_value = {"parent_session_id": None}
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+
+        with _patch(
+            "tools.session_search_tool.async_call_llm",
+            new_callable=AsyncMock,
+            side_effect=InterruptedError("interrupted"),
+        ) as mock_aux:
+            result = json.loads(session_search(query="test", db=mock_db))
+
+        assert result["success"] is False
+        assert result["interrupted"] is True
+        assert mock_aux.await_count == 1
+
     def test_current_child_session_excludes_parent_lineage(self):
         """Compression/delegation parents should be excluded for the active child session."""
         from unittest.mock import MagicMock

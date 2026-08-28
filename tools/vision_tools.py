@@ -460,6 +460,23 @@ def _supports_media_in_tool_results(provider: str, model: str) -> bool:
     if p in {"openai", "openai-chat", "openai-codex", "azure-openai"}:
         return True
 
+    # Local/custom providers are not intrinsically multimodal. Allow native
+    # image tool-results only when the local config explicitly opts in.
+    if p == "custom":
+        try:
+            from agent.image_routing import decide_image_input_mode
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else {}
+            if not isinstance(agent_cfg, dict):
+                return False
+            if not bool(agent_cfg.get("custom_native_vision_tool_results", False)):
+                return False
+            return decide_image_input_mode(provider, model, cfg) == "native"
+        except Exception:
+            return False
+
     # Gemini — gate on model name; older Gemini variants did not support
     # multimodal functionResponse. Gemini 3.x does.
     if p in {"google", "gemini", "google-gemini", "google-vertex-gemini"}:

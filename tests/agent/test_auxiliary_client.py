@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import asyncio
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +29,7 @@ from agent.auxiliary_client import (
     _try_payment_fallback,
     _resolve_auto,
     _CodexCompletionsAdapter,
+    _AsyncCodexCompletionsAdapter,
 )
 
 
@@ -219,6 +222,67 @@ class TestReadCodexAccessToken:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         result = _read_codex_access_token()
         assert result == "plain-token-no-jwt"
+
+
+class TestAsyncCodexInterruptPropagation:
+    @pytest.mark.asyncio
+    async def test_to_thread_responses_stream_sees_parent_interrupt(self):
+        class SlowStream:
+            def __init__(self):
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.closed = True
+                return False
+
+            def __iter__(self):
+                for _ in range(200):
+                    time.sleep(0.01)
+                    yield SimpleNamespace(type="response.output_text.delta", delta="")
+
+            def get_final_response(self):
+                return SimpleNamespace(output=[], usage=None)
+
+        class FakeResponses:
+            def __init__(self):
+                self.stream_obj = None
+
+            def stream(self, **_kwargs):
+                self.stream_obj = SlowStream()
+                return self.stream_obj
+
+        class FakeClient:
+            def __init__(self):
+                self.responses = FakeResponses()
+
+            def close(self):
+                pass
+
+        from tools.interrupt import set_interrupt
+
+        fake_client = FakeClient()
+        sync = _CodexCompletionsAdapter(fake_client, "test-model")
+        async_adapter = _AsyncCodexCompletionsAdapter(sync)
+        parent_tid = threading.current_thread().ident
+        task = asyncio.create_task(
+            async_adapter.create(
+                model="test-model",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+        )
+        try:
+            await asyncio.sleep(0.05)
+            set_interrupt(True, parent_tid)
+            with pytest.raises(InterruptedError):
+                await asyncio.wait_for(task, timeout=2)
+        finally:
+            set_interrupt(False, parent_tid)
+
+        assert fake_client.responses.stream_obj is not None
+        assert fake_client.responses.stream_obj.closed is True
 
 
 class TestAnthropicOAuthFlag:

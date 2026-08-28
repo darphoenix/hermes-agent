@@ -209,6 +209,41 @@ class TestTakeCheckpoint:
     def test_skip_home_dir(self, mgr):
         assert mgr.ensure_checkpoint(str(Path.home()), "home") is False
 
+    def test_skip_unmapped_docker_workdir_before_git(self, mgr, monkeypatch, caplog):
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false")
+        mgr._git_available = True
+
+        def fail_take(_working_dir, _reason):
+            raise AssertionError("unmapped container paths must not reach git")
+
+        monkeypatch.setattr(mgr, "_take", fail_take)
+        with caplog.at_level(logging.DEBUG):
+            assert mgr.ensure_checkpoint("/workdir", "before write_file") is False
+
+        assert "unmapped docker working directory (/workdir)" in caplog.text
+        assert "Git command skipped" not in caplog.text
+
+    def test_docker_workspace_checkpoint_maps_to_host_mount(self, mgr, tmp_path, monkeypatch):
+        host_cwd = tmp_path / "host"
+        mounted_subdir = host_cwd / "project"
+        mounted_subdir.mkdir(parents=True)
+        (mounted_subdir / "main.py").write_text("print('ok')\n")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+        monkeypatch.setenv("TERMINAL_CWD", str(host_cwd))
+        mgr._git_available = True
+        calls = []
+
+        def fake_take(working_dir, reason):
+            calls.append((working_dir, reason))
+            return True
+
+        monkeypatch.setattr(mgr, "_take", fake_take)
+
+        assert mgr.ensure_checkpoint("/workspace/project", "before write_file") is True
+        assert calls == [(str(mounted_subdir.resolve()), "before write_file")]
+
     def test_multiple_projects_share_store(self, mgr, tmp_path):
         """Two projects commit to the SAME shared store (dedup wins)."""
         a = tmp_path / "proj-a"

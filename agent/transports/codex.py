@@ -148,6 +148,21 @@ class ResponsesApiTransport(ProviderTransport):
         if request_overrides:
             kwargs.update(request_overrides)
 
+        runtime_instructions = str(params.get("runtime_instructions") or "").strip()
+        if runtime_instructions:
+            extra_body = kwargs.get("extra_body")
+            merged_extra_body = dict(extra_body) if isinstance(extra_body, dict) else {}
+            merged_extra_body["hermes_runtime_instructions"] = runtime_instructions
+            kwargs["extra_body"] = merged_extra_body
+
+        if is_xai_responses:
+            prompt_cache_key = kwargs.pop("prompt_cache_key", None)
+            if prompt_cache_key:
+                extra_body = kwargs.get("extra_body")
+                merged_extra_body = dict(extra_body) if isinstance(extra_body, dict) else {}
+                merged_extra_body["prompt_cache_key"] = prompt_cache_key
+                kwargs["extra_body"] = merged_extra_body
+
         if is_codex_backend:
             prompt_cache_key = kwargs.get("prompt_cache_key")
             cache_scope_id = str(prompt_cache_key or session_id or "").strip()

@@ -766,6 +766,45 @@ class TestHasStreamConsumers:
 class TestCodexStreamCallbacks:
     """Verify _run_codex_stream fires delta callbacks."""
 
+    def test_repetition_watchdog_triggers_on_repeated_paragraphs(self):
+        from run_agent import _StreamingRepetitionWatchdog
+
+        watchdog = _StreamingRepetitionWatchdog(
+            min_chars=1000,
+            window_chars=1024,
+            check_every_chars=128,
+            confirm_hits=2,
+        )
+        repeated_line = "The model is stuck repeating this same paragraph with no new information.\n"
+        snapshot = None
+        for _ in range(40):
+            snapshot = watchdog.observe(repeated_line * 2) or snapshot
+
+        assert snapshot is not None
+        assert snapshot["reason"] in {"repeated_lines", "repeated_ngrams", "compression_plus_repetition"}
+        assert snapshot["output_chars"] >= 1000
+
+    def test_repetition_watchdog_ignores_diverse_long_output(self):
+        import hashlib
+        from run_agent import _StreamingRepetitionWatchdog
+
+        watchdog = _StreamingRepetitionWatchdog(
+            min_chars=1000,
+            window_chars=2048,
+            check_every_chars=128,
+            confirm_hits=2,
+        )
+        snapshot = None
+        for index in range(160):
+            digest = hashlib.sha256(f"unique-row-{index}".encode()).hexdigest()
+            chunk = (
+                f"{index}: {digest[:16]} connects a different observation "
+                f"to a different consequence {digest[16:32]}.\n"
+            )
+            snapshot = watchdog.observe(chunk) or snapshot
+
+        assert snapshot is None
+
     def test_codex_text_delta_fires_callback(self):
         from run_agent import AIAgent
 
@@ -810,6 +849,44 @@ class TestCodexStreamCallbacks:
 
         response = agent._run_codex_stream({}, client=mock_client)
         assert "Hello from Codex!" in deltas
+
+    def test_codex_stream_aborts_runaway_repeated_output(self):
+        from run_agent import AIAgent
+
+        deltas = []
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=lambda text: deltas.append(text),
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        repeated_line = "The model is stuck repeating this same paragraph with no new information.\n"
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta=repeated_line * 8)
+            for _ in range(30)
+        ]
+
+        mock_stream = MagicMock()
+        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__exit__ = MagicMock(return_value=False)
+        mock_stream.__iter__ = MagicMock(return_value=iter(events))
+        mock_stream.get_final_response.return_value = SimpleNamespace(output=[], status="completed")
+
+        mock_client = MagicMock()
+        mock_client.responses.stream.return_value = mock_stream
+
+        response = agent._run_codex_stream({}, client=mock_client)
+
+        assert response.hermes_runaway_output_detected is True
+        assert "repeating output" in response.output_text
+        assert mock_stream.get_final_response.call_count == 0
+        assert len(deltas) < len(events)
 
     def test_codex_stream_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
@@ -944,6 +1021,43 @@ class TestCodexStreamCallbacks:
         )
 
         assert touch_calls.count("receiving stream response") == len(events)
+
+    def test_codex_create_stream_fallback_surfaces_error_event(self):
+        from run_agent import AIAgent, _StreamErrorEvent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+
+        class _FakeCreateStream:
+            def __iter__(self_inner):
+                return iter([
+                    {
+                        "type": "error",
+                        "message": "branch_poisoned stream failed",
+                        "code": "stream_failed",
+                    }
+                ])
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _FakeCreateStream()
+
+        with pytest.raises(_StreamErrorEvent, match="branch_poisoned stream failed") as raised:
+            agent._run_codex_create_stream_fallback(
+                {"model": "test/model", "instructions": "hi", "input": []},
+                client=mock_client,
+            )
+
+        assert raised.value.code == "stream_failed"
 
 
 class TestAnthropicStreamCallbacks:
@@ -1504,4 +1618,3 @@ class TestCopilotACPStreamingDecision:
             _use_streaming = False
 
         assert _use_streaming is True
-
