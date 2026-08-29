@@ -10889,6 +10889,11 @@ class AIAgent:
                 "stateful_input": stateful_input,
                 "previous_response_id": previous_response_id,
             }
+            if stateful_responses and is_local_endpoint(self.base_url):
+                _codex_kwargs_params["metadata"] = {
+                    "hermes_cache_role": "actor",
+                    "hermes_cache_scope": str(getattr(self, "session_id", None) or "hermes"),
+                }
             if _codex_instructions is not None:
                 _codex_kwargs_params["instructions"] = _codex_instructions
             if _codex_runtime_instructions:
@@ -12511,6 +12516,10 @@ class AIAgent:
                         ],
                         "store": store_response,
                         "max_output_tokens": max_tokens,
+                        "metadata": {
+                            "hermes_cache_role": "conscience",
+                            "hermes_cache_scope": str(stateful_payload.get("thread_id") or "conscience"),
+                        },
                     }
                     if temperature is not None:
                         request_kwargs["temperature"] = temperature

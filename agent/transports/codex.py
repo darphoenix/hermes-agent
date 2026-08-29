@@ -111,6 +111,10 @@ class ResponsesApiTransport(ProviderTransport):
             "store": stateful_responses,
         }
 
+        metadata = params.get("metadata")
+        if isinstance(metadata, dict) and metadata:
+            kwargs["metadata"] = dict(metadata)
+
         session_id = params.get("session_id")
         if (
             stateful_responses

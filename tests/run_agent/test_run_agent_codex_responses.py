@@ -706,6 +706,7 @@ def test_build_api_kwargs_stateful_custom_initial_request(monkeypatch):
     assert "previous_response_id" not in kwargs
     assert "prompt_cache_key" not in kwargs
     assert kwargs["input"] == [{"role": "user", "content": "Ping"}]
+    assert kwargs["metadata"]["hermes_cache_role"] == "actor"
 
 
 def test_build_api_kwargs_stateful_custom_followup_uses_previous_response_id(monkeypatch):
@@ -725,6 +726,7 @@ def test_build_api_kwargs_stateful_custom_followup_uses_previous_response_id(mon
     assert kwargs["parallel_tool_calls"] is False
     assert kwargs["previous_response_id"] == "resp_prev"
     assert kwargs["input"] == [{"role": "user", "content": "Next"}]
+    assert kwargs["metadata"]["hermes_cache_role"] == "actor"
 
 
 def test_stateful_custom_poisoned_resume_retries_full_prompt(monkeypatch):

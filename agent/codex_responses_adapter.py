@@ -755,7 +755,7 @@ def _preflight_codex_api_kwargs(
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
-        "previous_response_id", "extra_headers", "extra_body",
+        "previous_response_id", "metadata", "extra_headers", "extra_body",
     }
     normalized: Dict[str, Any] = {
         "model": model,
@@ -782,6 +782,12 @@ def _preflight_codex_api_kwargs(
     service_tier = api_kwargs.get("service_tier")
     if isinstance(service_tier, str) and service_tier.strip():
         normalized["service_tier"] = service_tier.strip()
+
+    metadata = api_kwargs.get("metadata")
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            raise ValueError("Codex Responses request 'metadata' must be an object.")
+        normalized["metadata"] = dict(metadata)
 
     # Pass through max_output_tokens and temperature
     max_output_tokens = api_kwargs.get("max_output_tokens")
