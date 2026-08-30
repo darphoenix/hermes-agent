@@ -421,6 +421,7 @@ from agent.conscience import (
     PLAN_SUMMARY,
     TASK_START,
     TOOL_CALL,
+    TOOL_PROGRESS,
     TOOL_RESULT,
     ConscienceMonitor,
     ConscienceVerdict,
@@ -2192,6 +2193,20 @@ class AIAgent:
             self.conscience_tool_narrowing_turns = 4
         if self.conscience_tool_narrowing_turns < 0:
             self.conscience_tool_narrowing_turns = 0
+        try:
+            self.conscience_tool_progress_seconds = max(
+                0.0,
+                float(agent_config.get("conscience_tool_progress_seconds", 60) or 0),
+            )
+        except Exception:
+            self.conscience_tool_progress_seconds = 60.0
+        try:
+            self.conscience_tool_progress_interval_seconds = max(
+                10.0,
+                float(agent_config.get("conscience_tool_progress_interval_seconds", 120) or 120),
+            )
+        except Exception:
+            self.conscience_tool_progress_interval_seconds = 120.0
         _conscience_effort = str(agent_config.get("conscience_reasoning_effort", "medium") or "medium").strip().lower()
         if _conscience_effort not in {"none", "low", "medium", "high", "xhigh"}:
             _conscience_effort = "medium"
@@ -2215,6 +2230,7 @@ class AIAgent:
         self._conscience_repair_turns_remaining = 0
         self._conscience_repair_override_active = False
         self._pending_conscience_internal_messages: list[dict[str, Any]] = []
+        self._deferred_conscience_visible_messages: list[str] = []
         self._active_conscience_internal_messages: list[dict[str, Any]] = []
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
@@ -12697,7 +12713,7 @@ class AIAgent:
             logger.debug("Failed to persist conscience artifacts: %s", exc)
             return monitor.to_artifacts()
 
-    def _handle_midtask_conscience_intervention(self, messages: list) -> bool:
+    def _handle_midtask_conscience_intervention(self, messages: list, *, defer_visible: bool = False) -> bool:
         monitor = getattr(self, "_conscience_current_monitor", None)
         if not monitor:
             return False
@@ -12733,16 +12749,65 @@ class AIAgent:
 
         visible_message = self._format_conscience_visible_message(verdict.critique_ticket)
         if self.conscience_mode in {"observe", "enforce_observe"}:
-            self._append_visible_conscience_message(
-                messages,
-                visible_message,
-                persist=not self.conscience_chat_messages,
-            )
+            if defer_visible and not self.conscience_chat_messages:
+                self._deferred_conscience_visible_messages.append(visible_message)
+            else:
+                self._append_visible_conscience_message(
+                    messages,
+                    visible_message,
+                    persist=not self.conscience_chat_messages,
+                )
 
         if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
             self._prepare_conscience_tool_narrowing(verdict.critique_ticket)
             self._queue_conscience_internal_message("MIDTASK", verdict.critique_ticket)
         return True
+
+    def _conscience_review_running_tool(
+        self,
+        *,
+        messages: list,
+        tool_name: str,
+        tool_args: dict,
+        progress: dict,
+    ) -> bool:
+        """Audit a still-running foreground tool and return whether to cancel it."""
+        monitor = getattr(self, "_conscience_current_monitor", None)
+        if not monitor:
+            return False
+        self._conscience_record_event(
+            TOOL_PROGRESS,
+            {
+                "tool_name": tool_name,
+                "tool_args": asdict_safe(tool_args),
+                "elapsed_seconds": progress.get("elapsed_seconds"),
+                "pid": progress.get("pid"),
+                "output_chars": progress.get("output_chars", 0),
+                "output_preview": progress.get("output_preview", ""),
+            },
+        )
+        intervened = self._handle_midtask_conscience_intervention(messages, defer_visible=True)
+        ticket = self._conscience_last_ticket if intervened else None
+        decision = str(getattr(ticket, "active_tool_decision", None) or "").strip().lower()
+        should_cancel = (
+            decision == "cancel"
+            and self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}
+        )
+        logger.info(
+            "Conscience long-tool review tool=%s elapsed=%s intervened=%s decision=%s enforced_cancel=%s",
+            tool_name,
+            progress.get("elapsed_seconds"),
+            intervened,
+            decision or "continue",
+            should_cancel,
+        )
+        return should_cancel
+
+    def _flush_deferred_conscience_visible_messages(self, messages: list) -> None:
+        pending = list(getattr(self, "_deferred_conscience_visible_messages", []) or [])
+        self._deferred_conscience_visible_messages = []
+        for text in pending:
+            self._append_visible_conscience_message(messages, text, persist=True)
 
     @staticmethod
     def _wrap_verbose(label: str, text: str, indent: str = "     ") -> str:
@@ -13269,8 +13334,28 @@ class AIAgent:
             # the agent while a command is running.
             if not _execution_blocked:
                 try:
-                    from tools.environments.base import set_activity_callback
+                    from tools.environments.base import (
+                        set_activity_callback,
+                        set_process_progress_callback,
+                    )
                     set_activity_callback(self._touch_activity)
+                    if (
+                        function_name == "terminal"
+                        and self.conscience_tool_progress_seconds > 0
+                        and getattr(self, "_conscience_current_monitor", None) is not None
+                    ):
+                        set_process_progress_callback(
+                            lambda progress, _messages=messages, _name=function_name, _args=function_args: self._conscience_review_running_tool(
+                                messages=_messages,
+                                tool_name=_name,
+                                tool_args=_args,
+                                progress=progress,
+                            ),
+                            initial_delay=self.conscience_tool_progress_seconds,
+                            interval=self.conscience_tool_progress_interval_seconds,
+                        )
+                    else:
+                        set_process_progress_callback(None)
                 except Exception:
                     pass
 
@@ -13500,6 +13585,13 @@ class AIAgent:
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 tool_duration = time.time() - tool_start_time
 
+            if function_name == "terminal":
+                try:
+                    from tools.environments.base import set_process_progress_callback
+                    set_process_progress_callback(None)
+                except Exception:
+                    pass
+
             if isinstance(function_result, str):
                 result_preview = function_result if self.verbose_logging else (
                     function_result[:200] if len(function_result) > 200 else function_result
@@ -13637,6 +13729,7 @@ class AIAgent:
                 time.sleep(self.tool_delay)
 
         # ── Per-turn aggregate budget enforcement ─────────────────────────
+        self._flush_deferred_conscience_visible_messages(messages)
         num_tools_seq = len(assistant_message.tool_calls)
         if num_tools_seq > 0:
             enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))

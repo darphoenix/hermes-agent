@@ -11,6 +11,7 @@ TASK_START = "TASK_START"
 PLAN_SUMMARY = "PLAN_SUMMARY"
 TOOL_CALL = "TOOL_CALL"
 TOOL_RESULT = "TOOL_RESULT"
+TOOL_PROGRESS = "TOOL_PROGRESS"
 ARTIFACT_UPDATED = "ARTIFACT_UPDATED"
 DRAFT_ANSWER = "DRAFT_ANSWER"
 INTENT_TO_STOP = "INTENT_TO_STOP"
@@ -21,6 +22,7 @@ IRREVERSIBLE_ACTION_INTENT = "IRREVERSIBLE_ACTION_INTENT"
 class TaskCriterion:
     criterion_id: str
     source_text: str
+    description: str = ""
     required: bool = True
     status: str = "open"
     evidence_refs: List[str] = field(default_factory=list)
@@ -68,6 +70,7 @@ class CritiqueTicket:
     next_best_action: str = ""
     criterion_ids: List[str] = field(default_factory=list)
     recommended_tools: Optional[List[str]] = None
+    active_tool_decision: Optional[str] = None
 
 
 @dataclass
@@ -102,6 +105,7 @@ class ConscienceState:
     stateful_next_init_reason: Optional[str] = None
     stateful_intervention_hashes: Dict[str, str] = field(default_factory=dict)
     stateful_ticket_history: Dict[str, int] = field(default_factory=dict)
+    task_contract_refined: bool = False
 
 
 def asdict_safe(obj):
@@ -787,11 +791,20 @@ class ConscienceMonitor:
             "When intervention requires tool use, set recommended_tools to the smallest useful list of exact tool names from payload.available_tools. "
             "If the actor should answer or synthesize from evidence already gathered without another tool call, return recommended_tools as an empty array. "
             "If no exact tool guidance is useful, return recommended_tools as null. Do not invent tool names. "
-            "You may also include intervention_outcomes when recent evidence clearly shows what happened after an earlier ticket in payload.trajectory_memory.intervention_ledger, the stateful intervention ledger, or payload.ledger_delta.intervention_upsert. "
-            "Each outcome object must use keys id, status, outcome, evidence, confidence. Status must be one of attempted, resolved, ignored, still_failing. "
-            "Only report an outcome when supported by concrete recent evidence; otherwise omit intervention_outcomes. "
+            "Hermes records attempted automatically when the actor takes the next tool action. Include intervention_outcomes only for a semantic status transition to resolved, ignored, or still_failing; never narrate attempted-to-attempted progress or repeat the current status. "
+            "Mark resolved only when a recent tool result or equivalent evidence directly proves the required action succeeded. Starting a command is attempted, not resolved. "
+            "Each outcome object must use keys id, status, outcome, evidence, confidence. "
+            "For a TOOL_PROGRESS review, set active_tool_decision to cancel only when the available command, elapsed time, and progress evidence make continued execution clearly wasteful; otherwise set it to continue. For other reviews omit active_tool_decision. "
             "Return strict JSON with keys: should_intervene (bool), verdict (string), reason (string), evidence (array of strings), "
-            "next_best_action (string), recommended_tools (array of strings or null), criterion_ids (array of strings), confidence (string)."
+            "next_best_action (string), recommended_tools (array of strings or null), criterion_ids (array of strings), confidence (string), and optional active_tool_decision (cancel or continue)."
+        )
+
+    @staticmethod
+    def _task_contract_refinement_prompt() -> str:
+        return (
+            "On stateful_mode='init_full', also include task_contract_refinement with explicit_asks, explicit_constraints, required_validation, and done_definition. "
+            "Each explicit_asks and explicit_constraints item must contain description and source_text, where source_text is an exact quote from task_contract.raw_user_request. Split only materially independent asks; preserve the raw request and do not invent requirements. "
+            "This one-time refinement may accompany an observe verdict. Omit task_contract_refinement on later deltas. "
         )
 
     @classmethod
@@ -799,15 +812,23 @@ class ConscienceMonitor:
         return (
             "Return strict JSON. If no intervention is warranted, return only "
             '{"should_intervene": false, "verdict": "observe"} '
-            "and omit reason, evidence, next_best_action, recommended_tools, criterion_ids, and confidence, unless adding a clearly supported intervention_outcomes update. "
+            "and omit reason, evidence, next_best_action, recommended_tools, criterion_ids, and confidence, unless adding a one-time task_contract_refinement or a transition-only intervention_outcomes update. "
             "Do not explain why you are observing. "
             "If intervention is warranted, "
             + cls._intervention_json_contract_prompt()
+            + cls._task_contract_refinement_prompt()
         )
 
     @classmethod
     def _stop_review_json_contract_prompt(cls) -> str:
-        return cls._intervention_json_contract_prompt()
+        return (
+            "Return strict JSON. If the actor may stop, return only "
+            '{"should_intervene": false, "verdict": "allow_stop"} '
+            "and omit reason, evidence, next_best_action, recommended_tools, criterion_ids, confidence, and intervention_outcomes. "
+            "If the actor must not stop, "
+            + cls._intervention_json_contract_prompt()
+            + cls._task_contract_refinement_prompt()
+        )
 
     @classmethod
     def _midtask_review_system_prompt(cls) -> str:
@@ -824,6 +845,7 @@ class ConscienceMonitor:
             "Do not intervene merely because the task is not finished yet, you can think of a better next step, the actor is gathering new evidence, the actor made one ordinary mistake, or you are uncertain. "
             "If unsure, observe silently: should_intervene=false. "
             "When intervening, give one concise course correction. Name the repeated or wrong behavior to stop, and the different strategy to try next. "
+            "Separate diagnosis from invocation details: if the exact command or procedure is not supported by the evidence, recommend one targeted inspection step instead of inventing a command. "
             "Do not produce a final answer unless the actor is explicitly looping on final-answer generation and no further tool use is needed. "
             "Do not rely on fixed heuristics, regex rules, or hand-crafted trigger categories. Infer directly from the evidence whether intervention is warranted right now. "
             + cls._midtask_review_json_contract_prompt()
@@ -1044,7 +1066,10 @@ class ConscienceMonitor:
             status = str(raw_update.get("status") or raw_update.get("outcome_status") or "").strip().lower()
             if status not in valid_statuses:
                 continue
-            if entry.get("status") == "resolved" and status != "resolved":
+            previous_status = str(entry.get("status") or "issued")
+            if previous_status == status:
+                continue
+            if previous_status == "resolved":
                 continue
             evidence = raw_update.get("evidence") or []
             if not isinstance(evidence, list):
@@ -1071,6 +1096,76 @@ class ConscienceMonitor:
                 }
             )
         return applied
+
+    def _apply_task_contract_refinement(self, parsed: Dict[str, Any]) -> bool:
+        if self.state.task_contract_refined:
+            return False
+        refinement = parsed.get("task_contract_refinement")
+        if not isinstance(refinement, dict):
+            return False
+
+        raw_request = self.state.contract.raw_user_request or ""
+        normalized_request = _normalize_text(raw_request).casefold()
+        criteria: List[TaskCriterion] = []
+        seen: set[tuple[str, str]] = set()
+        for item in refinement.get("explicit_asks") or []:
+            if isinstance(item, str):
+                description = source_text = item.strip()
+            elif isinstance(item, dict):
+                description = str(item.get("description") or item.get("criterion") or "").strip()
+                source_text = str(item.get("source_text") or item.get("source_quote") or "").strip()
+            else:
+                continue
+            normalized_source = _normalize_text(source_text).casefold()
+            if not description or not normalized_source or normalized_source not in normalized_request:
+                continue
+            key = (description.casefold(), normalized_source)
+            if key in seen:
+                continue
+            seen.add(key)
+            criteria.append(
+                TaskCriterion(
+                    criterion_id=f"criterion_{len(criteria) + 1:03d}",
+                    source_text=source_text,
+                    description=description,
+                )
+            )
+            if len(criteria) >= 16:
+                break
+        if not criteria:
+            return False
+
+        self.state.contract.explicit_asks = criteria
+        constraints: List[str] = []
+        for item in (refinement.get("explicit_constraints") or [])[:16]:
+            if isinstance(item, dict):
+                description = str(item.get("description") or "").strip()
+                source_text = str(item.get("source_text") or item.get("source_quote") or "").strip()
+            else:
+                description = source_text = str(item).strip()
+            normalized_source = _normalize_text(source_text).casefold()
+            if description and normalized_source and normalized_source in normalized_request:
+                constraints.append(_text_head_tail(description, 700))
+        self.state.contract.explicit_constraints = constraints
+        self.state.contract.implied_checks = [
+            _text_head_tail(str(item), 700)
+            for item in (refinement.get("required_validation") or refinement.get("implied_checks") or [])[:16]
+            if str(item).strip()
+        ]
+        self.state.contract.done_definition = [
+            _text_head_tail(str(item), 700)
+            for item in (refinement.get("done_definition") or [])[:16]
+            if str(item).strip()
+        ] or [criterion.description or criterion.source_text for criterion in criteria]
+        self.state.ledger = {
+            criterion.criterion_id: CompletionLedgerEntry(
+                criterion_id=criterion.criterion_id,
+                status="open",
+            )
+            for criterion in criteria
+        }
+        self.state.task_contract_refined = True
+        return True
 
     def _mark_completion_ledger_from_stop_review(self, parsed: Dict[str, Any], should_intervene: bool) -> None:
         if should_intervene:
@@ -1226,6 +1321,7 @@ class ConscienceMonitor:
         if not isinstance(parsed, dict):
             return ConscienceVerdict(should_intervene=False, source="llm", metadata={"parse_error": True})
 
+        contract_refined = self._apply_task_contract_refinement(parsed)
         applied_outcomes = self._apply_intervention_outcomes_from_review(parsed, review_type)
         should_intervene = bool(parsed.get("should_intervene"))
         if review_type == "stop":
@@ -1241,6 +1337,8 @@ class ConscienceMonitor:
             }
             if applied_outcomes:
                 metadata["intervention_outcomes_applied"] = applied_outcomes
+            if contract_refined:
+                metadata["task_contract_refined"] = True
             return ConscienceVerdict(
                 should_intervene=False,
                 critique_ticket=None,
@@ -1257,6 +1355,11 @@ class ConscienceMonitor:
             recommended_tools=(
                 [str(x) for x in parsed.get("recommended_tools")]
                 if isinstance(parsed.get("recommended_tools"), list)
+                else None
+            ),
+            active_tool_decision=(
+                str(parsed.get("active_tool_decision") or "").strip().lower()
+                if str(parsed.get("active_tool_decision") or "").strip().lower() in {"cancel", "continue"}
                 else None
             ),
         )
@@ -1279,6 +1382,8 @@ class ConscienceMonitor:
         }
         if applied_outcomes:
             metadata["intervention_outcomes_applied"] = applied_outcomes
+        if contract_refined:
+            metadata["task_contract_refined"] = True
         if suppressed_reason:
             metadata["suppressed"] = suppressed_reason
             metadata["suppressed_ticket"] = asdict_safe(suppressed_ticket)

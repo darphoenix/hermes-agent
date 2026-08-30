@@ -13554,6 +13554,8 @@ class GatewayRunner:
         ("agent", "conscience_reasoning_effort"),
         ("agent", "conscience_chat_messages"),
         ("agent", "conscience_stateful"),
+        ("agent", "conscience_tool_progress_seconds"),
+        ("agent", "conscience_tool_progress_interval_seconds"),
         ("agent", "disabled_toolsets"),
     )
 
