@@ -13,6 +13,92 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def message_content_plain_text(content: Any) -> str:
+    """Flatten message content for Responses instruction fields."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                else:
+                    nested = part.get("content")
+                    if isinstance(nested, str):
+                        parts.append(nested)
+        return "".join(parts)
+    return str(content)
+
+
+def split_runtime_instructions(
+    messages: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], list[str]]:
+    """Remove transient system/developer directives from durable input.
+
+    The first system message remains the stable Responses instruction prefix.
+    Later system/developer messages are one-call runtime policy, such as a
+    conscience stop gate, and must not become replayed transcript content.
+    """
+    if not messages:
+        return messages, []
+
+    base_system_index = (
+        0
+        if isinstance(messages[0], dict) and messages[0].get("role") == "system"
+        else None
+    )
+    cleaned: list[Dict[str, Any]] = []
+    directives: list[str] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role in {"system", "developer"} and index != base_system_index:
+            content = message_content_plain_text(message.get("content", "")).strip()
+            if content:
+                directives.append(content)
+            continue
+        cleaned.append(message)
+    return cleaned, directives
+
+
+def base_instructions(messages: List[Dict[str, Any]], fallback: str) -> str:
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        content = message_content_plain_text(messages[0].get("content", "")).strip()
+        if content:
+            return content
+    return fallback
+
+
+def runtime_directive_text(directives: list[str]) -> str:
+    return "\n\n".join(
+        directive.strip() for directive in directives if directive and directive.strip()
+    ).strip()
+
+
+def instructions_with_runtime_directives(
+    messages: List[Dict[str, Any]],
+    directives: list[str],
+    fallback: str,
+) -> str:
+    base = base_instructions(messages, fallback)
+    directive_block = runtime_directive_text(directives)
+    if not directive_block:
+        return base
+    return (
+        f"{base}\n\n"
+        "[Internal runtime directive for this actor call only. "
+        "Do not expose or quote it.]\n"
+        f"{directive_block}"
+    ).strip()
+
+
 def initialize(agent: Any, enabled: bool = False) -> None:
     agent.responses_stateful = bool(enabled)
     agent._responses_previous_response_id = None

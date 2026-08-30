@@ -1890,25 +1890,51 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             )
         )
         is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
-        from agent.stateful_responses import build_delta_messages, is_enabled
+        from agent.stateful_responses import (
+            base_instructions,
+            build_delta_messages,
+            instructions_with_runtime_directives,
+            is_enabled,
+            runtime_directive_text,
+            split_runtime_instructions,
+        )
+        from run_agent import DEFAULT_AGENT_IDENTITY
 
         _stateful_responses = is_enabled(agent)
         _stateful_messages = None
         _previous_response_id = None
+        _codex_messages, _runtime_directives = split_runtime_instructions(
+            api_messages
+        )
+        _instructions = None
+        _runtime_instructions = ""
+        if _runtime_directives and is_local_endpoint(agent.base_url):
+            _instructions = base_instructions(
+                _codex_messages, DEFAULT_AGENT_IDENTITY
+            )
+            _runtime_instructions = runtime_directive_text(
+                _runtime_directives
+            )
+        elif _runtime_directives:
+            _instructions = instructions_with_runtime_directives(
+                _codex_messages,
+                _runtime_directives,
+                DEFAULT_AGENT_IDENTITY,
+            )
         # The transport needs the full prepared message list to derive stable
         # Responses ``instructions`` even when the wire input is only a delta.
         # Passing the delta as ``messages`` silently replaces a session's real
         # system prompt with DEFAULT_AGENT_IDENTITY on resume, invalidating the
         # wrapper's exact qwen-late frontier.
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(
-            api_messages
+            _codex_messages
         )
         if _stateful_responses:
             # Select the durable branch before provider preparation strips
             # persistence-only metadata such as ``responses_response_id``.
             # Only the selected delta is then sanitized for the wire.
             _raw_stateful_messages, _previous_response_id = build_delta_messages(
-                agent, api_messages
+                agent, _codex_messages
             )
             _stateful_messages = agent._prepare_messages_for_non_vision_model(
                 _raw_stateful_messages
@@ -1980,6 +2006,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             stateful_responses=_stateful_responses,
             stateful_messages=_stateful_messages,
             previous_response_id=_previous_response_id,
+            instructions=_instructions,
+            runtime_instructions=_runtime_instructions,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────

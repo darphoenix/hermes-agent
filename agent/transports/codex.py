@@ -686,6 +686,19 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+
+        runtime_instructions = str(
+            params.get("runtime_instructions") or ""
+        ).strip()
+        if runtime_instructions:
+            extra_body = kwargs.get("extra_body")
+            merged_extra_body = (
+                dict(extra_body) if isinstance(extra_body, dict) else {}
+            )
+            merged_extra_body["hermes_runtime_instructions"] = (
+                runtime_instructions
+            )
+            kwargs["extra_body"] = merged_extra_body
         if stateful_responses:
             kwargs["store"] = True
             kwargs["parallel_tool_calls"] = False

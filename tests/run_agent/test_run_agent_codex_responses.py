@@ -131,6 +131,62 @@ def test_build_api_kwargs_stateful_custom_initial_and_followup(monkeypatch):
     assert followup_kwargs["input"][0]["role"] == "user"
 
 
+def test_stateful_custom_runtime_directive_is_transient(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._responses_previous_response_id = "resp_prev"
+    messages = [
+        {"role": "system", "content": "Stable local system prompt"},
+        {"role": "user", "content": "Original task"},
+        {
+            "role": "assistant",
+            "content": "Draft answer",
+            "responses_response_id": "resp_prev",
+        },
+        {
+            "role": "system",
+            "content": "[INTERNAL CONSCIENCE STOP-GATE] Break the loop.",
+            "_hermes_internal_directive": True,
+        },
+    ]
+
+    kwargs = agent._build_api_kwargs(messages)
+
+    assert kwargs["previous_response_id"] == "resp_prev"
+    assert kwargs["instructions"] == "Stable local system prompt"
+    assert kwargs["input"] == []
+    assert kwargs["extra_body"]["hermes_runtime_instructions"] == (
+        "[INTERNAL CONSCIENCE STOP-GATE] Break the loop."
+    )
+    assert all("STOP-GATE" not in str(item) for item in kwargs["input"])
+
+
+def test_stateful_custom_runtime_directive_expires_next_call(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._responses_previous_response_id = "resp_prev"
+    history = [
+        {"role": "system", "content": "Stable local system prompt"},
+        {"role": "user", "content": "Original task"},
+        {
+            "role": "assistant",
+            "content": "Draft answer",
+            "responses_response_id": "resp_prev",
+        },
+    ]
+
+    kwargs = agent._build_api_kwargs(
+        [
+            *history,
+            {"role": "system", "content": "One call only"},
+        ]
+    )
+    next_kwargs = agent._build_api_kwargs(
+        [*history, {"role": "user", "content": "Continue"}]
+    )
+
+    assert kwargs["extra_body"]["hermes_runtime_instructions"] == "One call only"
+    assert "extra_body" not in next_kwargs
+
+
 def test_stateful_custom_poisoned_parent_forces_full_prompt_retry(monkeypatch):
     agent = _build_stateful_custom_agent(monkeypatch)
     messages = [
