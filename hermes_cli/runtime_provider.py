@@ -14,14 +14,11 @@ from agent.credential_pool import CredentialPool, PooledCredential, get_custom_p
 from hermes_cli.auth import (
     AuthError,
     DEFAULT_CODEX_BASE_URL,
-    DEFAULT_QWEN_BASE_URL,
     PROVIDER_REGISTRY,
-    _agent_key_is_usable,
     format_auth_error,
     resolve_provider,
     resolve_nous_runtime_credentials,
     resolve_codex_runtime_credentials,
-    resolve_qwen_runtime_credentials,
     resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,
     has_usable_secret,
@@ -136,6 +133,37 @@ def _parse_api_mode(raw: Any) -> Optional[str]:
     return None
 
 
+def _parse_optional_bool(raw: Any) -> Optional[bool]:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _configured_responses_stateful(
+    model_cfg: Dict[str, Any],
+    provider: Optional[str],
+    configured_provider: Optional[str] = None,
+) -> Optional[bool]:
+    value = _parse_optional_bool(model_cfg.get("responses_stateful"))
+    if value is None:
+        return None
+    provider_name = (provider or "").strip().lower()
+    configured_name = configured_provider
+    if configured_name is None:
+        configured_name = str(model_cfg.get("provider") or "").strip().lower()
+    if not _provider_supports_explicit_api_mode(provider_name, configured_name):
+        return None
+    return value
+
+
 def _resolve_runtime_from_pool_entry(
     *,
     provider: str,
@@ -151,9 +179,6 @@ def _resolve_runtime_from_pool_entry(
     if provider == "openai-codex":
         api_mode = "codex_responses"
         base_url = base_url or DEFAULT_CODEX_BASE_URL
-    elif provider == "qwen-oauth":
-        api_mode = "chat_completions"
-        base_url = base_url or DEFAULT_QWEN_BASE_URL
     elif provider == "anthropic":
         api_mode = "anthropic_messages"
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -195,7 +220,7 @@ def _resolve_runtime_from_pool_entry(
     if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
         base_url = re.sub(r"/v1/?$", "", base_url)
 
-    return {
+    result = {
         "provider": provider,
         "api_mode": api_mode,
         "base_url": base_url,
@@ -204,6 +229,10 @@ def _resolve_runtime_from_pool_entry(
         "credential_pool": pool,
         "requested_provider": requested_provider,
     }
+    responses_stateful = _configured_responses_stateful(model_cfg, provider)
+    if responses_stateful is not None:
+        result["responses_stateful"] = responses_stateful
+    return result
 
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
@@ -229,6 +258,7 @@ def _try_resolve_from_custom_pool(
     base_url: str,
     provider_label: str,
     api_mode_override: Optional[str] = None,
+    responses_stateful: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
     """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
     pool_key = get_custom_provider_pool_key(base_url)
@@ -244,7 +274,7 @@ def _try_resolve_from_custom_pool(
         pool_api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         if not pool_api_key:
             return None
-        return {
+        result = {
             "provider": provider_label,
             "api_mode": api_mode_override or _detect_api_mode_for_url(base_url) or "chat_completions",
             "base_url": base_url,
@@ -252,6 +282,9 @@ def _try_resolve_from_custom_pool(
             "source": f"pool:{pool_key}",
             "credential_pool": pool,
         }
+        if responses_stateful is not None:
+            result["responses_stateful"] = responses_stateful
+        return result
     except Exception:
         return None
 
@@ -304,6 +337,9 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         api_mode = _parse_api_mode(entry.get("api_mode"))
         if api_mode:
             result["api_mode"] = api_mode
+        responses_stateful = _parse_optional_bool(entry.get("responses_stateful"))
+        if responses_stateful is not None:
+            result["responses_stateful"] = responses_stateful
         return result
 
     return None
@@ -327,7 +363,12 @@ def _resolve_named_custom_runtime(
         return None
 
     # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"))
+    pool_result = _try_resolve_from_custom_pool(
+        base_url,
+        "custom",
+        custom_provider.get("api_mode"),
+        custom_provider.get("responses_stateful"),
+    )
     if pool_result:
         return pool_result
 
@@ -339,7 +380,7 @@ def _resolve_named_custom_runtime(
     ]
     api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
 
-    return {
+    result = {
         "provider": "custom",
         "api_mode": custom_provider.get("api_mode")
         or _detect_api_mode_for_url(base_url)
@@ -348,6 +389,9 @@ def _resolve_named_custom_runtime(
         "api_key": api_key or "no-key-required",
         "source": f"custom_provider:{custom_provider.get('name', requested_provider)}",
     }
+    if "responses_stateful" in custom_provider:
+        result["responses_stateful"] = custom_provider["responses_stateful"]
+    return result
 
 
 def _resolve_openrouter_runtime(
@@ -427,8 +471,12 @@ def _resolve_openrouter_runtime(
 
     # For custom endpoints, check if a credential pool exists
     if effective_provider == "custom" and base_url:
+        responses_stateful = _configured_responses_stateful(model_cfg, "custom", cfg_provider)
         pool_result = _try_resolve_from_custom_pool(
-            base_url, effective_provider, _parse_api_mode(model_cfg.get("api_mode")),
+            base_url,
+            effective_provider,
+            _parse_api_mode(model_cfg.get("api_mode")),
+            responses_stateful,
         )
         if pool_result:
             return pool_result
@@ -436,7 +484,7 @@ def _resolve_openrouter_runtime(
     if effective_provider == "custom" and not api_key and not _is_openrouter_url:
         api_key = "no-key-required"
 
-    return {
+    result = {
         "provider": effective_provider,
         "api_mode": _parse_api_mode(model_cfg.get("api_mode"))
         or _detect_api_mode_for_url(base_url)
@@ -445,6 +493,10 @@ def _resolve_openrouter_runtime(
         "api_key": api_key,
         "source": source,
     }
+    responses_stateful = _configured_responses_stateful(model_cfg, effective_provider, cfg_provider)
+    if responses_stateful is not None:
+        result["responses_stateful"] = responses_stateful
+    return result
 
 
 def _resolve_explicit_runtime(
@@ -645,21 +697,6 @@ def resolve_runtime_provider(
                 getattr(entry, "runtime_api_key", None)
                 or getattr(entry, "access_token", "")
             )
-        # For Nous, the pool entry's runtime_api_key is the agent_key — a
-        # short-lived inference credential (~30 min TTL).  The pool doesn't
-        # refresh it during selection (that would trigger network calls in
-        # non-runtime contexts like `hermes auth list`).  If the key is
-        # expired, clear pool_api_key so we fall through to
-        # resolve_nous_runtime_credentials() which handles refresh + mint.
-        if provider == "nous" and entry is not None and pool_api_key:
-            min_ttl = max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800")))
-            nous_state = {
-                "agent_key": getattr(entry, "agent_key", None),
-                "agent_key_expires_at": getattr(entry, "agent_key_expires_at", None),
-            }
-            if not _agent_key_is_usable(nous_state, min_ttl):
-                logger.debug("Nous pool entry agent_key expired/missing, falling through to runtime resolution")
-                pool_api_key = ""
         if entry is not None and pool_api_key:
             return _resolve_runtime_from_pool_entry(
                 provider=provider,
@@ -710,24 +747,6 @@ def resolve_runtime_provider(
             # Auto-detected Codex but credentials are stale/revoked —
             # fall through to env-var providers (e.g. OpenRouter).
             logger.info("Auto-detected Codex provider but credentials failed; "
-                        "falling through to next provider.")
-
-    if provider == "qwen-oauth":
-        try:
-            creds = resolve_qwen_runtime_credentials()
-            return {
-                "provider": "qwen-oauth",
-                "api_mode": "chat_completions",
-                "base_url": creds.get("base_url", "").rstrip("/"),
-                "api_key": creds.get("api_key", ""),
-                "source": creds.get("source", "qwen-cli"),
-                "expires_at_ms": creds.get("expires_at_ms"),
-                "requested_provider": requested_provider,
-            }
-        except AuthError:
-            if requested_provider != "auto":
-                raise
-            logger.info("Qwen OAuth credentials failed; "
                         "falling through to next provider.")
 
     if provider == "copilot-acp":
