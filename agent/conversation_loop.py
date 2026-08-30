@@ -73,6 +73,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
+    is_local_endpoint,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
     save_context_length,
@@ -2937,6 +2938,9 @@ def run_conversation(
         agent._current_api_request_id = api_request_id
 
         while retry_count < max_retries:
+            trace_row = None
+            trace_finished = False
+            trace_attempt_wall_start = time.time()
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -2989,6 +2993,16 @@ def run_conversation(
                     pass  # Never let rate guard break the agent loop
 
             try:
+                trace_row = agent._trace_start_api_call(
+                    api_call_index=api_call_count,
+                    message_count=len(api_messages),
+                    tool_count=len(agent.tools or []),
+                    approx_input_tokens=approx_tokens,
+                    request_char_count=total_chars,
+                )
+                if trace_row is not None:
+                    agent._active_api_trace_row = trace_row
+                request_build_started = time.perf_counter()
                 agent._reset_stream_delivery_tracking()
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can
@@ -3037,6 +3051,26 @@ def run_conversation(
                         is_github_responses=agent._is_copilot_url(),
                         sanitize_harmony_tokens=agent._is_codex_backend(),
                     )
+                if trace_row is not None:
+                    trace_row["request_build_s"] = round(
+                        time.perf_counter() - request_build_started,
+                        6,
+                    )
+                    trace_row["request_tool_count"] = len(
+                        api_kwargs.get("tools") or []
+                    )
+                    if (
+                        agent.api_mode in {"chat_completions", "codex_responses"}
+                        and is_local_endpoint(agent.base_url)
+                    ):
+                        api_kwargs = agent._trace_apply_headers(
+                            api_kwargs,
+                            request_id=str(trace_row.get("request_id") or ""),
+                            actor=str(
+                                trace_row.get("actor")
+                                or agent._trace_actor_name()
+                            ),
+                        )
                 # OpenRouter response caching replays identical successful
                 # responses verbatim, including empty completions. An empty-
                 # response retry must reach the provider instead of replaying
@@ -4453,6 +4487,47 @@ def run_conversation(
                         clear_nous_rate_limit()
                     except Exception:
                         pass
+                if trace_row is not None and not trace_finished:
+                    response_id = str(getattr(response, "id", "") or "")
+                    trace_fields = {
+                        "status": "ok",
+                        "api_duration_s": round(api_duration, 6),
+                        "response_id": response_id,
+                        "response_model": str(
+                            getattr(response, "model", "") or ""
+                        ),
+                        "finish_reason": str(finish_reason or ""),
+                    }
+                    if agent.api_mode == "codex_responses":
+                        from agent.stateful_responses import is_enabled
+
+                        trace_fields.update(
+                            {
+                                "stateful_requested": bool(is_enabled(agent)),
+                                "stateful_used": bool(is_enabled(agent)),
+                                "previous_response_id": str(
+                                    api_kwargs.get("previous_response_id", "") or ""
+                                ),
+                                "responses_status": str(
+                                    getattr(response, "status", "") or ""
+                                ),
+                            }
+                        )
+                    if hasattr(response, "usage") and response.usage:
+                        trace_fields.update(
+                            {
+                                "prompt_tokens": canonical_usage.prompt_tokens,
+                                "completion_tokens": canonical_usage.output_tokens,
+                                "total_tokens": canonical_usage.total_tokens,
+                                "input_tokens": canonical_usage.input_tokens,
+                                "output_tokens": canonical_usage.output_tokens,
+                                "cache_read_tokens": canonical_usage.cache_read_tokens,
+                                "cache_write_tokens": canonical_usage.cache_write_tokens,
+                                "reasoning_tokens": canonical_usage.reasoning_tokens,
+                            }
+                        )
+                    agent._trace_finish_api_call(trace_row, **trace_fields)
+                    trace_finished = True
                 from agent import relay_llm
 
                 relay_llm.complete_logical_call(
@@ -4468,6 +4543,18 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+                if trace_row is not None and not trace_finished:
+                    agent._trace_finish_api_call(
+                        trace_row,
+                        status="interrupted",
+                        api_duration_s=round(
+                            time.time() - trace_attempt_wall_start,
+                            6,
+                        ),
+                        error_type="InterruptedError",
+                        error="Agent interrupted during API call",
+                    )
+                    trace_finished = True
                 if agent._has_pending_redirect():
                     # redirect() deliberately used the interrupt machinery to
                     # cancel only this provider request. Keep its correction
@@ -4504,6 +4591,19 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+                if trace_row is not None and not trace_finished:
+                    agent._trace_finish_api_call(
+                        trace_row,
+                        status="error",
+                        api_duration_s=round(
+                            time.time() - trace_attempt_wall_start,
+                            6,
+                        ),
+                        error_type=type(api_error).__name__,
+                        error=str(api_error)[:500],
+                        retry_count=retry_count,
+                    )
+                    trace_finished = True
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:

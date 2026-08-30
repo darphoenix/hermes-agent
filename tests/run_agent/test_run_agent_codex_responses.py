@@ -1275,6 +1275,36 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
+def test_run_conversation_records_main_stateful_request_trace(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._disable_streaming = True
+    captured = {}
+
+    def _capture(api_kwargs):
+        captured.update(api_kwargs)
+        response = _codex_message_response("OK")
+        response.id = "resp_trace_1"
+        return response
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _capture)
+
+    result = agent.run_conversation("Say OK")
+
+    assert result["completed"] is True
+    rows = [row for row in result["request_trace"] if row["kind"] == "api_call"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["actor"] == "main"
+    assert row["status"] == "ok"
+    assert row["response_id"] == "resp_trace_1"
+    assert row["stateful_requested"] is True
+    assert row["stateful_used"] is True
+    assert row["prompt_tokens"] == 5
+    assert row["completion_tokens"] == 3
+    assert captured["extra_headers"]["X-Hermes-Request-Id"] == row["request_id"]
+    assert captured["extra_headers"]["X-Hermes-Actor"] == "main"
+
+
 def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monkeypatch):
     """Both mutable request boundaries must reject literal Harmony wire tokens."""
     agent = _build_agent(monkeypatch)
