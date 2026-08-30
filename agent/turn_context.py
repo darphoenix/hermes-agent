@@ -531,6 +531,9 @@ def build_turn_context(
             api_key=getattr(agent, "api_key", "") or "",
             api_mode=getattr(agent, "api_mode", "") or "",
             auth_mode=getattr(agent, "auth_mode", "") or "",
+            responses_stateful=bool(
+                getattr(agent, "responses_stateful", False)
+            ),
             session_id=getattr(agent, "session_id", "") or "",
             cache_scope=_cache_scope,
         )

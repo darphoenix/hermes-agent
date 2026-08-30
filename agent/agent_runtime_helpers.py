@@ -1624,6 +1624,8 @@ def restore_primary_runtime(agent) -> bool:
         agent.requested_provider = rt.get("requested_provider", agent.provider)
         agent.base_url = rt["base_url"]           # setter updates _base_url_lower
         agent.api_mode = rt["api_mode"]
+        agent.responses_stateful = bool(rt.get("responses_stateful", False))
+        agent._clear_responses_stateful_chain(reason="restore_primary_runtime")
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
@@ -2722,7 +2724,15 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def switch_model(
+    agent,
+    new_model,
+    new_provider,
+    api_key='',
+    base_url='',
+    api_mode='',
+    responses_stateful=None,
+):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
@@ -2783,6 +2793,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "requested_provider",
             "base_url",
             "api_mode",
+            "responses_stateful",
             "api_key",
             "client",
             "_anthropic_client",
@@ -2852,6 +2863,10 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "refusing to keep the previous provider's endpoint"
             )
         agent.api_mode = api_mode
+        agent.responses_stateful = (
+            bool(responses_stateful) if responses_stateful is not None else False
+        )
+        agent._clear_responses_stateful_chain(reason="switch_model")
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
@@ -3107,6 +3122,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "requested_provider": agent.requested_provider,
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
+        "responses_stateful": bool(agent.responses_stateful),
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,

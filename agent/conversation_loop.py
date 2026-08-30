@@ -5143,6 +5143,31 @@ def run_conversation(
                         )
                         continue
 
+                # A compatible local Responses server can explicitly reject a
+                # stored parent after an interrupted or poisoned generation.
+                # Rebuild once from the full durable transcript; ordinary
+                # network failures preserve the valid parent and use the normal
+                # retry path.
+                if (
+                    not _retry.stateful_responses_fresh_retry_attempted
+                    and agent._should_reset_stateful_responses_after_error(api_error)
+                ):
+                    _retry.stateful_responses_fresh_retry_attempted = True
+                    blocked_response_id = (
+                        agent._active_responses_previous_response_id(api_kwargs)
+                    )
+                    agent._clear_responses_stateful_chain(
+                        reason="previous_response_id_rejected_or_poisoned",
+                        blocked_response_id=blocked_response_id,
+                        force_fresh_until_success=True,
+                    )
+                    logger.info(
+                        "Retrying Responses request without previous_response_id "
+                        "after stateful resume rejection/poison: %s",
+                        blocked_response_id or "<unknown>",
+                    )
+                    continue
+
                 # ── llama.cpp grammar-parse recovery ──────────────────
                 # llama.cpp's ``json-schema-to-grammar`` converter rejects
                 # regex escape classes (``\d``, ``\w``, ``\s``) and most

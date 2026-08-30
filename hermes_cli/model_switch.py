@@ -620,6 +620,7 @@ class ModelSwitchResult:
     api_key: str = ""
     base_url: str = ""
     api_mode: str = ""
+    responses_stateful: Optional[bool] = None
     error_message: str = ""
     warning_message: str = ""
     provider_label: str = ""
@@ -1847,6 +1848,7 @@ def switch_model(
     api_key = current_api_key
     base_url = current_base_url
     api_mode = ""
+    responses_stateful: Optional[bool] = None
     ollama_headers: dict[str, str] = {}
     validation_headers: dict[str, str] = {}
     suppress_ollama_headers = False
@@ -1891,6 +1893,8 @@ def switch_model(
                 api_key = runtime.get("api_key", "") or _ukey
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
                 api_mode = runtime.get("api_mode", "")
+                if "responses_stateful" in runtime:
+                    responses_stateful = bool(runtime.get("responses_stateful"))
                 validation_headers = runtime.get("extra_headers") or validation_headers
             except Exception:
                 api_key = _ukey
@@ -1909,6 +1913,8 @@ def switch_model(
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
+                if "responses_stateful" in runtime:
+                    responses_stateful = bool(runtime.get("responses_stateful"))
                 validation_headers = runtime.get("extra_headers") or validation_headers
             except Exception as e:
                 return ModelSwitchResult(
@@ -1969,6 +1975,8 @@ def switch_model(
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
+                if "responses_stateful" in runtime:
+                    responses_stateful = bool(runtime.get("responses_stateful"))
                 validation_headers = runtime.get("extra_headers") or validation_headers
             except Exception:
                 pass
@@ -2192,6 +2200,7 @@ def switch_model(
         api_key=api_key,
         base_url=base_url,
         api_mode=api_mode,
+        responses_stateful=responses_stateful,
         warning_message=" | ".join(warnings) if warnings else "",
         provider_label=provider_label,
         resolved_via_alias=resolved_alias,

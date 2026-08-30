@@ -340,6 +340,9 @@ def _resolve_review_runtime(
         "api_key": parent_runtime.get("api_key") or None,
         "base_url": parent_runtime.get("base_url") or None,
         "api_mode": parent_api_mode,
+        "responses_stateful": bool(
+            parent_runtime.get("responses_stateful", False)
+        ),
         "credential_pool": getattr(agent, "_credential_pool", None),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "max_tokens": getattr(agent, "max_tokens", None),
@@ -370,6 +373,7 @@ def _resolve_review_runtime(
             "api_key": rp.get("api_key"),
             "base_url": rp.get("base_url"),
             "api_mode": rp.get("api_mode"),
+            "responses_stateful": bool(rp.get("responses_stateful", False)),
             "credential_pool": rp.get("credential_pool"),
             "request_overrides": dict(rp.get("request_overrides") or {}),
             "max_tokens": rp.get("max_output_tokens"),
@@ -1303,6 +1307,7 @@ def _run_review_in_thread(
                 platform=agent.platform,
                 provider=_rt.get("provider") or agent.provider,
                 api_mode=_rt.get("api_mode"),
+                responses_stateful=_rt.get("responses_stateful", False),
                 base_url=_rt.get("base_url") or None,
                 api_key=_rt.get("api_key") or None,
                 credential_pool=_rt.get("credential_pool"),

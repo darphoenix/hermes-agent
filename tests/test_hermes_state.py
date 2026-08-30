@@ -655,6 +655,38 @@ class TestMessageStorage:
         assert "reasoning" not in conv[0]
         assert "reasoning" not in conv[2]
 
+    def test_responses_response_id_persisted_and_restored(self, db):
+        db.create_session(session_id="stateful", source="cli")
+        db.append_message(
+            "stateful",
+            role="assistant",
+            content="First answer",
+            responses_response_id=" resp_123 ",
+        )
+
+        conv = db.get_messages_as_conversation("stateful")
+
+        assert conv[0]["responses_response_id"] == "resp_123"
+
+    def test_replace_messages_preserves_responses_response_id(self, db):
+        db.create_session(session_id="stateful-rewrite", source="telegram")
+
+        db.replace_messages(
+            "stateful-rewrite",
+            [
+                {"role": "user", "content": "First"},
+                {
+                    "role": "assistant",
+                    "content": "Ack",
+                    "responses_response_id": "resp_replace",
+                },
+            ],
+        )
+
+        conv = db.get_messages_as_conversation("stateful-rewrite")
+
+        assert conv[1]["responses_response_id"] == "resp_replace"
+
 
 
 

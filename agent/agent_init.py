@@ -539,6 +539,7 @@ def init_agent(
     api_key: str = None,
     provider: str = None,
     api_mode: str = None,
+    responses_stateful: bool = False,
     acp_command: str = None,
     acp_args: list[str] | None = None,
     command: str = None,
@@ -712,6 +713,9 @@ def init_agent(
         if isinstance(requested_provider, str) and requested_provider.strip()
         else agent.provider
     )
+    from agent.stateful_responses import initialize as initialize_stateful_responses
+
+    initialize_stateful_responses(agent, responses_stateful)
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
@@ -3092,6 +3096,7 @@ def init_agent(
         "requested_provider": agent.requested_provider,
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
+        "responses_stateful": bool(agent.responses_stateful),
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,

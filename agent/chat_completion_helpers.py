@@ -1890,7 +1890,29 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             )
         )
         is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
-        _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
+        from agent.stateful_responses import build_delta_messages, is_enabled
+
+        _stateful_responses = is_enabled(agent)
+        _stateful_messages = None
+        _previous_response_id = None
+        # The transport needs the full prepared message list to derive stable
+        # Responses ``instructions`` even when the wire input is only a delta.
+        # Passing the delta as ``messages`` silently replaces a session's real
+        # system prompt with DEFAULT_AGENT_IDENTITY on resume, invalidating the
+        # wrapper's exact qwen-late frontier.
+        _msgs_for_codex = agent._prepare_messages_for_non_vision_model(
+            api_messages
+        )
+        if _stateful_responses:
+            # Select the durable branch before provider preparation strips
+            # persistence-only metadata such as ``responses_response_id``.
+            # Only the selected delta is then sanitized for the wire.
+            _raw_stateful_messages, _previous_response_id = build_delta_messages(
+                agent, api_messages
+            )
+            _stateful_messages = agent._prepare_messages_for_non_vision_model(
+                _raw_stateful_messages
+            )
 
         # Native server-side compaction (gpt-5.6 on direct OpenAI API /
         # ChatGPT Codex routes only) — None on every other route/model, in
@@ -1955,6 +1977,9 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
             context_management=_context_management,
+            stateful_responses=_stateful_responses,
+            stateful_messages=_stateful_messages,
+            previous_response_id=_previous_response_id,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────
@@ -2292,6 +2317,16 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     codex_message_items = getattr(assistant_message, "codex_message_items", None)
     if codex_message_items:
         msg["codex_message_items"] = codex_message_items
+
+    responses_response_id = getattr(
+        assistant_message, "responses_response_id", None
+    )
+    if isinstance(responses_response_id, str) and responses_response_id.strip():
+        from agent.stateful_responses import remember_response_id
+
+        normalized_response_id = responses_response_id.strip()
+        msg["responses_response_id"] = normalized_response_id
+        remember_response_id(agent, normalized_response_id)
 
     if assistant_tool_calls:
         tool_calls = []
@@ -2687,6 +2722,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        agent.responses_stateful = bool(fb.get("responses_stateful", False))
+        agent._clear_responses_stateful_chain(reason="activate_fallback")
         # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
         # Read from the fallback entry so the flag travels with the active
         # provider; restore_primary_runtime will revert it from the snapshot.

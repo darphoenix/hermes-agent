@@ -1617,6 +1617,7 @@ def _build_child_agent(
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
+    override_responses_stateful: Optional[bool] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
     # ACP transport overrides from trusted delegation config.
@@ -1809,6 +1810,14 @@ def _build_child_agent(
         effective_api_mode = None  # force re-derivation from provider's defaults
     else:
         effective_api_mode = getattr(parent_agent, "api_mode", None)
+    if override_responses_stateful is not None:
+        effective_responses_stateful = bool(override_responses_stateful)
+    elif effective_provider == _parent_provider:
+        effective_responses_stateful = bool(
+            getattr(parent_agent, "responses_stateful", False)
+        )
+    else:
+        effective_responses_stateful = False
     # Defensive: validate trusted delegation.command exists on PATH before
     # honoring it. An explicitly pinned transport that cannot run must fail
     # the spawn loudly (#80450) — silently falling back to the default
@@ -1968,6 +1977,7 @@ def _build_child_agent(
                 model=effective_model,
                 provider=effective_provider,
                 api_mode=effective_api_mode,
+                responses_stateful=effective_responses_stateful,
                 acp_command=effective_acp_command,
                 acp_args=effective_acp_args,
                 max_iterations=max_iterations,
@@ -3890,6 +3900,7 @@ def delegate_task(
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
+                override_responses_stateful=creds.get("responses_stateful"),
                 override_request_overrides=creds.get("request_overrides"),
                 override_max_tokens=creds.get("max_output_tokens"),
                 override_acp_command=creds.get("command"),
@@ -4477,6 +4488,11 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
+    configured_responses_stateful = (
+        is_truthy_value(cfg.get("responses_stateful"), default=False)
+        if "responses_stateful" in cfg
+        else None
+    )
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
@@ -4532,6 +4548,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "responses_stateful": configured_responses_stateful,
         }
 
     if not configured_provider:
@@ -4542,6 +4559,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": None,
             "api_key": None,
             "api_mode": None,
+            "responses_stateful": None,
             "request_overrides": None,
             "max_output_tokens": None,
         }
@@ -4586,6 +4604,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
+        "responses_stateful": runtime.get("responses_stateful"),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
         "max_output_tokens": runtime.get("max_output_tokens"),
         "command": runtime.get("command"),

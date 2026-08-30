@@ -447,6 +447,7 @@ class AIAgent:
         api_key: str = None,
         provider: str = None,
         api_mode: str = None,
+        responses_stateful: bool = False,
         acp_command: str = None,
         acp_args: list[str] | None = None,
         command: str = None,
@@ -539,6 +540,7 @@ class AIAgent:
             provider=provider,
             requested_provider=requested_provider,
             api_mode=api_mode,
+            responses_stateful=responses_stateful,
             acp_command=acp_command,
             acp_args=acp_args,
             command=command,
@@ -1364,7 +1366,7 @@ class AIAgent:
             detail = detail[:217].rstrip() + "..."
         self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}")
 
-    def _current_main_runtime(self) -> Dict[str, str]:
+    def _current_main_runtime(self) -> Dict[str, Any]:
         """Return the live main runtime for session-scoped auxiliary routing."""
         return {
             "model": getattr(self, "model", "") or "",
@@ -1373,6 +1375,9 @@ class AIAgent:
             "api_key": getattr(self, "api_key", "") or "",
             "api_mode": getattr(self, "api_mode", "") or "",
             "auth_mode": getattr(self, "auth_mode", "") or "",
+            "responses_stateful": bool(
+                getattr(self, "responses_stateful", False)
+            ),
         }
 
     def _check_compression_model_feasibility(self) -> None:
@@ -2367,6 +2372,7 @@ class AIAgent:
                     "reasoning_details": msg.get("reasoning_details"),
                     "codex_reasoning_items": msg.get("codex_reasoning_items"),
                     "codex_message_items": msg.get("codex_message_items"),
+                    "responses_response_id": msg.get("responses_response_id"),
                     "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
                     "timestamp": _row_timestamp,
                     "api_content": _row_api_content,
@@ -7625,6 +7631,40 @@ class AIAgent:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
         from agent.chat_completion_helpers import build_api_kwargs
         return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
+
+    def _responses_stateful_enabled(self) -> bool:
+        from agent.stateful_responses import is_enabled
+
+        return is_enabled(self)
+
+    def _clear_responses_stateful_chain(self, **kwargs) -> None:
+        from agent.stateful_responses import clear_chain
+
+        clear_chain(self, **kwargs)
+
+    def _remember_responses_response_id(self, response_id: Any) -> None:
+        from agent.stateful_responses import remember_response_id
+
+        remember_response_id(self, response_id)
+
+    def _remember_transient_responses_repair_parent(
+        self, response_id: Any, *, reason: str = ""
+    ) -> None:
+        from agent.stateful_responses import remember_transient_parent
+
+        remember_transient_parent(self, response_id, reason=reason)
+
+    def _active_responses_previous_response_id(
+        self, api_kwargs: Optional[Dict[str, Any]] = None
+    ) -> Optional[str]:
+        from agent.stateful_responses import active_previous_response_id
+
+        return active_previous_response_id(self, api_kwargs)
+
+    def _should_reset_stateful_responses_after_error(self, exc: Exception) -> bool:
+        from agent.stateful_responses import should_reset_after_error
+
+        return should_reset_after_error(self, exc)
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.

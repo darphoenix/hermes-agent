@@ -1404,6 +1404,7 @@ _ASSISTANT_REPLAY_FIELDS: tuple[str, ...] = (
     "reasoning_details",
     "codex_reasoning_items",
     "codex_message_items",
+    "responses_response_id",
     "finish_reason",
 )
 
@@ -2876,6 +2877,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "provider": runtime.get("provider"),
         "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"),
+        "responses_stateful": runtime.get("responses_stateful", False),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
@@ -3016,6 +3018,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "provider": runtime.get("provider"),
         "requested_provider": runtime.get("requested_provider"),
         "api_mode": runtime.get("api_mode"),
+        "responses_stateful": runtime.get("responses_stateful", False),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
@@ -3074,6 +3077,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "provider": runtime.get("provider"),
                     "requested_provider": runtime.get("requested_provider"),
                     "api_mode": runtime.get("api_mode"),
+                    "responses_stateful": runtime.get("responses_stateful", False),
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
@@ -8100,6 +8104,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
+                "responses_stateful": override.get("responses_stateful"),
                 "max_tokens": override.get("max_tokens"),
                 "credential_pool": override.get("credential_pool"),
             }
@@ -8246,6 +8251,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "provider": runtime_kwargs.get("provider"),
             "requested_provider": runtime_kwargs.get("requested_provider"),
             "api_mode": runtime_kwargs.get("api_mode"),
+            "responses_stateful": runtime_kwargs.get("responses_stateful", False),
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
@@ -8260,6 +8266,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime["requested_provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
+                bool(runtime["responses_stateful"]),
                 runtime["command"],
                 tuple(runtime["args"]),
             ),
@@ -26905,7 +26912,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
+        for key in (
+            "provider",
+            "api_key",
+            "base_url",
+            "api_mode",
+            "responses_stateful",
+            "credential_pool",
+        ):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val

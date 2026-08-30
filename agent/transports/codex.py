@@ -474,6 +474,14 @@ class ResponsesApiTransport(ProviderTransport):
         # them derived from one expression is what stops a persisted
         # checkpoint from restructuring the wire after the gate closes.
         native_compaction_active = _native_compaction_active(context_management)
+        stateful_responses = bool(params.get("stateful_responses", False))
+        stateful_messages = params.get("stateful_messages")
+        input_messages = (
+            stateful_messages
+            if stateful_responses and isinstance(stateful_messages, list)
+            else payload_messages
+        )
+        previous_response_id = params.get("previous_response_id")
 
         # Resolve the issuing endpoint for this call. Stashed on the
         # transport so normalize_response can stamp it onto reasoning
@@ -584,19 +592,26 @@ class ResponsesApiTransport(ProviderTransport):
             "model": _strip_ctx_variant(model),
             "instructions": instructions,
             "input": _chat_messages_to_responses_input(
-                payload_messages,
+                input_messages,
                 is_xai_responses=is_xai_responses,
                 is_github_responses=is_github_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning,
                 current_issuer_kind=issuer_kind,
                 native_compaction_eligible=native_compaction_active,
             ),
-            "store": False,
+            "store": stateful_responses,
         }
         if response_tools:
             kwargs["tools"] = response_tools
             kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = True
+        if stateful_responses:
+            kwargs["parallel_tool_calls"] = False
+            if (
+                isinstance(previous_response_id, str)
+                and previous_response_id.strip()
+            ):
+                kwargs["previous_response_id"] = previous_response_id.strip()
         if native_compaction_active:
             kwargs["context_management"] = context_management
 
@@ -623,7 +638,12 @@ class ResponsesApiTransport(ProviderTransport):
         ) or _cache_scope
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
-        if not is_github_responses and not is_xai_responses and cache_key:
+        if (
+            not stateful_responses
+            and not is_github_responses
+            and not is_xai_responses
+            and cache_key
+        ):
             kwargs["prompt_cache_key"] = cache_key
 
         cache_retention = _default_prompt_cache_retention_for_request(
@@ -666,6 +686,9 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+        if stateful_responses:
+            kwargs["store"] = True
+            kwargs["parallel_tool_calls"] = False
 
         if "prompt_cache_key" in kwargs:
             bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])
@@ -822,6 +845,8 @@ class ResponsesApiTransport(ProviderTransport):
             provider_data["codex_message_items"] = msg.codex_message_items
         if msg and hasattr(msg, "reasoning_details") and msg.reasoning_details:
             provider_data["reasoning_details"] = msg.reasoning_details
+        if msg and getattr(msg, "responses_response_id", None):
+            provider_data["responses_response_id"] = msg.responses_response_id
 
         return NormalizedResponse(
             content=msg.content if msg else None,

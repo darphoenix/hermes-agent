@@ -49,6 +49,33 @@ class TestCliTurnRoutePool:
         other_route = bound("test message")
         assert other_route["signature"] != route["signature"]
 
+    def test_resolve_turn_preserves_stateful_responses(self):
+        shell = SimpleNamespace(
+            model="local-qwen",
+            api_key="local-key",
+            base_url="http://127.0.0.1:1236/v1",
+            provider="custom",
+            requested_provider="custom",
+            api_mode="codex_responses",
+            responses_stateful=True,
+            acp_command=None,
+            acp_args=[],
+            _credential_pool=None,
+            service_tier=None,
+        )
+
+        from cli import HermesCLI
+
+        bound = HermesCLI._resolve_turn_agent_config.__get__(shell)
+        stateful_route = bound("first message")
+
+        assert stateful_route["runtime"]["responses_stateful"] is True
+
+        shell.responses_stateful = False
+        stateless_route = bound("second message")
+        assert stateless_route["runtime"]["responses_stateful"] is False
+        assert stateless_route["signature"] != stateful_route["signature"]
+
 
 # ---------------------------------------------------------------------------
 # 2. Gateway _resolve_turn_agent_config includes credential_pool
@@ -562,4 +589,3 @@ class TestFailureAttribution:
 
         failed = {e.id: e for e in pool.entries()}["cred-1"]
         assert failed.failure_reason != "billing"
-

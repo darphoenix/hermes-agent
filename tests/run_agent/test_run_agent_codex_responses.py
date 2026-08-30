@@ -77,6 +77,108 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
     return agent
 
 
+def _build_stateful_custom_agent(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="local-qwen",
+        provider="custom",
+        api_mode="codex_responses",
+        responses_stateful=True,
+        base_url="http://127.0.0.1:1236/v1",
+        api_key="local-key",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._cleanup_task_resources = lambda task_id: None
+    agent._persist_session = lambda messages, history=None: None
+    agent._save_trajectory = lambda messages, user_message, completed: None
+    return agent
+
+
+def test_build_api_kwargs_stateful_custom_initial_and_followup(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    initial = [
+        {"role": "system", "content": "Stable local system prompt"},
+        {"role": "user", "content": "First"},
+    ]
+
+    first_kwargs = agent._build_api_kwargs(initial)
+
+    assert first_kwargs["store"] is True
+    assert first_kwargs["parallel_tool_calls"] is False
+    assert "previous_response_id" not in first_kwargs
+    assert first_kwargs["instructions"] == "Stable local system prompt"
+    assert first_kwargs["input"][-1]["role"] == "user"
+
+    agent._responses_previous_response_id = "resp_prev"
+    followup = [
+        *initial,
+        {
+            "role": "assistant",
+            "content": "Ack",
+            "responses_response_id": "resp_prev",
+        },
+        {"role": "user", "content": "Second"},
+    ]
+
+    followup_kwargs = agent._build_api_kwargs(followup)
+
+    assert followup_kwargs["previous_response_id"] == "resp_prev"
+    assert followup_kwargs["instructions"] == "Stable local system prompt"
+    assert len(followup_kwargs["input"]) == 1
+    assert followup_kwargs["input"][0]["role"] == "user"
+
+
+def test_stateful_custom_poisoned_parent_forces_full_prompt_retry(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    messages = [
+        {"role": "user", "content": "First"},
+        {
+            "role": "assistant",
+            "content": "Ack",
+            "responses_response_id": "resp_prev",
+        },
+        {"role": "user", "content": "Second"},
+    ]
+    agent._responses_previous_response_id = "resp_prev"
+    first_kwargs = agent._build_api_kwargs(messages)
+    error = RuntimeError(
+        "Poisoned previous_response_id cache_poisoned: resp_prev"
+    )
+
+    assert agent._should_reset_stateful_responses_after_error(error)
+    agent._clear_responses_stateful_chain(
+        reason="test",
+        blocked_response_id=agent._active_responses_previous_response_id(first_kwargs),
+        force_fresh_until_success=True,
+    )
+    retry_kwargs = agent._build_api_kwargs(messages)
+
+    assert "previous_response_id" not in retry_kwargs
+    assert len(retry_kwargs["input"]) == 3
+
+
+def test_preflight_and_normalization_keep_stateful_response_identity(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    kwargs = agent._build_api_kwargs([{"role": "user", "content": "Hello"}])
+    kwargs["previous_response_id"] = "resp_prev"
+
+    preflight = agent._get_transport().preflight_kwargs(kwargs)
+
+    assert preflight["store"] is True
+    assert preflight["previous_response_id"] == "resp_prev"
+
+    response = _codex_message_response("Done")
+    response.id = "resp_123"
+    normalized = agent._get_transport().normalize_response(response)
+    message = agent._build_assistant_message(normalized, "stop")
+
+    assert message["responses_response_id"] == "resp_123"
+    assert agent._responses_previous_response_id == "resp_123"
+
+
 AZURE_FOUNDRY_BASE_URL = (
     "https://placeholder.services.ai.azure.com/api/projects/placeholder/openai/v1"
 )

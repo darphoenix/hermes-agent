@@ -1950,6 +1950,7 @@ class GatewaySlashCommandsMixin:
                                     api_key=result.api_key,
                                     base_url=result.base_url,
                                     api_mode=result.api_mode,
+                                    responses_stateful=result.responses_stateful,
                                 )
                             except Exception as exc:
                                 # The in-place swap rolled the agent back to the
@@ -2009,6 +2010,7 @@ class GatewaySlashCommandsMixin:
                             "api_key": result.api_key,
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
+                            "responses_stateful": result.responses_stateful,
                         }
 
                         # Write-through the non-secret parts to the session
@@ -2263,6 +2265,7 @@ class GatewaySlashCommandsMixin:
                         api_key=result.api_key,
                         base_url=result.base_url,
                         api_mode=result.api_mode,
+                        responses_stateful=result.responses_stateful,
                     )
                 except Exception as exc:
                     # In-place swap rolled the agent back to the OLD working
@@ -2321,6 +2324,7 @@ class GatewaySlashCommandsMixin:
                 "api_key": result.api_key,
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
+                "responses_stateful": result.responses_stateful,
             }
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):
@@ -5252,6 +5256,7 @@ class GatewaySlashCommandsMixin:
                         "reasoning_details": msg.get("reasoning_details"),
                         "codex_reasoning_items": msg.get("codex_reasoning_items"),
                         "codex_message_items": msg.get("codex_message_items"),
+                        "responses_response_id": msg.get("responses_response_id"),
                         # Keep the api_content sidecar so the branch's first turn
                         # replays the parent's exact wire bytes (warm provider
                         # prompt cache) instead of a full cold prefill.

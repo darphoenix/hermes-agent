@@ -3690,6 +3690,7 @@ def _persist_branch_seed(session: dict) -> None:
                         "reasoning_details": msg.get("reasoning_details"),
                         "codex_reasoning_items": msg.get("codex_reasoning_items"),
                         "codex_message_items": msg.get("codex_message_items"),
+                        "responses_response_id": msg.get("responses_response_id"),
                         # Timeline markers (model_switch, personality_switch,
                         # auto_continue, …) ride as role=user; dropping the tag
                         # here re-planted them as bare user turns after a
@@ -5681,6 +5682,8 @@ def _persist_model_switch(result) -> None:
         # removal without needing a key-delete. Leaving the old value would
         # route the new model at the previous custom host (#48305).
         save_config_value("model.base_url", None)
+    if result.responses_stateful is not None:
+        save_config_value("model.responses_stateful", bool(result.responses_stateful))
 
 
 def _snapshot_agent_model_runtime(agent) -> dict:
@@ -5691,6 +5694,7 @@ def _snapshot_agent_model_runtime(agent) -> dict:
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
+        "responses_stateful": bool(getattr(agent, "responses_stateful", False)),
         "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
     }
 
@@ -5716,6 +5720,7 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             api_key=snapshot.get("api_key", ""),
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
+            responses_stateful=snapshot.get("responses_stateful"),
         )
 
 
@@ -5879,6 +5884,7 @@ def _apply_model_switch(
                 api_key=result.api_key,
                 base_url=result.base_url,
                 api_mode=result.api_mode,
+                responses_stateful=result.responses_stateful,
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -5925,6 +5931,7 @@ def _apply_model_switch(
             "base_url": result.base_url,
             "api_key": result.api_key,
             "api_mode": result.api_mode,
+            "responses_stateful": result.responses_stateful,
         }
     if persist_global:
         _persist_model_switch(result)
@@ -8253,6 +8260,7 @@ def _make_agent(
         override_base_url = model_override.get("base_url")
         override_api_key = model_override.get("api_key")
         override_api_mode = model_override.get("api_mode")
+        override_responses_stateful = model_override.get("responses_stateful")
         resolve_kwargs = {}
         if str(requested_provider or "").strip().lower() == "custom":
             # Session rows persisted before the custom-provider identity fix
@@ -8295,6 +8303,10 @@ def _make_agent(
                 runtime["api_key"] = override_api_key
             if override_api_mode:
                 runtime["api_mode"] = override_api_mode
+            if override_responses_stateful is not None:
+                runtime["responses_stateful"] = bool(
+                    override_responses_stateful
+                )
     else:
         model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:
@@ -8318,6 +8330,7 @@ def _make_agent(
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
         api_mode=runtime.get("api_mode"),
+        responses_stateful=bool(runtime.get("responses_stateful", False)),
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"),

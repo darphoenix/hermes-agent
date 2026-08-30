@@ -139,6 +139,7 @@ class CLIAgentSetupMixin:
         )
         self.provider = resolved_provider
         self.api_mode = resolved_api_mode
+        self.responses_stateful = bool(runtime.get("responses_stateful", False))
         self.acp_command = resolved_acp_command
         self.acp_args = resolved_acp_args
         self._credential_pool = resolved_credential_pool
@@ -306,6 +307,9 @@ class CLIAgentSetupMixin:
                 self, "requested_provider", self.provider
             ),
             "api_mode": self.api_mode,
+            "responses_stateful": bool(
+                getattr(self, "responses_stateful", False)
+            ),
             "command": self.acp_command,
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
@@ -319,6 +323,7 @@ class CLIAgentSetupMixin:
                 runtime["requested_provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
+                runtime["responses_stateful"],
                 runtime["command"],
                 tuple(runtime["args"]),
             ),
@@ -483,6 +488,7 @@ class CLIAgentSetupMixin:
                     self, "requested_provider", self.provider
                 ),
                 "api_mode": self.api_mode,
+                "responses_stateful": getattr(self, "responses_stateful", False),
                 "command": self.acp_command,
                 "args": list(self.acp_args or []),
                 "credential_pool": getattr(self, "_credential_pool", None),
@@ -495,6 +501,7 @@ class CLIAgentSetupMixin:
                 provider=runtime.get("provider"),
                 requested_provider=runtime.get("requested_provider"),
                 api_mode=runtime.get("api_mode"),
+                responses_stateful=runtime.get("responses_stateful", False),
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
@@ -572,6 +579,7 @@ class CLIAgentSetupMixin:
                 runtime.get("requested_provider"),
                 runtime.get("base_url"),
                 runtime.get("api_mode"),
+                bool(runtime.get("responses_stateful", False)),
                 runtime.get("command"),
                 tuple(runtime.get("args") or ()),
             )

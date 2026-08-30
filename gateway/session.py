@@ -3891,6 +3891,7 @@ class SessionStore:
             reasoning_details=message.get("reasoning_details") if message.get("role") == "assistant" else None,
             codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
             codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
+            responses_response_id=message.get("responses_response_id") if message.get("role") == "assistant" else None,
             platform_message_id=(message.get("platform_message_id") or message.get("message_id")),
             observed=bool(message.get("observed")),
             timestamp=message.get("timestamp"),

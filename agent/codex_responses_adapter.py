@@ -1164,24 +1164,32 @@ def _preflight_codex_api_kwargs(
         normalized_tools = _neutralize_harmony_structure(normalized_tools)
 
     store = api_kwargs.get("store", False)
-    if store is not False:
-        raise ValueError("Codex Responses contract requires 'store' to be false.")
+    if not isinstance(store, bool):
+        raise ValueError("Codex Responses request 'store' must be a boolean.")
 
     allowed_keys = {
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key",
         "prompt_cache_retention", "service_tier", "context_management",
-        "extra_headers", "extra_body", "timeout",
+        "previous_response_id", "extra_headers", "extra_body", "timeout",
     }
     normalized: Dict[str, Any] = {
         "model": model,
         "instructions": instructions,
         "input": normalized_input,
-        "store": False,
+        "store": store,
     }
     if normalized_tools is not None:
         normalized["tools"] = normalized_tools
+
+    previous_response_id = api_kwargs.get("previous_response_id")
+    if previous_response_id is not None:
+        if not isinstance(previous_response_id, str) or not previous_response_id.strip():
+            raise ValueError(
+                "Codex Responses 'previous_response_id' must be a non-empty string."
+            )
+        normalized["previous_response_id"] = previous_response_id.strip()
 
     # Pass through reasoning config
     reasoning = api_kwargs.get("reasoning")
@@ -1714,6 +1722,7 @@ def _normalize_codex_response(
         reasoning_details=None,
         codex_reasoning_items=reasoning_items_raw or None,
         codex_message_items=message_items_raw or None,
+        responses_response_id=getattr(response, "id", None),
     )
 
     if tool_calls:
