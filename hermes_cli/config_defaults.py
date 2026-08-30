@@ -348,6 +348,24 @@ DEFAULT_CONFIG = {
         # remains available as a tool regardless of this setting — the routing
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
+        # Conscience sidecar mode:
+        #   off                - disabled
+        #   shadow             - audit without changing replies
+        #   observe            - surface critique in the reply
+        #   enforce_stop_gate  - block premature final answers internally
+        #   enforce_observe    - block and surface critique
+        "conscience_mode": "shadow",
+        "conscience_provider": "openai-codex",
+        "conscience_model": "gpt-5.4",
+        "conscience_reasoning_effort": "medium",
+        "conscience_chat_messages": False,
+        # Preserve a per-Hermes-turn Responses chain for local conscience
+        # models. Later audits send deltas and compact before the chain grows
+        # beyond the bounded context maintained by ConscienceState.
+        "conscience_stateful": True,
+        "conscience_repair_temperature": 0.2,
+        "conscience_tool_progress_seconds": 60,
+        "conscience_tool_progress_interval_seconds": 120,
         "disabled_toolsets": [],
 
         # Per-model reasoning effort overrides (spelling-tolerant).

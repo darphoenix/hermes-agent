@@ -1,5 +1,6 @@
 import sys
 import types
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -233,6 +234,79 @@ def test_preflight_and_normalization_keep_stateful_response_identity(monkeypatch
 
     assert message["responses_response_id"] == "resp_123"
     assert agent._responses_previous_response_id == "resp_123"
+
+
+def test_build_api_kwargs_uses_inflight_one_action_tool_policy(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent.tools.append(
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    )
+    agent.valid_tool_names.add("web_search")
+    agent._conscience_inflight_tool_policy = {
+        "mode": "allowlist",
+        "tools": ["terminal"],
+    }
+
+    narrowed = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Ping"},
+        ],
+        tools_for_api=agent._tools_for_next_api_call(),
+    )
+
+    assert [tool["name"] for tool in narrowed["tools"]] == ["terminal"]
+
+
+def test_structured_tool_policy_conflict_uses_transient_parent(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._conscience_inflight_tool_policy = {
+        "mode": "allowlist",
+        "tools": ["terminal"],
+    }
+    agent._conscience_current_monitor = run_agent.ConscienceMonitor(
+        agent.session_id,
+        "Fix the file",
+        agent.conscience_mode,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_handle_midtask_conscience_intervention",
+        lambda *args, **kwargs: False,
+    )
+    response = SimpleNamespace(
+        id="resp_policy_conflict",
+        metadata={
+            "hermes_tool_policy_conflict": json.dumps(
+                {
+                    "type": "undeclared_tool_call",
+                    "tool_names": ["write_file"],
+                }
+            )
+        },
+    )
+
+    names = agent._extract_responses_tool_policy_conflict(response)
+    agent._handle_responses_tool_policy_conflict(response, [], names)
+
+    assert names == ["write_file"]
+    assert (
+        agent._responses_transient_repair_previous_response_id
+        == "resp_policy_conflict"
+    )
+    event = agent._conscience_current_monitor.state.events[-1]
+    assert event.event_type == "TOOL_POLICY_CONFLICT"
+    assert event.payload["executed"] is False
+    assert agent._pending_conscience_internal_messages[-1]["label"] == (
+        "TOOL_POLICY_CONFLICT"
+    )
 
 
 AZURE_FOUNDRY_BASE_URL = (

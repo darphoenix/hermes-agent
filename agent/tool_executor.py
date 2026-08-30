@@ -592,6 +592,7 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    conscience_messages: list | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
     from agent import relay_tools
@@ -713,6 +714,33 @@ def _run_agent_tool_execution_middleware(
 
         _advance_start_order(_begin)
 
+        progress_callback_set = False
+        if (
+            function_name == "terminal"
+            and conscience_messages is not None
+            and getattr(agent, "conscience_tool_progress_seconds", 0) > 0
+            and getattr(agent, "_conscience_current_monitor", None) is not None
+        ):
+            try:
+                from tools.environments.base import set_process_progress_callback
+
+                set_process_progress_callback(
+                    lambda progress: agent._conscience_review_running_tool(
+                        messages=conscience_messages,
+                        tool_name=function_name,
+                        tool_args=final_args,
+                        progress=progress,
+                    ),
+                    initial_delay=agent.conscience_tool_progress_seconds,
+                    interval=agent.conscience_tool_progress_interval_seconds,
+                )
+                progress_callback_set = True
+            except Exception:
+                logger.debug(
+                    "Could not install conscience process-progress callback",
+                    exc_info=True,
+                )
+
         # Keep the gateway turn-inactivity watchdog from abandoning a turn
         # whose tool call runs silently for longer than the inactivity
         # timeout (#84491): stamp activity periodically while the tool is
@@ -731,6 +759,13 @@ def _run_agent_tool_execution_middleware(
         try:
             return execute(final_args)
         finally:
+            if progress_callback_set:
+                try:
+                    from tools.environments.base import set_process_progress_callback
+
+                    set_process_progress_callback(None)
+                except Exception:
+                    pass
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
 
@@ -827,6 +862,7 @@ def _run_sequential_tool_execution_middleware(
     scope_block: str | None = None,
     display_index: int | None = None,
     middleware_trace: list[dict[str, Any]] | None = None,
+    conscience_messages: list | None = None,
 ) -> _ManagedToolResult:
     """Run one sequential call with the concurrent executor's deadline.
 
@@ -845,6 +881,7 @@ def _run_sequential_tool_execution_middleware(
         "scope_block": scope_block,
         "display_index": display_index,
         "middleware_trace": middleware_trace,
+        "conscience_messages": conscience_messages,
     }
     if function_name in _NEVER_PARALLEL_TOOLS:
         return _run_agent_tool_execution_middleware(agent, **kwargs)
@@ -1397,6 +1434,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=middleware_trace,
                     begin_execution=_advance_start,
                     authorization_gate=authorization_gate,
+                    conscience_messages=messages,
                 )
                 result = managed.result
                 function_args = managed.args
@@ -1962,6 +2000,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # Keep every runtime-tool branch on one bounded execution funnel without
     # duplicating timeout policy across the branch-specific callbacks below.
     def _run_agent_tool_execution_middleware(agent, **kwargs):
+        kwargs.setdefault("conscience_messages", messages)
         return _run_sequential_tool_execution_middleware(agent, **kwargs)
 
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):

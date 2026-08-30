@@ -1818,6 +1818,104 @@ def init_agent(
     except Exception:
         agent.show_commentary = True
 
+    agent_config = (
+        _agent_cfg.get("agent", {}) if isinstance(_agent_cfg, dict) else {}
+    )
+    agent.conscience_mode = str(
+        agent_config.get("conscience_mode", "shadow") or "shadow"
+    ).strip().lower()
+    if agent.conscience_mode not in {
+        "off",
+        "shadow",
+        "observe",
+        "enforce_stop_gate",
+        "enforce_observe",
+    }:
+        agent.conscience_mode = "shadow"
+    agent.conscience_provider = str(
+        agent_config.get("conscience_provider", "openai-codex")
+        or "openai-codex"
+    ).strip()
+    agent.conscience_model = str(
+        agent_config.get("conscience_model", "gpt-5.4") or "gpt-5.4"
+    ).strip()
+    agent.conscience_chat_messages = is_truthy_value(
+        agent_config.get("conscience_chat_messages"), default=False
+    )
+    agent.conscience_stateful = is_truthy_value(
+        agent_config.get("conscience_stateful"), default=True
+    )
+    repair_temperature = agent_config.get(
+        "conscience_repair_temperature", 0.2
+    )
+    if isinstance(repair_temperature, str) and repair_temperature.strip().lower() in {
+        "",
+        "none",
+        "off",
+        "false",
+    }:
+        agent.conscience_repair_temperature = None
+    else:
+        try:
+            agent.conscience_repair_temperature = float(repair_temperature)
+        except (TypeError, ValueError):
+            agent.conscience_repair_temperature = 0.2
+        if agent.conscience_repair_temperature < 0:
+            agent.conscience_repair_temperature = None
+    try:
+        agent.conscience_tool_progress_seconds = max(
+            0.0,
+            float(
+                agent_config.get("conscience_tool_progress_seconds", 60) or 0
+            ),
+        )
+    except (TypeError, ValueError):
+        agent.conscience_tool_progress_seconds = 60.0
+    try:
+        agent.conscience_tool_progress_interval_seconds = max(
+            10.0,
+            float(
+                agent_config.get(
+                    "conscience_tool_progress_interval_seconds", 120
+                )
+                or 120
+            ),
+        )
+    except (TypeError, ValueError):
+        agent.conscience_tool_progress_interval_seconds = 120.0
+    conscience_effort = str(
+        agent_config.get("conscience_reasoning_effort", "medium") or "medium"
+    ).strip().lower()
+    if conscience_effort not in {"none", "low", "medium", "high", "xhigh"}:
+        conscience_effort = "medium"
+    agent.conscience_reasoning_config = (
+        {"enabled": False, "effort": "none"}
+        if conscience_effort == "none"
+        else {"enabled": True, "effort": conscience_effort}
+    )
+    agent._conscience_active = agent.conscience_mode != "off"
+    agent._conscience_current_monitor = None
+    agent._conscience_last_ticket = None
+    agent._conscience_last_stop_audit = None
+    agent._conscience_last_review = None
+    agent._conscience_last_review_payload = None
+    agent._conscience_last_useful_final_response = None
+    agent._conscience_intervention_count = 0
+    agent._conscience_blocked_stop_count = 0
+    agent._conscience_artifact_dir = None
+    agent._conscience_pending_tool_policy = None
+    agent._conscience_inflight_tool_policy = None
+    agent._conscience_repair_override_active = False
+    agent._pending_conscience_internal_messages = []
+    agent._deferred_conscience_visible_messages = []
+    agent._active_conscience_internal_messages = []
+    agent._trace_lock = threading.Lock()
+    agent._request_trace = []
+    agent._trace_turn_id = None
+    agent._trace_task_id = None
+    agent._trace_turn_started_at = time.time()
+    agent._active_api_trace_row = None
+
     # LM Studio can either be explicitly preloaded through LM Studio's
     # management API (the historical Hermes behavior) or left to LM Studio's
     # just-in-time / Auto-Evict chat-completions path.  Keep the default

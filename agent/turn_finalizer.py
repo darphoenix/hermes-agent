@@ -699,6 +699,13 @@ def finalize_turn(
     if isinstance(final_response, str):
         final_response = _sanitize_surrogates(final_response)
 
+    conscience_monitor = getattr(agent, "_conscience_current_monitor", None)
+    conscience_artifacts = (
+        agent._persist_conscience_artifacts(conscience_monitor)
+        if conscience_monitor is not None
+        else None
+    )
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,
@@ -766,9 +773,49 @@ def finalize_turn(
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
 
+    if conscience_monitor is not None:
+        from agent.conscience import asdict_safe
+
+        unresolved_criteria_count = sum(
+            1
+            for entry in conscience_monitor.state.ledger.values()
+            if getattr(entry, "status", None) != "done"
+        )
+        critique_tickets = []
+        if isinstance(conscience_artifacts, dict):
+            critique_tickets = list(
+                conscience_artifacts.get("critique_tickets") or []
+            )
+        if not critique_tickets and agent._conscience_last_ticket:
+            critique_tickets = [asdict_safe(agent._conscience_last_ticket)]
+        result["conscience"] = {
+            "mode": agent.conscience_mode,
+            "provider": agent.conscience_provider,
+            "model": agent.conscience_model,
+            "artifacts": conscience_artifacts,
+            "artifact_dir": str(agent._conscience_artifact_dir)
+            if agent._conscience_artifact_dir
+            else None,
+            "intervention_count": agent._conscience_intervention_count,
+            "blocked_stop_count": agent._conscience_blocked_stop_count,
+            "unresolved_criteria_count": unresolved_criteria_count,
+            "last_critique_reason": agent._conscience_last_ticket.reason
+            if agent._conscience_last_ticket
+            else None,
+            "ticket_count": len(critique_tickets),
+            "latest_ticket": critique_tickets[-1]
+            if critique_tickets
+            else None,
+            "latest_review": agent._conscience_last_review,
+            "latest_review_payload": agent._conscience_last_review_payload,
+            "stop_audit": agent._conscience_last_stop_audit,
+        }
+
     # Include interrupt message if one triggered the interrupt
     if interrupted and agent._interrupt_message:
         result["interrupt_message"] = agent._interrupt_message
+
+    agent._conscience_current_monitor = None
 
     # Clear interrupt state after handling
     agent.clear_interrupt()

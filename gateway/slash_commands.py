@@ -1748,6 +1748,19 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
+    async def _handle_conscience_command(self, event: MessageEvent) -> str:
+        """Show the latest conscience review for this session."""
+        from agent.conscience_status import (
+            build_conscience_status_summary,
+            format_conscience_status_text,
+        )
+        from gateway.run import _hermes_home
+
+        session_entry = self.session_store.get_or_create_session(event.source)
+        artifact_dir = str(_hermes_home / "conscience" / session_entry.session_id)
+        summary = build_conscience_status_summary(artifact_dir=artifact_dir)
+        return format_conscience_status_text(summary)
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model.
 

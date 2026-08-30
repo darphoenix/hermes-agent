@@ -187,6 +187,19 @@ def remember_transient_parent(
     )
 
 
+def clear_transient_parent(agent: Any, *, reason: str = "") -> None:
+    current = getattr(
+        agent, "_responses_transient_repair_previous_response_id", None
+    )
+    agent._responses_transient_repair_previous_response_id = None
+    if current:
+        logger.info(
+            "Cleared transient Responses repair parent (%s): %s",
+            reason or "clear",
+            current,
+        )
+
+
 def _get_previous_response_id(
     agent: Any,
     messages: Optional[List[Dict[str, Any]]] = None,

@@ -158,6 +158,21 @@ from agent.model_metadata import (
     is_local_endpoint,
 )
 from agent.usage_pricing import normalize_usage
+from agent.display import _detect_tool_failure
+from agent.conscience import (
+    ARTIFACT_UPDATED,
+    DRAFT_ANSWER,
+    PLAN_SUMMARY,
+    TASK_START,
+    TOOL_CALL,
+    TOOL_POLICY_CONFLICT,
+    TOOL_PROGRESS,
+    TOOL_RESULT,
+    ConscienceMonitor,
+    ConscienceVerdict,
+    CritiqueTicket,
+    asdict_safe,
+)
 # Re-exported for tests that monkeypatch these symbols on run_agent.
 from agent.context_compressor import (  # noqa: F401
     COMPRESSED_SUMMARY_METADATA_KEY,
@@ -7630,7 +7645,9 @@ class AIAgent:
     def _build_api_kwargs(self, api_messages: list, tools_for_api: Optional[list] = None) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
         from agent.chat_completion_helpers import build_api_kwargs
-        return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
+        return self._apply_conscience_repair_overrides(
+            build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
+        )
 
     def _responses_stateful_enabled(self) -> bool:
         from agent.stateful_responses import is_enabled
@@ -7653,6 +7670,11 @@ class AIAgent:
         from agent.stateful_responses import remember_transient_parent
 
         remember_transient_parent(self, response_id, reason=reason)
+
+    def _clear_transient_responses_repair_parent(self, reason: str = "") -> None:
+        from agent.stateful_responses import clear_transient_parent
+
+        clear_transient_parent(self, reason=reason)
 
     def _active_responses_previous_response_id(
         self, api_kwargs: Optional[Dict[str, Any]] = None
@@ -8459,6 +8481,981 @@ class AIAgent:
             tool_request_middleware_trace,
             skip_tool_execution_middleware,
         )
+
+    def _request_trace_enabled(self) -> bool:
+        value = str(os.getenv("HERMES_REQUEST_TRACE", "1")).strip().lower()
+        return value not in {"0", "false", "off", "no"}
+
+    def _trace_actor_name(self) -> str:
+        prefix = str(getattr(self, "log_prefix", "") or "").strip().lower()
+        if "subagent" in prefix or int(getattr(self, "_delegate_depth", 0) or 0) > 0:
+            return "delegate"
+        return "main"
+
+    def _trace_base_event(self, kind: str, *, actor: str | None = None, **fields: Any) -> dict[str, Any]:
+        now = time.time()
+        turn_started = float(getattr(self, "_trace_turn_started_at", now) or now)
+        row: dict[str, Any] = {
+            "schema_version": 1,
+            "kind": kind,
+            "created_at_s": round(now, 6),
+            "turn_elapsed_s": round(max(0.0, now - turn_started), 6),
+            "session_id": self.session_id or "",
+            "turn_id": getattr(self, "_trace_turn_id", None) or "",
+            "task_id": getattr(self, "_trace_task_id", None) or getattr(self, "_current_task_id", "") or "",
+            "actor": actor or self._trace_actor_name(),
+        }
+        row.update(fields)
+        return row
+
+    def _trace_record_event(self, kind: str, *, actor: str | None = None, **fields: Any) -> dict[str, Any] | None:
+        if not self._request_trace_enabled():
+            return None
+        row = self._trace_base_event(kind, actor=actor, **fields)
+        with self._trace_lock:
+            self._request_trace.append(row)
+        return row
+
+    def _trace_update_active_api(self, **fields: Any) -> None:
+        if not self._request_trace_enabled():
+            return
+        with self._trace_lock:
+            row = self._active_api_trace_row
+            if row is not None:
+                row.update(fields)
+
+    def _trace_apply_headers(self, api_kwargs: dict, *, request_id: str, actor: str) -> dict:
+        if not isinstance(api_kwargs, dict):
+            return api_kwargs
+        existing = api_kwargs.get("extra_headers")
+        headers: dict[str, str] = {}
+        if isinstance(existing, dict):
+            headers.update({str(k): str(v) for k, v in existing.items()})
+        headers.setdefault("X-Hermes-Request-Id", request_id)
+        headers.setdefault("X-Hermes-Actor", actor)
+        headers.setdefault("X-Hermes-Turn-Id", str(getattr(self, "_trace_turn_id", "") or ""))
+        headers.setdefault("X-Hermes-Session-Id", str(self.session_id or ""))
+        headers.setdefault("X-Hermes-Task-Id", str(getattr(self, "_trace_task_id", "") or getattr(self, "_current_task_id", "") or ""))
+        api_kwargs["extra_headers"] = headers
+        return api_kwargs
+
+    def _trace_start_api_call(
+        self,
+        *,
+        api_call_index: int,
+        message_count: int,
+        tool_count: int,
+        approx_input_tokens: int,
+        request_char_count: int,
+    ) -> dict[str, Any] | None:
+        if not self._request_trace_enabled():
+            return None
+        actor = self._trace_actor_name()
+        short_turn = str(getattr(self, "_trace_turn_id", "") or "turn").replace("turn_", "")
+        request_id = f"hrq_{short_turn}_{api_call_index}_{uuid.uuid4().hex[:6]}"
+        return self._trace_base_event(
+            "api_call",
+            actor=actor,
+            request_id=request_id,
+            api_call_index=api_call_index,
+            model=self.model,
+            provider=self.provider or "",
+            api_mode=self.api_mode,
+            base_url=self.base_url or "",
+            message_count=message_count,
+            tool_count=tool_count,
+            approx_input_tokens=approx_input_tokens,
+            request_char_count=request_char_count,
+            status="started",
+        )
+
+    def _trace_finish_api_call(self, row: dict[str, Any] | None, **fields: Any) -> None:
+        if not row or not self._request_trace_enabled():
+            return
+        now = time.time()
+        turn_started = float(getattr(self, "_trace_turn_started_at", now) or now)
+        row.update(fields)
+        row["finished_at_s"] = round(now, 6)
+        row["turn_finished_elapsed_s"] = round(max(0.0, now - turn_started), 6)
+        with self._trace_lock:
+            self._request_trace.append(dict(row))
+            if self._active_api_trace_row is row:
+                self._active_api_trace_row = None
+
+    def _conscience_record_event(self, event_type: str, payload: dict | None = None) -> None:
+        monitor = getattr(self, "_conscience_current_monitor", None)
+        if not monitor:
+            return
+        try:
+            monitor.record_event(event_type, payload or {})
+        except Exception as exc:
+            logger.debug("Conscience event recording failed for %s: %s", event_type, exc)
+
+    @staticmethod
+    def _conscience_head_tail_preview(value: Any, limit: int = 8_000) -> tuple[str, bool, int, str, str]:
+        text = "" if value is None else str(value)
+        limit = max(256, int(limit or 8_000))
+        if len(text) <= limit:
+            return text, False, 0, text, text
+
+        omitted = len(text) - limit
+        while True:
+            marker = f"\n... [truncated {omitted} chars] ...\n"
+            keep = max(0, limit - len(marker))
+            head_len = keep // 2
+            tail_len = keep - head_len
+            new_omitted = len(text) - head_len - tail_len
+            if new_omitted == omitted:
+                break
+            omitted = new_omitted
+
+        head = text[:head_len]
+        tail = text[-tail_len:] if tail_len else ""
+        return f"{head}{marker}{tail}", True, omitted, head, tail
+
+    def _conscience_tool_result_payload(
+        self,
+        *,
+        tool_name: str,
+        tool_args: dict,
+        tool_result: str,
+        duration: float,
+        call_id: str | None = None,
+    ) -> dict:
+        is_error, failure_reason = _detect_tool_failure(tool_name, tool_result)
+        result_preview, result_truncated, result_omitted, _, _ = self._conscience_head_tail_preview(tool_result)
+        payload = {
+            "tool_name": tool_name,
+            "tool_args": asdict_safe(tool_args),
+            "tool_call_id": call_id,
+            "success": not is_error,
+            "duration_seconds": duration,
+            "result_preview": result_preview,
+            "result_preview_truncated": result_truncated,
+        }
+        if result_truncated:
+            payload["result_omitted_chars"] = result_omitted
+
+        parsed_result = None
+        if isinstance(tool_result, str):
+            try:
+                loaded_result = json.loads(tool_result)
+            except Exception:
+                loaded_result = None
+            if isinstance(loaded_result, dict):
+                parsed_result = loaded_result
+
+        if parsed_result is not None:
+            for exit_key in ("exit_code", "returncode"):
+                if exit_key in parsed_result:
+                    payload["exit_code"] = parsed_result.get(exit_key)
+                    break
+            output = parsed_result.get("output")
+            if isinstance(output, str):
+                (
+                    _output_preview,
+                    output_truncated,
+                    output_omitted,
+                    output_head,
+                    output_tail,
+                ) = self._conscience_head_tail_preview(output)
+                payload["output_chars"] = len(output)
+                payload["output_preview_truncated"] = output_truncated
+                payload["output_head"] = output_head
+                if output_truncated:
+                    payload["output_tail"] = output_tail
+                    payload["output_omitted_chars"] = output_omitted
+            parsed_error = parsed_result.get("error")
+            if parsed_error not in (None, ""):
+                payload["tool_error"] = str(parsed_error)
+        if is_error and failure_reason:
+            payload["error"] = failure_reason
+        return payload
+
+    def _conscience_record_artifact_if_applicable(self, tool_name: str, tool_args: dict, tool_result: str) -> None:
+        if tool_name not in {"write_file", "patch"}:
+            return
+        path = tool_args.get("path") if isinstance(tool_args, dict) else None
+        if not isinstance(path, str) or not path.strip():
+            return
+        is_error, _ = _detect_tool_failure(tool_name, tool_result)
+        if is_error:
+            return
+        self._conscience_record_event(ARTIFACT_UPDATED, {"path": path})
+
+    @staticmethod
+    def _format_conscience_visible_message(ticket: CritiqueTicket) -> str:
+        evidence = "; ".join(ticket.evidence[:3])
+        message = f"[Conscience] {ticket.reason}."
+        if evidence:
+            message += f" Evidence: {evidence}."
+        if ticket.next_best_action:
+            message += f" Next action: {ticket.next_best_action}"
+        return message
+
+    @staticmethod
+    def _conscience_ticket_mentions_loop(ticket: CritiqueTicket) -> bool:
+        text = " ".join(
+            [
+                str(ticket.reason or ""),
+                str(ticket.next_best_action or ""),
+                " ".join(str(item) for item in (ticket.evidence or [])),
+            ]
+        ).lower()
+        loop_terms = (
+            "loop",
+            "repeat",
+            "same draft",
+            "same answer",
+            "same response",
+            "same tool",
+            "regenerat",
+            "no new evidence",
+        )
+        return any(term in text for term in loop_terms)
+
+    @staticmethod
+    def _conscience_ticket_needs_tool(ticket: CritiqueTicket) -> bool:
+        return bool(getattr(ticket, "recommended_tools", None))
+
+    @staticmethod
+    def _conscience_looks_like_useful_final_answer(text: str) -> bool:
+        cleaned = (text or "").strip()
+        if len(cleaned) < 20:
+            return False
+        lowered = cleaned.lower()
+        intent_starters = (
+            "let me ",
+            "i'll ",
+            "i will ",
+            "i'm going to ",
+            "i am going to ",
+            "right. let me ",
+            "need to ",
+        )
+        return not lowered.startswith(intent_starters)
+
+    def _conscience_best_repair_exhausted_final(self, final_response: str) -> str | None:
+        current = (final_response or "").strip()
+        if self._conscience_looks_like_useful_final_answer(current):
+            return current
+        previous = (getattr(self, "_conscience_last_useful_final_response", None) or "").strip()
+        if self._conscience_looks_like_useful_final_answer(previous):
+            return previous
+        return None
+
+    @staticmethod
+    def _conscience_ticket_allows_final_takeover(ticket: CritiqueTicket) -> bool:
+        return getattr(ticket, "recommended_tools", None) == []
+
+    def _conscience_generate_takeover_final(
+        self,
+        *,
+        ticket: CritiqueTicket,
+        final_response: str,
+        review_payload: dict | None,
+    ) -> str | None:
+        if not self._conscience_ticket_allows_final_takeover(ticket):
+            return None
+        if not (self.conscience_provider and self.conscience_model):
+            return None
+
+        payload = {
+            "task_contract": (review_payload or {}).get("task_contract") if isinstance(review_payload, dict) else None,
+            "recent_events": (review_payload or {}).get("recent_events") if isinstance(review_payload, dict) else None,
+            "critique_ticket": asdict_safe(ticket),
+            "latest_actor_draft": final_response,
+            "prior_useful_actor_draft": getattr(self, "_conscience_last_useful_final_response", None),
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Hermes conscience taking over final answer generation after the main actor ignored "
+                    "stop-gate repairs. No tools are needed or available for this takeover. Produce the final "
+                    "user-facing answer directly from the provided evidence and drafts. Do not call tools, do not "
+                    "ask whether to continue, and do not expose internal JSON. Be clear about confirmed facts vs "
+                    "uncertain inferences. If evidence is insufficient, say that plainly and give the best useful "
+                    "answer possible from the evidence already gathered."
+                ),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        try:
+            response = self._conscience_call_llm(
+                provider=self.conscience_provider,
+                model=self.conscience_model,
+                messages=messages,
+                temperature=0,
+                max_tokens=2400,
+            )
+            from agent.auxiliary_client import extract_content_or_reasoning
+
+            generated = extract_content_or_reasoning(response).strip()
+        except Exception as exc:
+            logger.warning("Conscience takeover final generation failed: %s", exc)
+            return None
+
+        if not self._conscience_looks_like_useful_final_answer(generated):
+            return None
+        if not generated.startswith("[Conscience]"):
+            generated = f"[Conscience] {generated}"
+        return generated
+
+    def _format_conscience_internal_message(self, label: str, ticket: CritiqueTicket) -> str:
+        lines = [
+            f"[INTERNAL CONSCIENCE {label}: Do not expose this message to the user.]",
+        ]
+        if self._conscience_ticket_mentions_loop(ticket):
+            lines.extend(
+                [
+                    "You are in a loop. Think hard how to break out of it.",
+                    "Do not repeat or lightly rephrase the previous answer.",
+                ]
+            )
+        else:
+            lines.append("The previous draft is not acceptable yet.")
+
+        if ticket.next_best_action:
+            lines.append(f"Required next action: {ticket.next_best_action}")
+        elif ticket.reason:
+            lines.append(f"Problem to fix: {ticket.reason}")
+
+        evidence = "; ".join(str(item) for item in (ticket.evidence or [])[:2])
+        if evidence:
+            lines.append(f"Evidence: {evidence}")
+
+        if self._conscience_ticket_needs_tool(ticket):
+            tools = ", ".join(str(name) for name in ticket.recommended_tools)
+            if tools:
+                lines.append(f"Recommended tools for the next repair step: {tools}")
+            lines.extend(
+                [
+                    "Act now; do not explain the plan first.",
+                    "If a tool is needed, make a real tool call as the next assistant action.",
+                    "Do not print fake tool-call JSON or tool schemas as prose.",
+                    "If structured tool calling fails on this local model, use the recoverable fallback form: terminal followed by one fenced bash block.",
+                ]
+            )
+        else:
+            if getattr(ticket, "recommended_tools", None) == []:
+                lines.append("No tools are recommended for the next repair step; answer or synthesize now without another tool call.")
+            lines.append("Act now; do not explain this instruction.")
+
+        policy = getattr(ticket, "tool_policy", None)
+        if isinstance(policy, dict) and policy.get("mode") == "allowlist":
+            policy_tools = ", ".join(str(name) for name in (policy.get("tools") or []))
+            if policy_tools:
+                lines.append(f"Strict one-action tool policy: use only {policy_tools} for the next actor action.")
+            else:
+                lines.append("Strict one-action tool policy: do not call a tool in the next actor action.")
+
+        return "\n".join(lines)
+
+    def _queue_actor_internal_message(
+        self,
+        label: str,
+        content: str,
+        *,
+        source: str = "runtime",
+    ) -> None:
+        if not content.strip():
+            return
+        event = {
+            "id": f"{source}_{label.lower()}_{uuid.uuid4().hex[:12]}",
+            "label": label,
+            "content": content,
+            "source": source,
+            "created_at": time.time(),
+        }
+        self._pending_conscience_internal_messages.append(event)
+        logger.info(
+            "Queued hidden %s %s directive for next actor request (session=%s event_id=%s)",
+            source,
+            label,
+            self.session_id or "-",
+            event["id"],
+        )
+
+    def _queue_conscience_internal_message(self, label: str, ticket: CritiqueTicket) -> None:
+        self._queue_actor_internal_message(
+            label,
+            self._format_conscience_internal_message(label, ticket),
+            source="conscience",
+        )
+
+    def _queue_empty_response_recovery_directive(self) -> None:
+        self._queue_actor_internal_message(
+            "EMPTY_RESPONSE_RECOVERY",
+            "\n".join(
+                [
+                    "[INTERNAL EMPTY-RESPONSE RECOVERY: Do not expose this message to the user.]",
+                    "You just received tool results but returned no usable assistant action.",
+                    "Process the latest tool results and continue the task now.",
+                    "Do not repeat prior narration.",
+                    "If another tool is needed, make a real tool call; otherwise provide the next useful answer.",
+                ]
+            ),
+            source="runtime",
+        )
+
+    def _consume_conscience_internal_messages_for_api(self) -> list[dict[str, Any]]:
+        pending = list(getattr(self, "_pending_conscience_internal_messages", []) or [])
+        self._pending_conscience_internal_messages = []
+        self._active_conscience_internal_messages = pending
+        if not pending:
+            return []
+        logger.info(
+            "Injecting %s hidden actor directive(s) into next request only (session=%s)",
+            len(pending),
+            self.session_id or "-",
+        )
+        return [
+            {
+                "role": "system",
+                "content": str(item.get("content") or ""),
+                "_hermes_internal_directive": True,
+                "_hermes_internal_directive_id": str(item.get("id") or ""),
+                "_hermes_internal_directive_label": str(item.get("label") or ""),
+            }
+            for item in pending
+            if str(item.get("content") or "").strip()
+        ]
+
+    def _clear_conscience_internal_messages(self, reason: str) -> None:
+        pending = len(getattr(self, "_pending_conscience_internal_messages", []) or [])
+        active = len(getattr(self, "_active_conscience_internal_messages", []) or [])
+        self._pending_conscience_internal_messages = []
+        self._active_conscience_internal_messages = []
+        self._conscience_pending_tool_policy = None
+        self._conscience_inflight_tool_policy = None
+        self._clear_transient_responses_repair_parent(f"hidden_directive_clear:{reason}")
+        if pending or active:
+            logger.info(
+                "Cleared hidden conscience directives (%s): pending=%s active=%s session=%s",
+                reason,
+                pending,
+                active,
+                self.session_id or "-",
+            )
+
+    def _prepare_conscience_tool_policy(self, ticket: CritiqueTicket) -> None:
+        """Stage an explicit strict policy for exactly one actor action."""
+        self._conscience_pending_tool_policy = None
+        if not self.tools or not self.valid_tool_names:
+            return
+
+        policy = getattr(ticket, "tool_policy", None)
+        if not isinstance(policy, dict) or policy.get("mode") != "allowlist":
+            return
+        raw_names = policy.get("tools")
+        if not isinstance(raw_names, list):
+            return
+
+        requested = {str(name).strip() for name in raw_names if str(name).strip()}
+        unknown = sorted(requested.difference(self.valid_tool_names))
+        if unknown:
+            logger.warning(
+                "Ignoring conscience tool policy with unloaded tools %s (session=%s)",
+                unknown,
+                self.session_id or "-",
+            )
+            return
+
+        self._conscience_pending_tool_policy = {
+            "mode": "allowlist",
+            "tools": sorted(requested),
+        }
+        logger.info(
+            "Staged one-action conscience tool policy tools=%s (session=%s)",
+            sorted(requested),
+            self.session_id or "-",
+        )
+
+    def _activate_conscience_tool_policy_for_actor_action(self) -> None:
+        self._conscience_inflight_tool_policy = self._conscience_pending_tool_policy
+        self._conscience_pending_tool_policy = None
+
+    def _tools_for_next_api_call(self) -> Optional[List[Dict[str, Any]]]:
+        self._conscience_repair_override_active = any(
+            item.get("source") == "conscience"
+            for item in (getattr(self, "_active_conscience_internal_messages", []) or [])
+            if isinstance(item, dict)
+        )
+        policy = getattr(self, "_conscience_inflight_tool_policy", None)
+        if not isinstance(policy, dict) or policy.get("mode") != "allowlist" or not self.tools:
+            return self.tools
+        tool_names = set(policy.get("tools") or [])
+        if not tool_names:
+            self._conscience_repair_override_active = True
+            return []
+        filtered = [
+            tool for tool in self.tools
+            if tool.get("function", {}).get("name") in tool_names
+        ]
+        if filtered:
+            self._conscience_repair_override_active = True
+        return filtered or self.tools
+
+    def _apply_conscience_repair_overrides(self, api_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        if not getattr(self, "_conscience_repair_override_active", False):
+            return api_kwargs
+        if self.provider != "custom":
+            return api_kwargs
+        if self.conscience_repair_temperature is not None:
+            api_kwargs["temperature"] = self.conscience_repair_temperature
+        return api_kwargs
+
+    @staticmethod
+    def _extract_responses_tool_policy_conflict(response: Any) -> list[str]:
+        metadata = getattr(response, "metadata", None)
+        if hasattr(metadata, "model_dump"):
+            metadata = metadata.model_dump()
+        if not isinstance(metadata, dict):
+            return []
+        raw = metadata.get("hermes_tool_policy_conflict")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return []
+        if not isinstance(raw, dict):
+            return []
+        names = raw.get("tool_names")
+        if not isinstance(names, list):
+            return []
+        return sorted({str(name).strip() for name in names if str(name).strip()})
+
+    def _handle_responses_tool_policy_conflict(
+        self,
+        response: Any,
+        messages: list,
+        tool_names: list[str],
+    ) -> None:
+        active_policy = getattr(self, "_conscience_inflight_tool_policy", None)
+        policy_was_active = isinstance(active_policy, dict)
+        self._conscience_record_event(
+            TOOL_POLICY_CONFLICT,
+            {
+                "requested_tools": list(tool_names),
+                "active_tool_policy": dict(active_policy) if policy_was_active else None,
+                "available_tools": sorted(self.valid_tool_names) if self.valid_tool_names else [],
+                "executed": False,
+            },
+        )
+        self._remember_transient_responses_repair_parent(
+            getattr(response, "id", None),
+            reason="tool_policy_conflict",
+        )
+        requested = ", ".join(tool_names)
+        policy_context = (
+            "The strict one-action tool policy has now expired."
+            if policy_was_active
+            else "The requested name is not in the loaded tool schema."
+        )
+        self._queue_actor_internal_message(
+            "TOOL_POLICY_CONFLICT",
+            "\n".join(
+                [
+                    "[INTERNAL TOOL-POLICY CONFLICT: Do not expose this message to the user.]",
+                    f"Your previous action requested excluded tool(s): {requested}.",
+                    "The tool call was not executed; do not claim that it succeeded.",
+                    policy_context,
+                    "Reassess the next action using the currently available tools.",
+                ]
+            ),
+            source="runtime",
+        )
+        if getattr(self, "_conscience_current_monitor", None) is not None:
+            self._handle_midtask_conscience_intervention(messages, defer_visible=True)
+        logger.warning(
+            "Recovering structured tool-policy conflict tools=%s policy_active=%s session=%s",
+            tool_names,
+            policy_was_active,
+            self.session_id or "-",
+        )
+
+    def _append_visible_conscience_message(self, messages: list, text: str, *, persist: bool = True) -> None:
+        if not isinstance(text, str) or not text.strip():
+            return
+        msg = {"role": "assistant", "content": text.strip()}
+        if persist:
+            messages.append(msg)
+        if self.conscience_chat_messages:
+            self._emit_interim_assistant_message(msg)
+
+    @staticmethod
+    def _extract_responses_text(response: Any) -> str:
+        direct = getattr(response, "output_text", None)
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+        parts: list[str] = []
+        for item in getattr(response, "output", []) or []:
+            item_type = getattr(item, "type", None)
+            if item_type is None and isinstance(item, dict):
+                item_type = item.get("type")
+            if item_type != "message":
+                continue
+            content = getattr(item, "content", None)
+            if content is None and isinstance(item, dict):
+                content = item.get("content")
+            for part in content or []:
+                part_type = getattr(part, "type", None)
+                text = getattr(part, "text", None)
+                if isinstance(part, dict):
+                    part_type = part.get("type", part_type)
+                    text = part.get("text", text)
+                if part_type in {"output_text", "text"} and isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _responses_usage_to_chat_usage(response: Any) -> Any:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        input_tokens = getattr(usage, "input_tokens", 0) or 0
+        output_tokens = getattr(usage, "output_tokens", 0) or 0
+        total_tokens = getattr(usage, "total_tokens", None)
+        if total_tokens is None:
+            total_tokens = input_tokens + output_tokens
+        return SimpleNamespace(
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=total_tokens,
+        )
+
+    def _conscience_call_llm(
+        self,
+        *,
+        provider: str,
+        model: str,
+        messages: list,
+        temperature: float,
+        max_tokens: int,
+        stateful_payload: dict | None = None,
+    ):
+        from agent.auxiliary_client import call_llm as _call_llm
+
+        extra_body = None
+        if getattr(self, "conscience_reasoning_config", None):
+            reasoning = dict(self.conscience_reasoning_config)
+            if str(provider or "").strip().lower() == "openai-codex":
+                # Codex/OpenAI Responses accepts reasoning.effort but rejects
+                # reasoning.enabled.
+                reasoning.pop("enabled", None)
+            extra_body = {"reasoning": reasoning}
+
+        trace_row = None
+        trace_started = time.perf_counter()
+        if self._request_trace_enabled():
+            short_turn = str(getattr(self, "_trace_turn_id", "") or "turn").replace("turn_", "")
+            trace_row = self._trace_base_event(
+                "conscience_call",
+                actor="conscience",
+                request_id=f"hrq_{short_turn}_conscience_{uuid.uuid4().hex[:6]}",
+                provider=provider or "",
+                model=model or "",
+                api_mode="codex_responses" if self.conscience_stateful else "chat_completions",
+                stateful_requested=bool(self.conscience_stateful),
+                max_tokens=max_tokens,
+                temperature=temperature,
+                status="started",
+            )
+
+        if (
+            self.conscience_stateful
+            and isinstance(stateful_payload, dict)
+            and str(provider or "").strip().lower().startswith("custom")
+        ):
+            try:
+                from agent.auxiliary_client import _get_cached_client, _resolve_task_provider_model
+
+                resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = (
+                    _resolve_task_provider_model(
+                        provider=provider,
+                        model=model,
+                    )
+                )
+                client, final_model = _get_cached_client(
+                    resolved_provider,
+                    resolved_model,
+                    base_url=resolved_base_url,
+                    api_key=resolved_api_key,
+                    api_mode=resolved_api_mode,
+                )
+                base_url = str(getattr(client, "base_url", "") or "")
+                real_client = getattr(client, "_real_client", client)
+                if client is not None and is_local_endpoint(base_url) and hasattr(real_client, "responses"):
+                    input_payload = stateful_payload.get("input_payload")
+                    instructions = str(stateful_payload.get("instructions") or "").strip()
+                    fresh_fallback = bool(stateful_payload.get("fresh_fallback"))
+                    previous_response_id = None if fresh_fallback else stateful_payload.get("previous_response_id")
+                    store_response = not fresh_fallback and bool(stateful_payload.get("store", True))
+                    request_kwargs: dict[str, Any] = {
+                        "model": final_model or model,
+                        "instructions": instructions or "You are Hermes conscience sidecar.",
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": json.dumps(input_payload or {}, ensure_ascii=False),
+                            }
+                        ],
+                        "store": store_response,
+                        "max_output_tokens": max_tokens,
+                    }
+                    if temperature is not None:
+                        request_kwargs["temperature"] = temperature
+                    if isinstance(previous_response_id, str) and previous_response_id.strip():
+                        request_kwargs["previous_response_id"] = previous_response_id.strip()
+                    if trace_row is not None:
+                        request_kwargs = self._trace_apply_headers(
+                            request_kwargs,
+                            request_id=str(trace_row.get("request_id") or ""),
+                            actor="conscience",
+                        )
+                    logger.info(
+                        "Conscience stateful audit call: provider=%s model=%s prev=%s mode=%s",
+                        provider,
+                        final_model or model,
+                        previous_response_id or None,
+                        (input_payload or {}).get("stateful_mode") if isinstance(input_payload, dict) else None,
+                    )
+                    response = real_client.responses.create(**request_kwargs)
+                    response_id = str(getattr(response, "id", "") or "").strip() or None
+                    response_status = str(getattr(response, "status", "") or "").strip()
+                    response_finish_reason = "length" if response_status == "incomplete" else "stop"
+                    content = self._extract_responses_text(response)
+                    if trace_row is not None:
+                        usage = self._responses_usage_to_chat_usage(response)
+                        trace_fields = {
+                            "status": "ok",
+                            "api_duration_s": round(time.perf_counter() - trace_started, 6),
+                            "response_id": response_id or "",
+                            "stateful_used": not fresh_fallback,
+                            "fresh_fallback": fresh_fallback,
+                            "previous_response_id": previous_response_id or "",
+                            "responses_status": response_status,
+                            "finish_reason": response_finish_reason,
+                        }
+                        if usage is not None:
+                            trace_fields.update({
+                                "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+                                "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+                                "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+                            })
+                        self._trace_finish_api_call(trace_row, **trace_fields)
+                        trace_row = None
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                index=0,
+                                message=SimpleNamespace(role="assistant", content=content),
+                                finish_reason=response_finish_reason,
+                            )
+                        ],
+                        model=final_model or model,
+                        usage=self._responses_usage_to_chat_usage(response),
+                        status=response_status,
+                        response_id=response_id,
+                        conscience_response_id=response_id,
+                        conscience_previous_response_id=previous_response_id,
+                        conscience_stateful_used=not fresh_fallback,
+                        conscience_fresh_fallback=fresh_fallback,
+                        conscience_response_status=response_status,
+                    )
+            except Exception as exc:
+                if trace_row is not None:
+                    self._trace_finish_api_call(
+                        trace_row,
+                        status="error",
+                        api_duration_s=round(time.perf_counter() - trace_started, 6),
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:500],
+                        stateful_used=False,
+                    )
+                    trace_row = None
+                logger.warning(
+                    "Conscience stateful audit failed; falling back to stateless chat audit: %s",
+                    exc,
+                )
+
+        fallback_trace_row = trace_row
+        fallback_started = trace_started
+        if fallback_trace_row is None and self._request_trace_enabled():
+            short_turn = str(getattr(self, "_trace_turn_id", "") or "turn").replace("turn_", "")
+            fallback_trace_row = self._trace_base_event(
+                "conscience_call",
+                actor="conscience",
+                request_id=f"hrq_{short_turn}_conscience_{uuid.uuid4().hex[:6]}",
+                provider=provider or "",
+                model=model or "",
+                api_mode="chat_completions",
+                stateful_requested=bool(self.conscience_stateful),
+                max_tokens=max_tokens,
+                temperature=temperature,
+                status="started",
+            )
+            fallback_started = time.perf_counter()
+        try:
+            response = _call_llm(
+                provider=provider,
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout="none",
+                extra_body=extra_body,
+            )
+            if fallback_trace_row is not None:
+                usage = getattr(response, "usage", None)
+                trace_fields = {
+                    "status": "ok",
+                    "api_duration_s": round(time.perf_counter() - fallback_started, 6),
+                    "stateful_used": False,
+                }
+                if usage is not None:
+                    trace_fields.update({
+                        "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+                        "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+                        "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+                    })
+                self._trace_finish_api_call(fallback_trace_row, **trace_fields)
+            return response
+        except Exception as exc:
+            if fallback_trace_row is not None:
+                self._trace_finish_api_call(
+                    fallback_trace_row,
+                    status="error",
+                    api_duration_s=round(time.perf_counter() - fallback_started, 6),
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:500],
+                    stateful_used=False,
+                )
+            raise
+
+    def _persist_conscience_artifacts(self, monitor: ConscienceMonitor) -> dict | None:
+        if not monitor:
+            return None
+        try:
+            conscience_dir = get_hermes_home() / "conscience" / (self.session_id or "unknown")
+            conscience_dir.mkdir(parents=True, exist_ok=True)
+            artifacts = monitor.to_artifacts()
+            atomic_json_write(conscience_dir / "task-contract.json", artifacts.get("task_contract", {}))
+            atomic_json_write(conscience_dir / "completion-ledger.json", artifacts.get("completion_ledger", {}))
+            atomic_json_write(conscience_dir / "conscience-events.json", artifacts.get("events", []))
+            atomic_json_write(conscience_dir / "intervention-ledger.json", artifacts.get("intervention_ledger", []))
+            atomic_json_write(conscience_dir / "llm-audits.json", artifacts.get("llm_audits", []))
+            tickets = list(artifacts.get("critique_tickets") or [])
+            if self._conscience_last_ticket:
+                last_ticket = asdict_safe(self._conscience_last_ticket)
+                if not tickets or (tickets[-1].get("reason") != last_ticket.get("reason")):
+                    tickets.append(last_ticket)
+            atomic_json_write(conscience_dir / "critique-tickets.json", tickets)
+            atomic_json_write(conscience_dir / "stop-audit.json", self._conscience_last_stop_audit or {})
+            atomic_json_write(conscience_dir / "last-review.json", self._conscience_last_review or {})
+            atomic_json_write(conscience_dir / "last-review-payload.json", self._conscience_last_review_payload or {})
+            self._conscience_artifact_dir = conscience_dir
+            return artifacts
+        except Exception as exc:
+            logger.debug("Failed to persist conscience artifacts: %s", exc)
+            return monitor.to_artifacts()
+
+    def _handle_midtask_conscience_intervention(self, messages: list, *, defer_visible: bool = False) -> bool:
+        monitor = getattr(self, "_conscience_current_monitor", None)
+        if not monitor:
+            return False
+        try:
+            verdict = monitor.audit_midtask_progress(
+                llm_callable=self._conscience_call_llm,
+                provider=self.conscience_provider,
+                model=self.conscience_model,
+            )
+        except Exception as exc:
+            logger.debug("Mid-task conscience audit failed: %s", exc)
+            return False
+        latest_audit = monitor.state.llm_audits[-1] if getattr(monitor.state, "llm_audits", None) else None
+        self._conscience_last_review = {
+            "review_type": "midtask",
+            "mode": self.conscience_mode,
+            "provider": self.conscience_provider,
+            "model": self.conscience_model,
+            "raw_review_content": latest_audit.get("raw_content") if isinstance(latest_audit, dict) else None,
+            "parsed_review": latest_audit.get("parsed") if isinstance(latest_audit, dict) else None,
+            "verdict": asdict_safe(verdict),
+            "open_criteria": [
+                asdict_safe(c) for c in getattr(monitor.state.contract, "explicit_asks", [])
+                if monitor.state.ledger.get(c.criterion_id) and monitor.state.ledger.get(c.criterion_id).status != "done"
+            ],
+        }
+        self._conscience_last_review_payload = latest_audit.get("payload") if isinstance(latest_audit, dict) else None
+        if not verdict.should_intervene or verdict.critique_ticket is None:
+            return False
+
+        self._conscience_last_ticket = verdict.critique_ticket
+        self._conscience_intervention_count += 1
+
+        visible_message = self._format_conscience_visible_message(verdict.critique_ticket)
+        if self.conscience_mode in {"observe", "enforce_observe"}:
+            if defer_visible and not self.conscience_chat_messages:
+                self._deferred_conscience_visible_messages.append(visible_message)
+            else:
+                self._append_visible_conscience_message(
+                    messages,
+                    visible_message,
+                    persist=not self.conscience_chat_messages,
+                )
+
+        if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
+            self._prepare_conscience_tool_policy(verdict.critique_ticket)
+            self._queue_conscience_internal_message("MIDTASK", verdict.critique_ticket)
+        return True
+
+    def _conscience_review_running_tool(
+        self,
+        *,
+        messages: list,
+        tool_name: str,
+        tool_args: dict,
+        progress: dict,
+    ) -> bool:
+        """Audit a still-running foreground tool and return whether to cancel it."""
+        monitor = getattr(self, "_conscience_current_monitor", None)
+        if not monitor:
+            return False
+        self._conscience_record_event(
+            TOOL_PROGRESS,
+            {
+                "tool_name": tool_name,
+                "tool_args": asdict_safe(tool_args),
+                "elapsed_seconds": progress.get("elapsed_seconds"),
+                "pid": progress.get("pid"),
+                "output_chars": progress.get("output_chars", 0),
+                "output_preview": progress.get("output_preview", ""),
+            },
+        )
+        intervened = self._handle_midtask_conscience_intervention(messages, defer_visible=True)
+        ticket = self._conscience_last_ticket if intervened else None
+        decision = str(getattr(ticket, "active_tool_decision", None) or "").strip().lower()
+        should_cancel = (
+            decision == "cancel"
+            and self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}
+        )
+        logger.info(
+            "Conscience long-tool review tool=%s elapsed=%s intervened=%s decision=%s enforced_cancel=%s",
+            tool_name,
+            progress.get("elapsed_seconds"),
+            intervened,
+            decision or "continue",
+            should_cancel,
+        )
+        return should_cancel
+
+    def _flush_deferred_conscience_visible_messages(self, messages: list) -> None:
+        pending = list(getattr(self, "_deferred_conscience_visible_messages", []) or [])
+        self._deferred_conscience_visible_messages = []
+        for text in pending:
+            self._append_visible_conscience_message(messages, text, persist=True)
 
     @staticmethod
     def _wrap_verbose(label: str, text: str, indent: str = "     ") -> str:

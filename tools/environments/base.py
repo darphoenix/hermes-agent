@@ -45,6 +45,7 @@ if _DEBUG_INTERRUPT:
 # Thread-local activity callback.  The agent sets this before a tool call so
 # long-running _wait_for_process loops can report liveness to the gateway.
 _activity_callback_local = threading.local()
+_process_progress_callback_local = threading.local()
 
 
 # Sentinel capacity for full-fidelity capture (internal consumers). Large
@@ -252,6 +253,30 @@ def get_activity_callback() -> Callable[[str], None] | None:
     back) — e.g. the manual cron-run heartbeat (#76502).
     """
     return getattr(_activity_callback_local, "callback", None)
+
+
+def set_process_progress_callback(
+    cb: Callable[[dict], bool] | None,
+    *,
+    initial_delay: float = 60.0,
+    interval: float = 120.0,
+) -> None:
+    """Register a cooperative long-process reviewer for this thread."""
+    _process_progress_callback_local.callback = cb
+    _process_progress_callback_local.initial_delay = max(1.0, float(initial_delay))
+    _process_progress_callback_local.interval = max(1.0, float(interval))
+
+
+def _get_process_progress_callback() -> tuple[
+    Callable[[dict], bool] | None,
+    float,
+    float,
+]:
+    return (
+        getattr(_process_progress_callback_local, "callback", None),
+        float(getattr(_process_progress_callback_local, "initial_delay", 60.0)),
+        float(getattr(_process_progress_callback_local, "interval", 120.0)),
+    )
 
 
 def touch_activity_if_due(
@@ -1247,6 +1272,10 @@ class BaseEnvironment(ABC):
         _last_heartbeat = _now
         _last_interrupt_state = False
         _cb_was_none = get_activity_callback() is None
+        progress_cb, progress_initial_delay, progress_interval = (
+            _get_process_progress_callback()
+        )
+        next_progress_review = _now + progress_initial_delay
         if _DEBUG_INTERRUPT:
             logger.info(
                 "[interrupt-debug] _wait_for_process ENTER tid=%s pid=%s "
@@ -1293,6 +1322,37 @@ class BaseEnvironment(ABC):
                     )
                 # Periodic activity touch so the gateway knows we're alive
                 touch_activity_if_due(_activity_state, "terminal command running")
+
+                now = time.monotonic()
+                if progress_cb is not None and now >= next_progress_review:
+                    partial = output.render()
+                    cancel = False
+                    try:
+                        cancel = bool(
+                            progress_cb(
+                                {
+                                    "elapsed_seconds": round(
+                                        now - _activity_state["start"], 3
+                                    ),
+                                    "pid": getattr(proc, "pid", None),
+                                    "output_chars": output.total_chars,
+                                    "output_preview": partial,
+                                }
+                            )
+                        )
+                    except Exception:
+                        logger.exception("Long-process progress callback failed")
+                    next_progress_review = time.monotonic() + progress_interval
+                    if cancel:
+                        self._kill_process(proc)
+                        drain_thread.join(timeout=2)
+                        marker = "\n[Command cancelled after conscience progress review]"
+                        rendered = output.render(suffix=marker)
+                        return self._finalize_wait_result(
+                            output,
+                            rendered.lstrip() if output.total_chars == 0 else rendered,
+                            125,
+                        )
 
                 # Heartbeat every ~30s: proves the loop is alive and reports
                 # the activity-callback state (thread-local, can get clobbered

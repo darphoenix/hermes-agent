@@ -96,6 +96,16 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
+from agent.conscience import (
+    DRAFT_ANSWER,
+    PLAN_SUMMARY,
+    TASK_START,
+    TOOL_CALL,
+    ConscienceMonitor,
+    ConscienceVerdict,
+    CritiqueTicket,
+    asdict_safe,
+)
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -1931,6 +1941,39 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    conscience_monitor = None
+    if getattr(agent, "_conscience_active", False):
+        conscience_monitor = ConscienceMonitor(
+            agent.session_id,
+            original_user_message,
+            agent.conscience_mode,
+        )
+        agent._conscience_current_monitor = conscience_monitor
+        agent._conscience_last_ticket = None
+        agent._conscience_last_stop_audit = None
+        agent._conscience_last_review = None
+        agent._conscience_last_review_payload = None
+        agent._conscience_last_useful_final_response = None
+        agent._conscience_record_event(
+            TASK_START,
+            {
+                "task_id": effective_task_id,
+                "user_message": original_user_message,
+                "available_tools": sorted(agent.valid_tool_names)
+                if agent.valid_tool_names
+                else [],
+            },
+        )
+        agent._conscience_record_event(PLAN_SUMMARY, {"text": user_message})
+    else:
+        agent._conscience_current_monitor = None
+        agent._conscience_last_ticket = None
+        agent._conscience_last_stop_audit = None
+        agent._conscience_last_review = None
+        agent._conscience_last_review_payload = None
+        agent._conscience_last_useful_final_response = None
+        agent._conscience_artifact_dir = None
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
@@ -2016,6 +2059,7 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        agent._activate_conscience_tool_policy_for_actor_action()
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -2033,6 +2077,7 @@ def run_conversation(
         if agent._interrupt_requested:
             interrupted = True
             _turn_exit_reason = "interrupted_by_user"
+            agent._clear_conscience_internal_messages("interrupt_before_request")
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
@@ -2474,6 +2519,11 @@ def run_conversation(
             logger=request_logger,
         )
 
+        # One-call conscience/repair directives never enter durable history.
+        # The Responses transport lifts these trailing system messages into
+        # hermes_runtime_instructions for local stateful wrappers.
+        api_messages.extend(agent._consume_conscience_internal_messages_for_api())
+
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
         # gated on context_compressor — so orphans from session loading or
@@ -2535,7 +2585,7 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
+        tools_for_api = agent._tools_for_next_api_call()
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -3263,7 +3313,7 @@ def run_conversation(
                     else:
                         interrupted = True
                     break
-                
+
                 api_duration = time.time() - api_start_time
                 
                 # Stop thinking spinner silently -- the response box or tool
@@ -6778,12 +6828,28 @@ def run_conversation(
             agent._persist_session(messages, conversation_history)
             break
 
+        if agent.api_mode == "codex_responses":
+            tool_policy_conflicts = agent._extract_responses_tool_policy_conflict(response)
+            if tool_policy_conflicts:
+                agent._handle_responses_tool_policy_conflict(
+                    response,
+                    messages,
+                    tool_policy_conflicts,
+                )
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                agent.iteration_budget.refund()
+                continue
+
         try:
             _transport = agent._get_transport()
             _normalize_kwargs = {}
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
+            # Runtime directives and strict tool policy are scoped to the
+            # completed actor request. A later action must opt in again.
+            agent._active_conscience_internal_messages = []
             assistant_message = normalized
             finish_reason = normalized.finish_reason
             
@@ -7481,7 +7547,73 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                conscience_tool_meta: dict[str, tuple[str, dict]] = {}
+                if conscience_monitor:
+                    execution_mode = (
+                        "concurrent"
+                        if len(assistant_message.tool_calls) > 1
+                        else "sequential"
+                    )
+                    for tool_call in assistant_message.tool_calls:
+                        tool_name = tool_call.function.name
+                        raw_args = tool_call.function.arguments
+                        try:
+                            tool_args = (
+                                raw_args
+                                if isinstance(raw_args, dict)
+                                else json.loads(raw_args or "{}")
+                            )
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            tool_args = {"raw": str(raw_args or "")}
+                        call_id = coalesce_tool_call_id(tool_call)
+                        conscience_tool_meta[call_id] = (tool_name, tool_args)
+                        agent._conscience_record_event(
+                            TOOL_CALL,
+                            {
+                                "tool_name": tool_name,
+                                "tool_args": raw_args,
+                                "tool_call_id": call_id,
+                                "execution_mode": execution_mode,
+                            },
+                        )
+
+                conscience_result_start = len(messages)
+                agent._execute_tool_calls(
+                    assistant_message,
+                    messages,
+                    effective_task_id,
+                    api_call_count,
+                )
+
+                if conscience_monitor:
+                    for tool_message in messages[conscience_result_start:]:
+                        if not isinstance(tool_message, dict) or tool_message.get("role") != "tool":
+                            continue
+                        call_id = str(tool_message.get("tool_call_id") or "")
+                        tool_name, tool_args = conscience_tool_meta.get(
+                            call_id,
+                            (str(tool_message.get("name") or "unknown"), {}),
+                        )
+                        content = tool_message.get("content", "")
+                        if not isinstance(content, str):
+                            content = json.dumps(content, ensure_ascii=False, default=str)
+                        agent._conscience_record_event(
+                            "TOOL_RESULT",
+                            agent._conscience_tool_result_payload(
+                                tool_name=tool_name,
+                                tool_args=tool_args,
+                                tool_result=content,
+                                duration=0.0,
+                                call_id=call_id or None,
+                            ),
+                        )
+                        agent._conscience_record_artifact_if_applicable(
+                            tool_name,
+                            tool_args,
+                            content,
+                        )
+                    agent._flush_deferred_conscience_visible_messages(messages)
+                    agent._handle_midtask_conscience_intervention(messages)
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -8235,6 +8367,191 @@ def run_conversation(
                 # a genuine turn end. Clear the consecutive-stall budget so the
                 # next turn starts fresh.
                 agent._dropped_toolcall_retries = 0
+
+                agent._conscience_record_event(DRAFT_ANSWER, {"text": final_response})
+                if agent._conscience_looks_like_useful_final_answer(final_response):
+                    agent._conscience_last_useful_final_response = final_response
+                conscience_terminal_response = None
+
+                if conscience_monitor:
+                    try:
+                        verdict = conscience_monitor.audit_stop_decision(
+                            final_response,
+                            llm_callable=agent._conscience_call_llm,
+                            provider=agent.conscience_provider,
+                            model=agent.conscience_model,
+                        )
+                        latest_audit = conscience_monitor.state.llm_audits[-1] if getattr(conscience_monitor.state, "llm_audits", None) else None
+                    except Exception as exc:
+                        logger.warning("Conscience stop audit failed open: %s", exc)
+                        verdict = ConscienceVerdict(
+                            should_intervene=False,
+                            source="llm",
+                            metadata={"skipped": "audit_failed", "error": str(exc)},
+                        )
+                        latest_audit = None
+                    open_criteria = [
+                        asdict_safe(c) for c in getattr(conscience_monitor.state.contract, "explicit_asks", [])
+                        if conscience_monitor.state.ledger.get(c.criterion_id) and conscience_monitor.state.ledger.get(c.criterion_id).status != "done"
+                    ]
+                    agent._conscience_last_stop_audit = {
+                        "review_type": "stop",
+                        "mode": agent.conscience_mode,
+                        "provider": agent.conscience_provider,
+                        "model": agent.conscience_model,
+                        "raw_review_content": latest_audit.get("raw_content") if isinstance(latest_audit, dict) else None,
+                        "parsed_review": latest_audit.get("parsed") if isinstance(latest_audit, dict) else None,
+                        "draft_answer": final_response,
+                        "open_criteria": open_criteria,
+                        "verdict": asdict_safe(verdict),
+                    }
+                    agent._conscience_last_review = dict(agent._conscience_last_stop_audit)
+                    agent._conscience_last_review_payload = latest_audit.get("payload") if isinstance(latest_audit, dict) else None
+                    suppressed_reason = ""
+                    suppressed_ticket = None
+                    if isinstance(getattr(verdict, "metadata", None), dict):
+                        suppressed_reason = str(verdict.metadata.get("suppressed") or "")
+                        suppressed_ticket = verdict.metadata.get("suppressed_ticket")
+                    parse_error_after_prior_block = (
+                        isinstance(getattr(verdict, "metadata", None), dict)
+                        and bool(verdict.metadata.get("parse_error"))
+                        and agent.conscience_mode in {"enforce_stop_gate", "enforce_observe"}
+                        and agent._conscience_blocked_stop_count > 0
+                        and agent._conscience_last_ticket is not None
+                    )
+                    if (
+                        suppressed_reason in {"duplicate_recent_issue", "repair_limit_exhausted"}
+                        and agent.conscience_mode in {"enforce_stop_gate", "enforce_observe"}
+                        and isinstance(suppressed_ticket, dict)
+                    ):
+                        _suppressed_recommended_tools = suppressed_ticket.get("recommended_tools", None)
+                        _suppressed_tool_policy = suppressed_ticket.get("tool_policy", None)
+                        ticket = CritiqueTicket(
+                            verdict=str(suppressed_ticket.get("verdict") or "blocked"),
+                            reason=str(suppressed_ticket.get("reason") or "conscience stop gate suppressed repeated incomplete response"),
+                            evidence=[str(x) for x in (suppressed_ticket.get("evidence") or [])],
+                            next_best_action=str(suppressed_ticket.get("next_best_action") or "Continue with the required next action."),
+                            criterion_ids=[str(x) for x in (suppressed_ticket.get("criterion_ids") or [])],
+                            recommended_tools=(
+                                [str(x) for x in _suppressed_recommended_tools]
+                                if isinstance(_suppressed_recommended_tools, list)
+                                else None
+                            ),
+                            tool_policy=(
+                                dict(_suppressed_tool_policy)
+                                if isinstance(_suppressed_tool_policy, dict)
+                                else None
+                            ),
+                        )
+                        agent._conscience_last_ticket = ticket
+                        agent._conscience_intervention_count += 1
+                        agent._conscience_blocked_stop_count += 1
+                        takeover_final = (
+                            agent._conscience_generate_takeover_final(
+                                ticket=ticket,
+                                final_response=final_response,
+                                review_payload=agent._conscience_last_review_payload,
+                            )
+                            if suppressed_reason == "repair_limit_exhausted"
+                            else None
+                        )
+                        preserved_final = (
+                            agent._conscience_best_repair_exhausted_final(final_response)
+                            if suppressed_reason == "repair_limit_exhausted" and takeover_final is None
+                            else None
+                        )
+                        terminal_final = takeover_final or preserved_final
+                        if terminal_final is not None:
+                            final_response = terminal_final
+                            conscience_terminal_response = terminal_final
+                            for review in (agent._conscience_last_stop_audit, agent._conscience_last_review):
+                                if isinstance(review, dict):
+                                    verdict_dict = review.get("verdict")
+                                    if isinstance(verdict_dict, dict):
+                                        metadata = verdict_dict.setdefault("metadata", {})
+                                        if isinstance(metadata, dict):
+                                            if takeover_final is not None:
+                                                metadata["conscience_takeover_final"] = True
+                                                metadata["takeover_reason"] = "repair_limit_exhausted_no_tools_needed"
+                                            else:
+                                                metadata["preserved_final_response"] = True
+                                                metadata["preserved_reason"] = "repair_limit_exhausted"
+                        else:
+                            reason_label = (
+                                "repair limit was exhausted"
+                                if suppressed_reason == "repair_limit_exhausted"
+                                else "the same issue repeated without progress"
+                            )
+                            evidence_text = "; ".join(ticket.evidence[:3]) or "The draft did not satisfy the user's request."
+                            conscience_terminal_response = (
+                                "[Conscience] I blocked this stop because the response was still incomplete, "
+                                f"but the main model did not recover after the stop-gate retries ({reason_label}).\n\n"
+                                f"Reason: {ticket.reason}\n"
+                                f"Evidence: {evidence_text}\n"
+                                f"Required next action: {ticket.next_best_action}"
+                            ).strip()
+                            final_response = conscience_terminal_response
+                    elif parse_error_after_prior_block:
+                        ticket = agent._conscience_last_ticket
+                        agent._conscience_intervention_count += 1
+                        agent._conscience_blocked_stop_count += 1
+                        preserved_final = agent._conscience_best_repair_exhausted_final(final_response)
+                        if preserved_final is not None:
+                            final_response = preserved_final
+                            conscience_terminal_response = preserved_final
+                            for review in (agent._conscience_last_stop_audit, agent._conscience_last_review):
+                                if isinstance(review, dict):
+                                    verdict_dict = review.get("verdict")
+                                    if isinstance(verdict_dict, dict):
+                                        metadata = verdict_dict.setdefault("metadata", {})
+                                        if isinstance(metadata, dict):
+                                            metadata["preserved_final_response"] = True
+                                            metadata["preserved_reason"] = "parse_error_after_prior_block"
+                        else:
+                            evidence_text = "; ".join(ticket.evidence[:3]) or "The draft did not satisfy the user's request."
+                            conscience_terminal_response = (
+                                "[Conscience] I blocked this stop because the response was still incomplete, "
+                                "and the follow-up stop audit failed to parse after an earlier block.\n\n"
+                                f"Reason: {ticket.reason}\n"
+                                f"Evidence: {evidence_text}\n"
+                                f"Required next action: {ticket.next_best_action}"
+                            ).strip()
+                            final_response = conscience_terminal_response
+                    if verdict.should_intervene and verdict.critique_ticket is not None:
+                        agent._conscience_last_ticket = verdict.critique_ticket
+                        agent._conscience_intervention_count += 1
+                        visible_conscience_message = agent._format_conscience_visible_message(verdict.critique_ticket)
+                        if agent.conscience_mode in {"observe", "enforce_observe"}:
+                            if (
+                                agent.conscience_chat_messages
+                                and agent.conscience_mode in {"enforce_stop_gate", "enforce_observe"}
+                            ):
+                                agent._append_visible_conscience_message(
+                                    messages,
+                                    visible_conscience_message,
+                                    persist=False,
+                                )
+                            else:
+                                final_response = (
+                                    f"{visible_conscience_message}\n\n"
+                                    f"{final_response}"
+                                ).strip()
+                        if agent.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
+                            agent._conscience_blocked_stop_count += 1
+                            agent._prepare_conscience_tool_policy(verdict.critique_ticket)
+                            agent._remember_transient_responses_repair_parent(
+                                getattr(assistant_message, "responses_response_id", None),
+                                reason="conscience_stop_gate",
+                            )
+                            agent._queue_conscience_internal_message(
+                                "STOP-GATE",
+                                verdict.critique_ticket,
+                            )
+                            final_response = None
+                            continue
+
+                if final_response is not None:
+                    final_msg["content"] = final_response
 
                 # Pop thinking-only prefill and empty-response retry
                 # scaffolding before appending either a final response or a
