@@ -603,6 +603,12 @@ DEFAULT_CONFIG = {
         # conscience models. The first audit sends full context; later audits
         # send append-only deltas so the wrapper can reuse KV/cache.
         "conscience_stateful": True,
+        # Review a still-running foreground terminal command after this many
+        # seconds, then at the interval below. The model decides whether the
+        # command should continue; elapsed time alone never cancels it. Set the
+        # first value to 0 to disable live progress reviews.
+        "conscience_tool_progress_seconds": 60,
+        "conscience_tool_progress_interval_seconds": 120,
         "disabled_toolsets": [],
     },
     

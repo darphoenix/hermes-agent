@@ -2417,8 +2417,8 @@ def test_run_conversation_codex_continues_after_reasoning_only_response(monkeypa
     )
 
 
-def test_stateful_empty_after_tools_replays_synthetic_empty_delta(monkeypatch):
-    """Post-tool empty nudge must preserve Hermes' synthetic local transcript."""
+def test_stateful_empty_after_tools_branches_without_synthetic_history(monkeypatch):
+    """Post-tool empty recovery branches from the empty response's exact state."""
     agent = _build_stateful_custom_agent(monkeypatch)
 
     tool_response = _codex_tool_call_response()
@@ -2470,10 +2470,13 @@ def test_stateful_empty_after_tools_replays_synthetic_empty_delta(monkeypatch):
     assert empty_messages == []
     assert not any(msg.get("_empty_recovery_synthetic") for msg in result["messages"])
     assert requests[1].get("previous_response_id") == "resp_tool"
-    assert requests[2].get("previous_response_id") == "resp_tool"
-    assert requests[2]["input"][0]["type"] == "function_call_output"
-    assert requests[2]["input"][1] == {"role": "assistant", "content": "(empty)"}
-    assert requests[2]["input"][2]["role"] == "user"
+    assert requests[2].get("previous_response_id") == "resp_empty"
+    assert requests[2]["input"] == []
+    runtime_instructions = requests[2]["extra_body"]["hermes_runtime_instructions"]
+    assert "returned no usable assistant action" in runtime_instructions
+    assert "Process the latest tool results" in runtime_instructions
+    assert "(empty)" not in runtime_instructions
+    assert all("EMPTY-RESPONSE RECOVERY" not in str(msg) for msg in result["messages"])
 
 
 def test_post_tool_empty_nudge_does_not_consume_iteration_budget(monkeypatch):
@@ -2485,8 +2488,14 @@ def test_post_tool_empty_nudge_does_not_consume_iteration_budget(monkeypatch):
     tool_response.id = "resp_tool"
     empty_response = SimpleNamespace(
         id="resp_empty",
-        output=[],
-        usage=SimpleNamespace(input_tokens=50, output_tokens=0, total_tokens=50),
+        output=[
+            SimpleNamespace(
+                type="reasoning",
+                summary=[SimpleNamespace(type="summary_text", text="Thinking...")],
+                status="completed",
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=50, output_tokens=10, total_tokens=60),
         status="completed",
         model="local-qwopus",
     )
@@ -2519,6 +2528,8 @@ def test_post_tool_empty_nudge_does_not_consume_iteration_budget(monkeypatch):
     assert result["completed"] is True
     assert result["api_calls"] == 2
     assert result["final_response"] == "done"
+    assert requests[2].get("previous_response_id") == "resp_empty"
+    assert requests[2]["input"] == []
 
 
 def test_run_conversation_codex_preserves_encrypted_reasoning_in_interim(monkeypatch):

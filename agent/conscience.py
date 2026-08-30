@@ -11,6 +11,7 @@ TASK_START = "TASK_START"
 PLAN_SUMMARY = "PLAN_SUMMARY"
 TOOL_CALL = "TOOL_CALL"
 TOOL_RESULT = "TOOL_RESULT"
+TOOL_PROGRESS = "TOOL_PROGRESS"
 ARTIFACT_UPDATED = "ARTIFACT_UPDATED"
 DRAFT_ANSWER = "DRAFT_ANSWER"
 INTENT_TO_STOP = "INTENT_TO_STOP"
@@ -21,6 +22,7 @@ IRREVERSIBLE_ACTION_INTENT = "IRREVERSIBLE_ACTION_INTENT"
 class TaskCriterion:
     criterion_id: str
     source_text: str
+    description: str = ""
     required: bool = True
     status: str = "open"
     evidence_refs: List[str] = field(default_factory=list)
@@ -68,6 +70,7 @@ class CritiqueTicket:
     next_best_action: str = ""
     criterion_ids: List[str] = field(default_factory=list)
     recommended_tools: Optional[List[str]] = None
+    active_tool_decision: Optional[str] = None
 
 
 @dataclass
@@ -787,11 +790,12 @@ class ConscienceMonitor:
             "When intervention requires tool use, set recommended_tools to the smallest useful list of exact tool names from payload.available_tools. "
             "If the actor should answer or synthesize from evidence already gathered without another tool call, return recommended_tools as an empty array. "
             "If no exact tool guidance is useful, return recommended_tools as null. Do not invent tool names. "
-            "You may also include intervention_outcomes when recent evidence clearly shows what happened after an earlier ticket in payload.trajectory_memory.intervention_ledger, the stateful intervention ledger, or payload.ledger_delta.intervention_upsert. "
-            "Each outcome object must use keys id, status, outcome, evidence, confidence. Status must be one of attempted, resolved, ignored, still_failing. "
-            "Only report an outcome when supported by concrete recent evidence; otherwise omit intervention_outcomes. "
+            "Hermes records attempted automatically when the actor takes the next tool action. Include intervention_outcomes only for a semantic status transition to resolved, ignored, or still_failing; never narrate attempted-to-attempted progress or repeat the current status. "
+            "Mark resolved only when a recent tool result or equivalent evidence directly proves the required action succeeded. Starting a command is attempted, not resolved. "
+            "Each outcome object must use keys id, status, outcome, evidence, confidence. "
+            "For a TOOL_PROGRESS review, set active_tool_decision to cancel only when the available command, elapsed time, and progress evidence make continued execution clearly wasteful; otherwise set it to continue. For other reviews omit active_tool_decision. "
             "Return strict JSON with keys: should_intervene (bool), verdict (string), reason (string), evidence (array of strings), "
-            "next_best_action (string), recommended_tools (array of strings or null), criterion_ids (array of strings), confidence (string)."
+            "next_best_action (string), recommended_tools (array of strings or null), criterion_ids (array of strings), confidence (string), and optional active_tool_decision (cancel or continue)."
         )
 
     @classmethod
@@ -799,7 +803,7 @@ class ConscienceMonitor:
         return (
             "Return strict JSON. If no intervention is warranted, return only "
             '{"should_intervene": false, "verdict": "observe"} '
-            "and omit reason, evidence, next_best_action, recommended_tools, criterion_ids, and confidence, unless adding a clearly supported intervention_outcomes update. "
+            "and omit reason, evidence, next_best_action, recommended_tools, criterion_ids, and confidence, unless adding a transition-only intervention_outcomes update. "
             "Do not explain why you are observing. "
             "If intervention is warranted, "
             + cls._intervention_json_contract_prompt()
@@ -807,7 +811,13 @@ class ConscienceMonitor:
 
     @classmethod
     def _stop_review_json_contract_prompt(cls) -> str:
-        return cls._intervention_json_contract_prompt()
+        return (
+            "Return strict JSON. If the actor may stop, return only "
+            '{"should_intervene": false, "verdict": "allow_stop"} '
+            "and omit reason, evidence, next_best_action, recommended_tools, criterion_ids, confidence, and intervention_outcomes. "
+            "If the actor must not stop, "
+            + cls._intervention_json_contract_prompt()
+        )
 
     @classmethod
     def _midtask_review_system_prompt(cls) -> str:
@@ -824,6 +834,7 @@ class ConscienceMonitor:
             "Do not intervene merely because the task is not finished yet, you can think of a better next step, the actor is gathering new evidence, the actor made one ordinary mistake, or you are uncertain. "
             "If unsure, observe silently: should_intervene=false. "
             "When intervening, give one concise course correction. Name the repeated or wrong behavior to stop, and the different strategy to try next. "
+            "Separate diagnosis from invocation details: if the exact command or procedure is not supported by the evidence, recommend one targeted inspection step instead of inventing a command. "
             "Do not produce a final answer unless the actor is explicitly looping on final-answer generation and no further tool use is needed. "
             "Do not rely on fixed heuristics, regex rules, or hand-crafted trigger categories. Infer directly from the evidence whether intervention is warranted right now. "
             + cls._midtask_review_json_contract_prompt()
@@ -1044,7 +1055,10 @@ class ConscienceMonitor:
             status = str(raw_update.get("status") or raw_update.get("outcome_status") or "").strip().lower()
             if status not in valid_statuses:
                 continue
-            if entry.get("status") == "resolved" and status != "resolved":
+            previous_status = str(entry.get("status") or "issued")
+            if previous_status == status:
+                continue
+            if previous_status == "resolved":
                 continue
             evidence = raw_update.get("evidence") or []
             if not isinstance(evidence, list):
@@ -1257,6 +1271,11 @@ class ConscienceMonitor:
             recommended_tools=(
                 [str(x) for x in parsed.get("recommended_tools")]
                 if isinstance(parsed.get("recommended_tools"), list)
+                else None
+            ),
+            active_tool_decision=(
+                str(parsed.get("active_tool_decision") or "").strip().lower()
+                if str(parsed.get("active_tool_decision") or "").strip().lower() in {"cancel", "continue"}
                 else None
             ),
         )

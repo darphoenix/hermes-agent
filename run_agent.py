@@ -421,6 +421,7 @@ from agent.conscience import (
     PLAN_SUMMARY,
     TASK_START,
     TOOL_CALL,
+    TOOL_PROGRESS,
     TOOL_RESULT,
     ConscienceMonitor,
     ConscienceVerdict,
@@ -2192,6 +2193,20 @@ class AIAgent:
             self.conscience_tool_narrowing_turns = 4
         if self.conscience_tool_narrowing_turns < 0:
             self.conscience_tool_narrowing_turns = 0
+        try:
+            self.conscience_tool_progress_seconds = max(
+                0.0,
+                float(agent_config.get("conscience_tool_progress_seconds", 60) or 0),
+            )
+        except Exception:
+            self.conscience_tool_progress_seconds = 60.0
+        try:
+            self.conscience_tool_progress_interval_seconds = max(
+                10.0,
+                float(agent_config.get("conscience_tool_progress_interval_seconds", 120) or 120),
+            )
+        except Exception:
+            self.conscience_tool_progress_interval_seconds = 120.0
         _conscience_effort = str(agent_config.get("conscience_reasoning_effort", "medium") or "medium").strip().lower()
         if _conscience_effort not in {"none", "low", "medium", "high", "xhigh"}:
             _conscience_effort = "medium"
@@ -2215,6 +2230,7 @@ class AIAgent:
         self._conscience_repair_turns_remaining = 0
         self._conscience_repair_override_active = False
         self._pending_conscience_internal_messages: list[dict[str, Any]] = []
+        self._deferred_conscience_visible_messages: list[str] = []
         self._active_conscience_internal_messages: list[dict[str, Any]] = []
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
@@ -7183,7 +7199,7 @@ class AIAgent:
         if isinstance(transient_repair_parent, str) and transient_repair_parent.strip():
             previous_response_id = transient_repair_parent.strip()
             logger.info(
-                "Building Responses stop-repair request from transient parent: %s",
+                "Building Responses transient-repair request from parent: %s",
                 previous_response_id,
             )
             return self._chat_messages_to_responses_input([]), previous_response_id
@@ -12258,22 +12274,50 @@ class AIAgent:
 
         return "\n".join(lines)
 
-    def _queue_conscience_internal_message(self, label: str, ticket: CritiqueTicket) -> None:
-        content = self._format_conscience_internal_message(label, ticket)
+    def _queue_actor_internal_message(
+        self,
+        label: str,
+        content: str,
+        *,
+        source: str = "runtime",
+    ) -> None:
         if not content.strip():
             return
         event = {
-            "id": f"conscience_{label.lower()}_{uuid.uuid4().hex[:12]}",
+            "id": f"{source}_{label.lower()}_{uuid.uuid4().hex[:12]}",
             "label": label,
             "content": content,
             "created_at": time.time(),
         }
         self._pending_conscience_internal_messages.append(event)
         logger.info(
-            "Queued hidden conscience %s directive for next actor request (session=%s event_id=%s)",
+            "Queued hidden %s %s directive for next actor request (session=%s event_id=%s)",
+            source,
             label,
             self.session_id or "-",
             event["id"],
+        )
+
+    def _queue_conscience_internal_message(self, label: str, ticket: CritiqueTicket) -> None:
+        self._queue_actor_internal_message(
+            label,
+            self._format_conscience_internal_message(label, ticket),
+            source="conscience",
+        )
+
+    def _queue_empty_response_recovery_directive(self) -> None:
+        self._queue_actor_internal_message(
+            "EMPTY_RESPONSE_RECOVERY",
+            "\n".join(
+                [
+                    "[INTERNAL EMPTY-RESPONSE RECOVERY: Do not expose this message to the user.]",
+                    "You just received tool results but returned no usable assistant action.",
+                    "Process the latest tool results and continue the task now.",
+                    "Do not repeat prior narration.",
+                    "If another tool is needed, make a real tool call; otherwise provide the next useful answer.",
+                ]
+            ),
+            source="runtime",
         )
 
     def _consume_conscience_internal_messages_for_api(self) -> list[dict[str, Any]]:
@@ -12283,7 +12327,7 @@ class AIAgent:
         if not pending:
             return []
         logger.info(
-            "Injecting %s hidden conscience directive(s) into next actor request only (session=%s)",
+            "Injecting %s hidden actor directive(s) into next request only (session=%s)",
             len(pending),
             self.session_id or "-",
         )
@@ -12669,7 +12713,7 @@ class AIAgent:
             logger.debug("Failed to persist conscience artifacts: %s", exc)
             return monitor.to_artifacts()
 
-    def _handle_midtask_conscience_intervention(self, messages: list) -> bool:
+    def _handle_midtask_conscience_intervention(self, messages: list, *, defer_visible: bool = False) -> bool:
         monitor = getattr(self, "_conscience_current_monitor", None)
         if not monitor:
             return False
@@ -12705,16 +12749,65 @@ class AIAgent:
 
         visible_message = self._format_conscience_visible_message(verdict.critique_ticket)
         if self.conscience_mode in {"observe", "enforce_observe"}:
-            self._append_visible_conscience_message(
-                messages,
-                visible_message,
-                persist=not self.conscience_chat_messages,
-            )
+            if defer_visible and not self.conscience_chat_messages:
+                self._deferred_conscience_visible_messages.append(visible_message)
+            else:
+                self._append_visible_conscience_message(
+                    messages,
+                    visible_message,
+                    persist=not self.conscience_chat_messages,
+                )
 
         if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
             self._prepare_conscience_tool_narrowing(verdict.critique_ticket)
             self._queue_conscience_internal_message("MIDTASK", verdict.critique_ticket)
         return True
+
+    def _conscience_review_running_tool(
+        self,
+        *,
+        messages: list,
+        tool_name: str,
+        tool_args: dict,
+        progress: dict,
+    ) -> bool:
+        """Audit a still-running foreground tool and return whether to cancel it."""
+        monitor = getattr(self, "_conscience_current_monitor", None)
+        if not monitor:
+            return False
+        self._conscience_record_event(
+            TOOL_PROGRESS,
+            {
+                "tool_name": tool_name,
+                "tool_args": asdict_safe(tool_args),
+                "elapsed_seconds": progress.get("elapsed_seconds"),
+                "pid": progress.get("pid"),
+                "output_chars": progress.get("output_chars", 0),
+                "output_preview": progress.get("output_preview", ""),
+            },
+        )
+        intervened = self._handle_midtask_conscience_intervention(messages, defer_visible=True)
+        ticket = self._conscience_last_ticket if intervened else None
+        decision = str(getattr(ticket, "active_tool_decision", None) or "").strip().lower()
+        should_cancel = (
+            decision == "cancel"
+            and self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}
+        )
+        logger.info(
+            "Conscience long-tool review tool=%s elapsed=%s intervened=%s decision=%s enforced_cancel=%s",
+            tool_name,
+            progress.get("elapsed_seconds"),
+            intervened,
+            decision or "continue",
+            should_cancel,
+        )
+        return should_cancel
+
+    def _flush_deferred_conscience_visible_messages(self, messages: list) -> None:
+        pending = list(getattr(self, "_deferred_conscience_visible_messages", []) or [])
+        self._deferred_conscience_visible_messages = []
+        for text in pending:
+            self._append_visible_conscience_message(messages, text, persist=True)
 
     @staticmethod
     def _wrap_verbose(label: str, text: str, indent: str = "     ") -> str:
@@ -13241,8 +13334,28 @@ class AIAgent:
             # the agent while a command is running.
             if not _execution_blocked:
                 try:
-                    from tools.environments.base import set_activity_callback
+                    from tools.environments.base import (
+                        set_activity_callback,
+                        set_process_progress_callback,
+                    )
                     set_activity_callback(self._touch_activity)
+                    if (
+                        function_name == "terminal"
+                        and self.conscience_tool_progress_seconds > 0
+                        and getattr(self, "_conscience_current_monitor", None) is not None
+                    ):
+                        set_process_progress_callback(
+                            lambda progress, _messages=messages, _name=function_name, _args=function_args: self._conscience_review_running_tool(
+                                messages=_messages,
+                                tool_name=_name,
+                                tool_args=_args,
+                                progress=progress,
+                            ),
+                            initial_delay=self.conscience_tool_progress_seconds,
+                            interval=self.conscience_tool_progress_interval_seconds,
+                        )
+                    else:
+                        set_process_progress_callback(None)
                 except Exception:
                     pass
 
@@ -13472,6 +13585,13 @@ class AIAgent:
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 tool_duration = time.time() - tool_start_time
 
+            if function_name == "terminal":
+                try:
+                    from tools.environments.base import set_process_progress_callback
+                    set_process_progress_callback(None)
+                except Exception:
+                    pass
+
             if isinstance(function_result, str):
                 result_preview = function_result if self.verbose_logging else (
                     function_result[:200] if len(function_result) > 200 else function_result
@@ -13609,6 +13729,7 @@ class AIAgent:
                 time.sleep(self.tool_delay)
 
         # ── Per-turn aggregate budget enforcement ─────────────────────────
+        self._flush_deferred_conscience_visible_messages(messages)
         num_tools_seq = len(assistant_message.tool_calls)
         if num_tools_seq > 0:
             enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))
@@ -17428,35 +17549,41 @@ class AIAgent:
                                 "⚠️ Model returned empty after tool calls — "
                                 "nudging to continue"
                             )
-                            # Append the empty assistant message first so the
-                            # message sequence stays valid:
-                            #   tool(result) → assistant("(empty)") → user(nudge)
-                            # Without this, we'd have tool → user which most
-                            # APIs reject as an invalid sequence.
                             _nudge_msg = self._build_assistant_message(
                                 assistant_message,
                                 finish_reason,
                             )
-                            _nudge_msg["content"] = "(empty)"
-                            _nudge_msg["_empty_recovery_synthetic"] = True
-                            messages.append(_nudge_msg)
                             synthetic_response_id = _nudge_msg.get(
                                 "responses_response_id"
                             )
-                            if isinstance(synthetic_response_id, str):
-                                self._clear_responses_stateful_chain(
-                                    reason="synthetic_empty_assistant",
-                                    blocked_response_id=synthetic_response_id,
+                            if (
+                                self._responses_stateful_enabled()
+                                and isinstance(synthetic_response_id, str)
+                                and synthetic_response_id.strip()
+                            ):
+                                # The empty child still owns the exact model KV
+                                # frontier. Branch the repair from it without
+                                # persisting synthetic chat messages locally.
+                                self._remember_transient_responses_repair_parent(
+                                    synthetic_response_id,
+                                    reason="synthetic_empty_after_tool",
                                 )
-                            messages.append({
-                                "role": "user",
-                                "content": (
-                                    "You just executed tool calls but returned an "
-                                    "empty response. Please process the tool "
-                                    "results above and continue with the task."
-                                ),
-                                "_empty_recovery_synthetic": True,
-                            })
+                                self._queue_empty_response_recovery_directive()
+                            else:
+                                # Stateless providers need a valid local
+                                # tool(result) -> assistant -> user sequence.
+                                _nudge_msg["content"] = "(empty)"
+                                _nudge_msg["_empty_recovery_synthetic"] = True
+                                messages.append(_nudge_msg)
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        "You just executed tool calls but returned an "
+                                        "empty response. Please process the tool "
+                                        "results above and continue with the task."
+                                    ),
+                                    "_empty_recovery_synthetic": True,
+                                })
                             if api_call_count > 0:
                                 api_call_count -= 1
                                 self._api_call_count = api_call_count

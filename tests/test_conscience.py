@@ -133,6 +133,46 @@ def test_llm_review_payload_includes_available_tools_and_parses_recommendation()
     assert verdict.critique_ticket.recommended_tools == ["web_search", "web_extract"]
 
 
+def test_progress_review_parses_explicit_active_tool_cancel_decision():
+    monitor = ConscienceMonitor("task-progress", "Find an efficient exact solution")
+    monitor.record_event(
+        TOOL_RESULT,
+        {"tool_name": "write_file", "success": True, "result_preview": "wrote brute-force solver"},
+    )
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "should_intervene": True,
+                                "verdict": "course_correction",
+                                "reason": "current search is nonproductive",
+                                "evidence": ["no output after the progress interval"],
+                                "next_best_action": "Cancel and derive a pruned search.",
+                                "recommended_tools": ["terminal", "write_file"],
+                                "criterion_ids": ["criterion_001"],
+                                "confidence": "high",
+                                "active_tool_decision": "cancel",
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+
+    verdict = monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="openai-codex",
+        model="gpt-5.4",
+    )
+
+    assert verdict.critique_ticket is not None
+    assert verdict.critique_ticket.active_tool_decision == "cancel"
+
+
 def test_stateful_conscience_sends_full_payload_then_delta():
     monitor = ConscienceMonitor("task-stateful", "Check current setup")
     monitor.record_event(TASK_START, {"available_tools": ["terminal", "web_search"]})
@@ -729,6 +769,36 @@ def test_llm_review_updates_intervention_outcome_without_new_intervention():
     assert verdict.metadata["intervention_outcomes_applied"] == [
         {"id": "intervention_001", "status": "resolved", "outcome_event_index": len(monitor.state.events) - 1}
     ]
+
+
+def test_intervention_outcome_ignores_same_status_narration():
+    monitor = ConscienceMonitor("task-transition-only", "Fix the parser")
+    monitor.state.intervention_ledger.append(
+        {
+            "id": "intervention_001",
+            "status": "attempted",
+            "outcome": "initial attempt",
+            "outcome_updated_at": 10.0,
+        }
+    )
+
+    applied = monitor._apply_intervention_outcomes_from_review(
+        {
+            "intervention_outcomes": [
+                {
+                    "id": "intervention_001",
+                    "status": "attempted",
+                    "outcome": "another exploratory command ran",
+                    "evidence": ["command started"],
+                }
+            ]
+        },
+        "midtask",
+    )
+
+    assert applied == []
+    assert monitor.state.intervention_ledger[0]["outcome"] == "initial attempt"
+    assert monitor.state.intervention_ledger[0]["outcome_updated_at"] == 10.0
 
 
 def test_artifacts_preserve_ticket_history_outcomes_and_done_ledger():

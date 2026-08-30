@@ -41,6 +41,7 @@ if _DEBUG_INTERRUPT:
 # Thread-local activity callback.  The agent sets this before a tool call so
 # long-running _wait_for_process loops can report liveness to the gateway.
 _activity_callback_local = threading.local()
+_process_progress_callback_local = threading.local()
 
 
 def set_activity_callback(cb: Callable[[str], None] | None) -> None:
@@ -50,6 +51,31 @@ def set_activity_callback(cb: Callable[[str], None] | None) -> None:
 
 def _get_activity_callback() -> Callable[[str], None] | None:
     return getattr(_activity_callback_local, "callback", None)
+
+
+def set_process_progress_callback(
+    cb: Callable[[dict], bool] | None,
+    *,
+    initial_delay: float = 60.0,
+    interval: float = 120.0,
+) -> None:
+    """Register a cooperative long-process reviewer for the current thread.
+
+    The callback receives bounded progress evidence and returns true only when
+    the active process should be cancelled. It is intentionally independent of
+    the gateway liveness callback above.
+    """
+    _process_progress_callback_local.callback = cb
+    _process_progress_callback_local.initial_delay = max(1.0, float(initial_delay))
+    _process_progress_callback_local.interval = max(1.0, float(interval))
+
+
+def _get_process_progress_callback() -> tuple[Callable[[dict], bool] | None, float, float]:
+    return (
+        getattr(_process_progress_callback_local, "callback", None),
+        float(getattr(_process_progress_callback_local, "initial_delay", 60.0)),
+        float(getattr(_process_progress_callback_local, "interval", 120.0)),
+    )
 
 
 def touch_activity_if_due(
@@ -599,6 +625,8 @@ class BaseEnvironment(ABC):
         _last_heartbeat = _now
         _last_interrupt_state = False
         _cb_was_none = _get_activity_callback() is None
+        _progress_cb, _progress_initial_delay, _progress_interval = _get_process_progress_callback()
+        _next_progress_review = _now + _progress_initial_delay
         if _DEBUG_INTERRUPT:
             logger.info(
                 "[interrupt-debug] _wait_for_process ENTER tid=%s pid=%s "
@@ -644,6 +672,40 @@ class BaseEnvironment(ABC):
                     }
                 # Periodic activity touch so the gateway knows we're alive
                 touch_activity_if_due(_activity_state, "terminal command running")
+
+                now = time.monotonic()
+                if _progress_cb is not None and now >= _next_progress_review:
+                    partial = "".join(output_chunks)
+                    preview_limit = 8_000
+                    if len(partial) > preview_limit:
+                        half = preview_limit // 2
+                        preview = partial[:half] + "\n... [progress output truncated] ...\n" + partial[-half:]
+                    else:
+                        preview = partial
+                    cancel = False
+                    try:
+                        cancel = bool(
+                            _progress_cb(
+                                {
+                                    "elapsed_seconds": round(now - _activity_state["start"], 3),
+                                    "pid": getattr(proc, "pid", None),
+                                    "output_chars": len(partial),
+                                    "output_preview": preview,
+                                }
+                            )
+                        )
+                    except Exception:
+                        logger.exception("Long-process progress callback failed")
+                    _next_progress_review = time.monotonic() + _progress_interval
+                    if cancel:
+                        self._kill_process(proc)
+                        drain_thread.join(timeout=2)
+                        partial = "".join(output_chunks)
+                        marker = "\n[Command cancelled after conscience progress review]"
+                        return {
+                            "output": partial + marker if partial else marker.lstrip(),
+                            "returncode": 125,
+                        }
 
                 # Heartbeat every ~30s: proves the loop is alive and reports
                 # the activity-callback state (thread-local, can get clobbered
@@ -851,4 +913,3 @@ class BaseEnvironment(ABC):
         from tools.terminal_tool import _transform_sudo_command
 
         return _transform_sudo_command(command)
-
