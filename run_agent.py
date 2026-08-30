@@ -466,6 +466,7 @@ class AIAgent:
         api_key: str = None,
         provider: str = None,
         api_mode: str = None,
+        responses_stateful: bool = False,
         acp_command: str = None,
         acp_args: list[str] | None = None,
         command: str = None,
@@ -525,6 +526,9 @@ class AIAgent:
             api_key (str): API key for authentication (optional, uses env var if not provided)
             provider (str): Provider identifier (optional; used for telemetry/routing hints)
             api_mode (str): API mode override: "chat_completions" or "codex_responses"
+            responses_stateful (bool): Enable server-side conversation chaining
+                for custom Responses-compatible endpoints that support
+                ``previous_response_id``.
             model (str): Model name to use (default: "anthropic/claude-opus-4.6")
             max_iterations (int): Maximum number of tool calling iterations (default: 90)
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
@@ -586,6 +590,9 @@ class AIAgent:
         self.base_url = base_url or ""
         provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
         self.provider = provider_name or ""
+        self.responses_stateful = bool(responses_stateful)
+        self._responses_previous_response_id: Optional[str] = None
+        self._responses_blocked_response_id: Optional[str] = None
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
         if api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
@@ -1260,6 +1267,7 @@ class AIAgent:
             "provider": self.provider,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "responses_stateful": self.responses_stateful,
             "api_key": getattr(self, "api_key", ""),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
@@ -1309,6 +1317,7 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self._clear_responses_stateful_chain(reason="reset_session_state")
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
@@ -1323,7 +1332,15 @@ class AIAgent:
             # Iterative summary from previous session must not bleed into new one (#2635)
             self.context_compressor._previous_summary = None
     
-    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
+    def switch_model(
+        self,
+        new_model,
+        new_provider,
+        api_key='',
+        base_url='',
+        api_mode='',
+        responses_stateful: Optional[bool] = None,
+    ):
         """Switch the model/provider in-place for a live agent.
 
         Called by the /model command handlers (CLI and gateway) after
@@ -1352,8 +1369,11 @@ class AIAgent:
         self.provider = new_provider
         self.base_url = base_url or self.base_url
         self.api_mode = api_mode
+        if responses_stateful is not None:
+            self.responses_stateful = bool(responses_stateful)
         if api_key:
             self.api_key = api_key
+        self._clear_responses_stateful_chain(reason="switch_model")
 
         # ── Build new client ──
         if api_mode == "anthropic_messages":
@@ -1421,6 +1441,7 @@ class AIAgent:
             "provider": self.provider,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "responses_stateful": self.responses_stateful,
             "api_key": getattr(self, "api_key", ""),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
@@ -3102,6 +3123,113 @@ class AIAgent:
         digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:24]
         return f"fc_{digest}"
 
+    def _responses_stateful_enabled(self) -> bool:
+        return (
+            self.api_mode == "codex_responses"
+            and bool(getattr(self, "responses_stateful", False))
+            and self.provider != "openai-codex"
+        )
+
+    def _clear_responses_stateful_chain(
+        self,
+        *,
+        reason: str = "",
+        blocked_response_id: Optional[str] = None,
+    ) -> None:
+        blocked = (
+            blocked_response_id.strip()
+            if isinstance(blocked_response_id, str) and blocked_response_id.strip()
+            else None
+        )
+        current = getattr(self, "_responses_previous_response_id", None)
+        if blocked is None and isinstance(current, str) and current.strip():
+            blocked = current.strip()
+        had_state = bool(blocked or current)
+        if blocked:
+            self._responses_blocked_response_id = blocked
+        self._responses_previous_response_id = None
+        if reason and blocked:
+            logger.info("Cleared stateful Responses chain (%s): %s", reason, blocked)
+        elif reason and had_state:
+            logger.info("Cleared stateful Responses chain (%s)", reason)
+
+    def _remember_responses_response_id(self, response_id: Any) -> None:
+        if not isinstance(response_id, str) or not response_id.strip():
+            return
+        self._responses_previous_response_id = response_id.strip()
+        self._responses_blocked_response_id = None
+
+    def _get_responses_previous_response_id(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
+        blocked = getattr(self, "_responses_blocked_response_id", None)
+        current = getattr(self, "_responses_previous_response_id", None)
+        if isinstance(current, str):
+            current = current.strip() or None
+        else:
+            current = None
+        if current and current != blocked:
+            return current
+
+        for msg in reversed(messages or []):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            candidate = msg.get("responses_response_id")
+            if not isinstance(candidate, str):
+                continue
+            candidate = candidate.strip()
+            if candidate and candidate != blocked:
+                self._responses_previous_response_id = candidate
+                return candidate
+        return None
+
+    @staticmethod
+    def _find_responses_anchor_index(
+        messages: List[Dict[str, Any]],
+        response_id: str,
+    ) -> Optional[int]:
+        target = response_id.strip()
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            candidate = msg.get("responses_response_id")
+            if isinstance(candidate, str) and candidate.strip() == target:
+                return idx
+        return None
+
+    def _build_stateful_responses_input(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        previous_response_id = self._get_responses_previous_response_id(messages)
+        if not previous_response_id:
+            return self._chat_messages_to_responses_input(messages), None
+
+        anchor_idx = self._find_responses_anchor_index(messages, previous_response_id)
+        if anchor_idx is None:
+            self._clear_responses_stateful_chain(
+                reason="missing_local_anchor",
+                blocked_response_id=previous_response_id,
+            )
+            return self._chat_messages_to_responses_input(messages), None
+
+        delta_messages = messages[anchor_idx + 1:]
+        return self._chat_messages_to_responses_input(delta_messages), previous_response_id
+
+    def _should_reset_stateful_responses_after_error(self, exc: Exception) -> bool:
+        if not self._responses_stateful_enabled():
+            return False
+        message = str(exc or "").lower()
+        if not message:
+            return False
+        if "previous_response_id" in message and ("not found" in message or "unknown" in message or "404" in message):
+            return True
+        if "previous response" in message and "not found" in message:
+            return True
+        return False
+
     def _chat_messages_to_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Convert internal chat-style messages to Responses input items."""
         items: List[Dict[str, Any]] = []
@@ -3353,23 +3481,38 @@ class AIAgent:
                     }
                 )
 
+        stateful_enabled = self._responses_stateful_enabled()
         store = api_kwargs.get("store", False)
-        if store is not False:
-            raise ValueError("Codex Responses contract requires 'store' to be false.")
+        if not isinstance(store, bool):
+            raise ValueError("Codex Responses request 'store' must be a boolean when provided.")
+        if store and not stateful_enabled:
+            raise ValueError(
+                "Codex Responses contract requires 'store' to be false unless stateful Responses mode is enabled."
+            )
 
         allowed_keys = {
             "model", "instructions", "input", "tools", "store",
             "reasoning", "include", "max_output_tokens", "temperature",
-            "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
+            "tool_choice", "parallel_tool_calls", "prompt_cache_key", "previous_response_id",
         }
         normalized: Dict[str, Any] = {
             "model": model,
             "instructions": instructions,
             "input": normalized_input,
-            "store": False,
+            "store": store if stateful_enabled else False,
         }
         if normalized_tools is not None:
             normalized["tools"] = normalized_tools
+
+        previous_response_id = api_kwargs.get("previous_response_id")
+        if previous_response_id is not None:
+            if not stateful_enabled:
+                raise ValueError(
+                    "Codex Responses 'previous_response_id' requires stateful Responses mode to be enabled."
+                )
+            if not isinstance(previous_response_id, str) or not previous_response_id.strip():
+                raise ValueError("Codex Responses 'previous_response_id' must be a non-empty string.")
+            normalized["previous_response_id"] = previous_response_id.strip()
 
         # Pass through reasoning config
         reasoning = api_kwargs.get("reasoning")
@@ -3378,9 +3521,6 @@ class AIAgent:
         include = api_kwargs.get("include")
         if isinstance(include, list):
             normalized["include"] = include
-        service_tier = api_kwargs.get("service_tier")
-        if isinstance(service_tier, str) and service_tier.strip():
-            normalized["service_tier"] = service_tier.strip()
 
         # Pass through max_output_tokens and temperature
         max_output_tokens = api_kwargs.get("max_output_tokens")
@@ -3592,6 +3732,7 @@ class AIAgent:
             reasoning_content=None,
             reasoning_details=None,
             codex_reasoning_items=reasoning_items_raw or None,
+            responses_response_id=getattr(response, "id", None),
         )
 
         if tool_calls:
@@ -5051,7 +5192,9 @@ class AIAgent:
             self.provider = fb_provider
             self.base_url = fb_base_url
             self.api_mode = fb_api_mode
+            self.responses_stateful = bool(fb.get("responses_stateful", False))
             self._fallback_activated = True
+            self._clear_responses_stateful_chain(reason="activate_fallback")
 
             if fb_api_mode == "anthropic_messages":
                 # Build native Anthropic client instead of using OpenAI client
@@ -5147,9 +5290,11 @@ class AIAgent:
             self.provider = rt["provider"]
             self.base_url = rt["base_url"]           # setter updates _base_url_lower
             self.api_mode = rt["api_mode"]
+            self.responses_stateful = bool(rt.get("responses_stateful", False))
             self.api_key = rt["api_key"]
             self._client_kwargs = dict(rt["client_kwargs"])
             self._use_prompt_caching = rt["use_prompt_caching"]
+            self._clear_responses_stateful_chain(reason="restore_primary_runtime")
 
             # ── Rebuild client for the primary provider ──
             if self.api_mode == "anthropic_messages":
@@ -5245,6 +5390,7 @@ class AIAgent:
             self.provider = rt["provider"]
             self.base_url = rt["base_url"]
             self.api_mode = rt["api_mode"]
+            self.responses_stateful = bool(rt.get("responses_stateful", False))
             self.api_key = rt["api_key"]
 
             if self.api_mode == "anthropic_messages":
@@ -5539,6 +5685,7 @@ class AIAgent:
                 self.provider == "openai-codex"
                 or "chatgpt.com/backend-api/codex" in self.base_url.lower()
             )
+            stateful_responses = self._responses_stateful_enabled()
 
             # Resolve reasoning effort: config > default (medium)
             reasoning_effort = "medium"
@@ -5559,7 +5706,13 @@ class AIAgent:
                 "store": False,
             }
 
-            if not is_github_responses:
+            if stateful_responses:
+                kwargs["input"], previous_response_id = self._build_stateful_responses_input(payload_messages)
+                kwargs["store"] = True
+                if previous_response_id:
+                    kwargs["previous_response_id"] = previous_response_id
+
+            if not is_github_responses and not stateful_responses:
                 kwargs["prompt_cache_key"] = self.session_id
 
             if reasoning_enabled:
@@ -5889,6 +6042,12 @@ class AIAgent:
         codex_items = getattr(assistant_message, "codex_reasoning_items", None)
         if codex_items:
             msg["codex_reasoning_items"] = codex_items
+
+        responses_response_id = getattr(assistant_message, "responses_response_id", None)
+        if isinstance(responses_response_id, str) and responses_response_id.strip():
+            normalized_response_id = responses_response_id.strip()
+            msg["responses_response_id"] = normalized_response_id
+            self._remember_responses_response_id(normalized_response_id)
 
         if assistant_message.tool_calls:
             tool_calls = []
@@ -9443,6 +9602,17 @@ class AIAgent:
                     break
                 
             except Exception as e:
+                if self._should_reset_stateful_responses_after_error(e):
+                    self._clear_responses_stateful_chain(
+                        reason="previous_response_id_rejected",
+                        blocked_response_id=self._responses_previous_response_id,
+                    )
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        logger.info(
+                            "Retrying Responses request without previous_response_id after server rejection"
+                        )
+                        continue
                 error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
                 try:
                     print(f"❌ {error_msg}")
