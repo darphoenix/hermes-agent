@@ -12,6 +12,7 @@ PLAN_SUMMARY = "PLAN_SUMMARY"
 TOOL_CALL = "TOOL_CALL"
 TOOL_RESULT = "TOOL_RESULT"
 TOOL_PROGRESS = "TOOL_PROGRESS"
+TOOL_POLICY_CONFLICT = "TOOL_POLICY_CONFLICT"
 ARTIFACT_UPDATED = "ARTIFACT_UPDATED"
 DRAFT_ANSWER = "DRAFT_ANSWER"
 INTENT_TO_STOP = "INTENT_TO_STOP"
@@ -70,6 +71,7 @@ class CritiqueTicket:
     next_best_action: str = ""
     criterion_ids: List[str] = field(default_factory=list)
     recommended_tools: Optional[List[str]] = None
+    tool_policy: Optional[Dict[str, Any]] = None
     active_tool_decision: Optional[str] = None
 
 
@@ -787,15 +789,17 @@ class ConscienceMonitor:
     @staticmethod
     def _intervention_json_contract_prompt() -> str:
         return (
-            "When intervention requires tool use, set recommended_tools to the smallest useful list of exact tool names from payload.available_tools. "
+            "When intervention requires tool use, set recommended_tools to a useful advisory list of exact tool names from payload.available_tools. "
             "If the actor should answer or synthesize from evidence already gathered without another tool call, return recommended_tools as an empty array. "
             "If no exact tool guidance is useful, return recommended_tools as null. Do not invent tool names. "
+            "tool_policy is separate from recommended_tools and defaults to null. Set tool_policy only when the recent failure is specifically repeated wrong tool selection and preventing that choice for the next actor action is necessary to break the loop. "
+            "A strict policy has the form {\"mode\":\"allowlist\",\"tools\":[\"exact_tool_name\"]}; it applies to one actor action only and must use exact names from payload.available_tools. Do not use tool_policy merely to recommend an efficient next step. "
             "Hermes records attempted automatically when the actor takes the next tool action. Include intervention_outcomes only for a semantic status transition to resolved, ignored, or still_failing; never narrate attempted-to-attempted progress or repeat the current status. "
             "Mark resolved only when a recent tool result or equivalent evidence directly proves the required action succeeded. Starting a command is attempted, not resolved. "
             "Each outcome object must use keys id, status, outcome, evidence, confidence. "
             "For a TOOL_PROGRESS review, set active_tool_decision to cancel only when the available command, elapsed time, and progress evidence make continued execution clearly wasteful; otherwise set it to continue. For other reviews omit active_tool_decision. "
             "Return strict JSON with keys: should_intervene (bool), verdict (string), reason (string), evidence (array of strings), "
-            "next_best_action (string), recommended_tools (array of strings or null), criterion_ids (array of strings), confidence (string), and optional active_tool_decision (cancel or continue)."
+            "next_best_action (string), recommended_tools (array of strings or null), tool_policy (object or null), criterion_ids (array of strings), confidence (string), and optional active_tool_decision (cancel or continue)."
         )
 
     @classmethod
@@ -803,7 +807,7 @@ class ConscienceMonitor:
         return (
             "Return strict JSON. If no intervention is warranted, return only "
             '{"should_intervene": false, "verdict": "observe"} '
-            "and omit reason, evidence, next_best_action, recommended_tools, criterion_ids, and confidence, unless adding a transition-only intervention_outcomes update. "
+            "and omit reason, evidence, next_best_action, recommended_tools, tool_policy, criterion_ids, and confidence, unless adding a transition-only intervention_outcomes update. "
             "Do not explain why you are observing. "
             "If intervention is warranted, "
             + cls._intervention_json_contract_prompt()
@@ -814,7 +818,7 @@ class ConscienceMonitor:
         return (
             "Return strict JSON. If the actor may stop, return only "
             '{"should_intervene": false, "verdict": "allow_stop"} '
-            "and omit reason, evidence, next_best_action, recommended_tools, criterion_ids, confidence, and intervention_outcomes. "
+            "and omit reason, evidence, next_best_action, recommended_tools, tool_policy, criterion_ids, confidence, and intervention_outcomes. "
             "If the actor must not stop, "
             + cls._intervention_json_contract_prompt()
         )
@@ -1024,6 +1028,7 @@ class ConscienceMonitor:
                 "required_action": ticket.next_best_action,
                 "next_best_action": ticket.next_best_action,
                 "recommended_tools": list(ticket.recommended_tools or []),
+                "tool_policy": dict(ticket.tool_policy) if ticket.tool_policy else None,
                 "evidence": list(ticket.evidence[:5]),
                 "criterion_ids": list(ticket.criterion_ids),
                 "status": "issued",
@@ -1262,6 +1267,20 @@ class ConscienceMonitor:
                 metadata=metadata,
             )
 
+        raw_tool_policy = parsed.get("tool_policy")
+        tool_policy = None
+        if isinstance(raw_tool_policy, dict) and raw_tool_policy.get("mode") == "allowlist":
+            raw_policy_tools = raw_tool_policy.get("tools")
+            if isinstance(raw_policy_tools, list):
+                tool_policy = {
+                    "mode": "allowlist",
+                    "tools": [
+                        str(name).strip()
+                        for name in raw_policy_tools
+                        if str(name).strip()
+                    ],
+                }
+
         ticket = CritiqueTicket(
             verdict=str(parsed.get("verdict") or ("repair" if review_type == "midtask" else "block")),
             reason=str(parsed.get("reason") or f"{review_type}_review"),
@@ -1273,6 +1292,7 @@ class ConscienceMonitor:
                 if isinstance(parsed.get("recommended_tools"), list)
                 else None
             ),
+            tool_policy=tool_policy,
             active_tool_decision=(
                 str(parsed.get("active_tool_decision") or "").strip().lower()
                 if str(parsed.get("active_tool_decision") or "").strip().lower() in {"cancel", "continue"}

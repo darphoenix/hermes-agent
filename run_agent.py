@@ -421,6 +421,7 @@ from agent.conscience import (
     PLAN_SUMMARY,
     TASK_START,
     TOOL_CALL,
+    TOOL_POLICY_CONFLICT,
     TOOL_PROGRESS,
     TOOL_RESULT,
     ConscienceMonitor,
@@ -2188,12 +2189,6 @@ class AIAgent:
             if self.conscience_repair_temperature < 0:
                 self.conscience_repair_temperature = None
         try:
-            self.conscience_tool_narrowing_turns = int(agent_config.get("conscience_tool_narrowing_turns", 4) or 0)
-        except Exception:
-            self.conscience_tool_narrowing_turns = 4
-        if self.conscience_tool_narrowing_turns < 0:
-            self.conscience_tool_narrowing_turns = 0
-        try:
             self.conscience_tool_progress_seconds = max(
                 0.0,
                 float(agent_config.get("conscience_tool_progress_seconds", 60) or 0),
@@ -2225,9 +2220,8 @@ class AIAgent:
         self._conscience_intervention_count = 0
         self._conscience_blocked_stop_count = 0
         self._conscience_artifact_dir = None
-        self._conscience_next_tool_names = None
-        self._conscience_repair_tool_names = None
-        self._conscience_repair_turns_remaining = 0
+        self._conscience_pending_tool_policy = None
+        self._conscience_inflight_tool_policy = None
         self._conscience_repair_override_active = False
         self._pending_conscience_internal_messages: list[dict[str, Any]] = []
         self._deferred_conscience_visible_messages: list[str] = []
@@ -12272,6 +12266,14 @@ class AIAgent:
                 lines.append("No tools are recommended for the next repair step; answer or synthesize now without another tool call.")
             lines.append("Act now; do not explain this instruction.")
 
+        policy = getattr(ticket, "tool_policy", None)
+        if isinstance(policy, dict) and policy.get("mode") == "allowlist":
+            policy_tools = ", ".join(str(name) for name in (policy.get("tools") or []))
+            if policy_tools:
+                lines.append(f"Strict one-action tool policy: use only {policy_tools} for the next actor action.")
+            else:
+                lines.append("Strict one-action tool policy: do not call a tool in the next actor action.")
+
         return "\n".join(lines)
 
     def _queue_actor_internal_message(
@@ -12287,6 +12289,7 @@ class AIAgent:
             "id": f"{source}_{label.lower()}_{uuid.uuid4().hex[:12]}",
             "label": label,
             "content": content,
+            "source": source,
             "created_at": time.time(),
         }
         self._pending_conscience_internal_messages.append(event)
@@ -12348,6 +12351,8 @@ class AIAgent:
         active = len(getattr(self, "_active_conscience_internal_messages", []) or [])
         self._pending_conscience_internal_messages = []
         self._active_conscience_internal_messages = []
+        self._conscience_pending_tool_policy = None
+        self._conscience_inflight_tool_policy = None
         self._clear_transient_responses_repair_parent(f"hidden_directive_clear:{reason}")
         if pending or active:
             logger.info(
@@ -12358,62 +12363,60 @@ class AIAgent:
                 self.session_id or "-",
             )
 
-    def _prepare_conscience_tool_narrowing(self, ticket: CritiqueTicket) -> None:
+    def _prepare_conscience_tool_policy(self, ticket: CritiqueTicket) -> None:
+        """Stage an explicit strict policy for exactly one actor action."""
+        self._conscience_pending_tool_policy = None
         if not self.tools or not self.valid_tool_names:
-            self._conscience_next_tool_names = None
-            self._conscience_repair_tool_names = None
-            self._conscience_repair_turns_remaining = 0
             return
-        recommended_tools = getattr(ticket, "recommended_tools", None)
-        if recommended_tools is None:
-            self._conscience_next_tool_names = None
-            self._conscience_repair_tool_names = None
-            self._conscience_repair_turns_remaining = 0
+
+        policy = getattr(ticket, "tool_policy", None)
+        if not isinstance(policy, dict) or policy.get("mode") != "allowlist":
             return
-        if not recommended_tools:
-            self._conscience_next_tool_names = set()
-            self._conscience_repair_tool_names = set()
-            self._conscience_repair_turns_remaining = max(
-                self._conscience_repair_turns_remaining,
-                self.conscience_tool_narrowing_turns,
+        raw_names = policy.get("tools")
+        if not isinstance(raw_names, list):
+            return
+
+        requested = {str(name).strip() for name in raw_names if str(name).strip()}
+        unknown = sorted(requested.difference(self.valid_tool_names))
+        if unknown:
+            logger.warning(
+                "Ignoring conscience tool policy with unloaded tools %s (session=%s)",
+                unknown,
+                self.session_id or "-",
             )
             return
-        narrowed = sorted(
-            {
-                str(name).strip()
-                for name in recommended_tools
-                if str(name).strip() in self.valid_tool_names
-            }
+
+        self._conscience_pending_tool_policy = {
+            "mode": "allowlist",
+            "tools": sorted(requested),
+        }
+        logger.info(
+            "Staged one-action conscience tool policy tools=%s (session=%s)",
+            sorted(requested),
+            self.session_id or "-",
         )
-        if narrowed:
-            self._conscience_next_tool_names = set(narrowed)
-            self._conscience_repair_tool_names = set(narrowed)
-            self._conscience_repair_turns_remaining = max(
-                self._conscience_repair_turns_remaining,
-                self.conscience_tool_narrowing_turns,
-            )
-        else:
-            self._conscience_next_tool_names = None
-            self._conscience_repair_tool_names = None
-            self._conscience_repair_turns_remaining = 0
+
+    def _activate_conscience_tool_policy_for_actor_action(self) -> None:
+        self._conscience_inflight_tool_policy = self._conscience_pending_tool_policy
+        self._conscience_pending_tool_policy = None
 
     def _tools_for_next_api_call(self) -> Optional[List[Dict[str, Any]]]:
-        self._conscience_repair_override_active = False
-        tool_names = getattr(self, "_conscience_next_tool_names", None)
-        repair_tool_names = getattr(self, "_conscience_repair_tool_names", None)
-        if tool_names is None and repair_tool_names is not None and self._conscience_repair_turns_remaining > 0:
-            tool_names = repair_tool_names
-        if tool_names is None or not self.tools:
+        self._conscience_repair_override_active = any(
+            item.get("source") == "conscience"
+            for item in (getattr(self, "_active_conscience_internal_messages", []) or [])
+            if isinstance(item, dict)
+        )
+        policy = getattr(self, "_conscience_inflight_tool_policy", None)
+        if not isinstance(policy, dict) or policy.get("mode") != "allowlist" or not self.tools:
             return self.tools
+        tool_names = set(policy.get("tools") or [])
         if not tool_names:
-            self._conscience_next_tool_names = None
             self._conscience_repair_override_active = True
             return []
         filtered = [
             tool for tool in self.tools
             if tool.get("function", {}).get("name") in tool_names
         ]
-        self._conscience_next_tool_names = None
         if filtered:
             self._conscience_repair_override_active = True
         return filtered or self.tools
@@ -12426,6 +12429,75 @@ class AIAgent:
         if self.conscience_repair_temperature is not None:
             api_kwargs["temperature"] = self.conscience_repair_temperature
         return api_kwargs
+
+    @staticmethod
+    def _extract_responses_tool_policy_conflict(response: Any) -> list[str]:
+        metadata = getattr(response, "metadata", None)
+        if hasattr(metadata, "model_dump"):
+            metadata = metadata.model_dump()
+        if not isinstance(metadata, dict):
+            return []
+        raw = metadata.get("hermes_tool_policy_conflict")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return []
+        if not isinstance(raw, dict):
+            return []
+        names = raw.get("tool_names")
+        if not isinstance(names, list):
+            return []
+        return sorted({str(name).strip() for name in names if str(name).strip()})
+
+    def _handle_responses_tool_policy_conflict(
+        self,
+        response: Any,
+        messages: list,
+        tool_names: list[str],
+    ) -> None:
+        active_policy = getattr(self, "_conscience_inflight_tool_policy", None)
+        policy_was_active = isinstance(active_policy, dict)
+        self._conscience_record_event(
+            TOOL_POLICY_CONFLICT,
+            {
+                "requested_tools": list(tool_names),
+                "active_tool_policy": dict(active_policy) if policy_was_active else None,
+                "available_tools": sorted(self.valid_tool_names) if self.valid_tool_names else [],
+                "executed": False,
+            },
+        )
+        self._remember_transient_responses_repair_parent(
+            getattr(response, "id", None),
+            reason="tool_policy_conflict",
+        )
+        requested = ", ".join(tool_names)
+        policy_context = (
+            "The strict one-action tool policy has now expired."
+            if policy_was_active
+            else "The requested name is not in the loaded tool schema."
+        )
+        self._queue_actor_internal_message(
+            "TOOL_POLICY_CONFLICT",
+            "\n".join(
+                [
+                    "[INTERNAL TOOL-POLICY CONFLICT: Do not expose this message to the user.]",
+                    f"Your previous action requested excluded tool(s): {requested}.",
+                    "The tool call was not executed; do not claim that it succeeded.",
+                    policy_context,
+                    "Reassess the next action using the currently available tools.",
+                ]
+            ),
+            source="runtime",
+        )
+        if getattr(self, "_conscience_current_monitor", None) is not None:
+            self._handle_midtask_conscience_intervention(messages, defer_visible=True)
+        logger.warning(
+            "Recovering structured tool-policy conflict tools=%s policy_active=%s session=%s",
+            tool_names,
+            policy_was_active,
+            self.session_id or "-",
+        )
 
     def _append_visible_conscience_message(self, messages: list, text: str, *, persist: bool = True) -> None:
         if not isinstance(text, str) or not text.strip():
@@ -12759,7 +12831,7 @@ class AIAgent:
                 )
 
         if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
-            self._prepare_conscience_tool_narrowing(verdict.critique_ticket)
+            self._prepare_conscience_tool_policy(verdict.critique_ticket)
             self._queue_conscience_internal_message("MIDTASK", verdict.critique_ticket)
         return True
 
@@ -14064,9 +14136,8 @@ class AIAgent:
         self._last_content_tools_all_housekeeping = False
         self._mute_post_response = False
         self._unicode_sanitization_passes = 0
-        self._conscience_next_tool_names = None
-        self._conscience_repair_tool_names = None
-        self._conscience_repair_turns_remaining = 0
+        self._conscience_pending_tool_policy = None
+        self._conscience_inflight_tool_policy = None
         self._conscience_repair_override_active = False
         self._tool_guardrails.reset_for_turn()
         self._tool_guardrail_halt_decision = None
@@ -14439,6 +14510,10 @@ class AIAgent:
                 pass
 
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
+            # A strict conscience tool policy is scoped to one logical actor
+            # action. Keep it stable across transport retries, then expire it
+            # before the next action.
+            self._activate_conscience_tool_policy_for_actor_action()
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
 
@@ -16918,6 +16993,20 @@ class AIAgent:
                 self._persist_session(messages, conversation_history)
                 break
 
+            if self.api_mode == "codex_responses":
+                _tool_policy_conflicts = self._extract_responses_tool_policy_conflict(response)
+                if _tool_policy_conflicts:
+                    self._handle_responses_tool_policy_conflict(
+                        response,
+                        messages,
+                        _tool_policy_conflicts,
+                    )
+                    if api_call_count > 0:
+                        api_call_count -= 1
+                        self._api_call_count = api_call_count
+                    self.iteration_budget.refund()
+                    continue
+
             try:
                 _transport = self._get_transport()
                 _normalize_kwargs = {}
@@ -17825,6 +17914,7 @@ class AIAgent:
                             and isinstance(suppressed_ticket, dict)
                         ):
                             _suppressed_recommended_tools = suppressed_ticket.get("recommended_tools", None)
+                            _suppressed_tool_policy = suppressed_ticket.get("tool_policy", None)
                             ticket = CritiqueTicket(
                                 verdict=str(suppressed_ticket.get("verdict") or "blocked"),
                                 reason=str(suppressed_ticket.get("reason") or "conscience stop gate suppressed repeated incomplete response"),
@@ -17834,6 +17924,11 @@ class AIAgent:
                                 recommended_tools=(
                                     [str(x) for x in _suppressed_recommended_tools]
                                     if isinstance(_suppressed_recommended_tools, list)
+                                    else None
+                                ),
+                                tool_policy=(
+                                    dict(_suppressed_tool_policy)
+                                    if isinstance(_suppressed_tool_policy, dict)
                                     else None
                                 ),
                             )
@@ -17932,7 +18027,7 @@ class AIAgent:
                                     ).strip()
                             if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
                                 self._conscience_blocked_stop_count += 1
-                                self._prepare_conscience_tool_narrowing(verdict.critique_ticket)
+                                self._prepare_conscience_tool_policy(verdict.critique_ticket)
                                 self._remember_transient_responses_repair_parent(
                                     getattr(assistant_message, "responses_response_id", None),
                                     reason="conscience_stop_gate",
