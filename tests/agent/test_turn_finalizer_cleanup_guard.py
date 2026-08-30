@@ -57,6 +57,7 @@ class _StubAgent:
             setattr(self, attr, 0)
         self.session_cost_status = "ok"
         self.session_cost_source = "stub"
+        self._request_trace = [{"kind": "api_call", "status": "completed"}]
 
     # --- fallible cleanup surfaces -------------------------------------
     def _save_trajectory(self, *a, **k):
@@ -162,5 +163,5 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
     assert "cleanup_errors" not in result
-
+    assert result["request_trace"] == agent._request_trace
 

@@ -218,6 +218,21 @@ def test_user_message_preserves_platform_event_timestamp():
     assert ctx.messages[-1]["timestamp"] == 123.5
 
 
+def test_turn_start_resets_request_trace_and_binds_task_identity():
+    agent = _FakeAgent()
+    agent._trace_lock = threading.Lock()
+    agent._request_trace = [{"kind": "stale"}]
+    agent._active_api_trace_row = {"status": "started"}
+
+    _build(agent, task_id="task-trace")
+
+    assert agent._request_trace == []
+    assert agent._active_api_trace_row is None
+    assert agent._trace_task_id == "task-trace"
+    assert agent._trace_turn_id.startswith("turn_")
+    assert isinstance(agent._trace_turn_started_at, float)
+
+
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
 #
 # The prologue is the ONLY place the per-turn synchronous
