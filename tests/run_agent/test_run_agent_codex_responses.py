@@ -445,7 +445,7 @@ def test_stateful_stop_gate_repair_branches_from_rejected_draft_response(monkeyp
     assert not any("INTERNAL CONSCIENCE" in str(msg.get("content", "")) for msg in result["messages"])
 
 
-def test_build_api_kwargs_consumes_conscience_tool_narrowing(monkeypatch):
+def test_build_api_kwargs_uses_inflight_one_action_tool_policy(monkeypatch):
     agent = _build_agent(monkeypatch)
     agent.tools.append({
         "type": "function",
@@ -456,7 +456,10 @@ def test_build_api_kwargs_consumes_conscience_tool_narrowing(monkeypatch):
         },
     })
     agent.valid_tool_names.add("web_search")
-    agent._conscience_next_tool_names = {"terminal"}
+    agent._conscience_inflight_tool_policy = {
+        "mode": "allowlist",
+        "tools": ["terminal"],
+    }
 
     narrowed = agent._build_api_kwargs(
         [
@@ -466,16 +469,25 @@ def test_build_api_kwargs_consumes_conscience_tool_narrowing(monkeypatch):
     )
     assert [tool["name"] for tool in narrowed["tools"]] == ["terminal"]
 
-    restored = agent._build_api_kwargs(
+    same_action_retry = agent._build_api_kwargs(
         [
             {"role": "system", "content": "You are Hermes."},
             {"role": "user", "content": "Ping again"},
         ]
     )
+    assert [tool["name"] for tool in same_action_retry["tools"]] == ["terminal"]
+
+    agent._conscience_inflight_tool_policy = None
+    restored = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "A new actor action"},
+        ]
+    )
     assert len(restored["tools"]) > 1
 
 
-def test_conscience_tool_narrowing_uses_only_explicit_recommended_tools(monkeypatch):
+def test_recommended_tools_are_advisory_and_explicit_policy_is_strict(monkeypatch):
     agent = _build_agent(monkeypatch)
     agent.tools.append({
         "type": "function",
@@ -487,7 +499,7 @@ def test_conscience_tool_narrowing_uses_only_explicit_recommended_tools(monkeypa
     })
     agent.valid_tool_names.add("web_search")
 
-    agent._prepare_conscience_tool_narrowing(
+    agent._prepare_conscience_tool_policy(
         run_agent.CritiqueTicket(
             verdict="repair",
             reason="needs_current_source",
@@ -495,32 +507,35 @@ def test_conscience_tool_narrowing_uses_only_explicit_recommended_tools(monkeypa
             recommended_tools=["web_search", "not_loaded"],
         )
     )
-    narrowed = agent._build_api_kwargs(
+    agent._activate_conscience_tool_policy_for_actor_action()
+    advisory = agent._build_api_kwargs(
         [
             {"role": "system", "content": "You are Hermes."},
             {"role": "user", "content": "Ping"},
         ]
     )
-    assert [tool["name"] for tool in narrowed["tools"]] == ["web_search"]
+    assert sorted(tool["name"] for tool in advisory["tools"]) == ["terminal", "web_search"]
 
-    agent._prepare_conscience_tool_narrowing(
+    agent._prepare_conscience_tool_policy(
         run_agent.CritiqueTicket(
             verdict="repair",
-            reason="terminal would help",
-            next_best_action="Run a shell command.",
-            recommended_tools=None,
+            reason="repeated wrong tool",
+            next_best_action="Search once.",
+            recommended_tools=["web_search"],
+            tool_policy={"mode": "allowlist", "tools": ["web_search"]},
         )
     )
-    restored = agent._build_api_kwargs(
+    agent._activate_conscience_tool_policy_for_actor_action()
+    narrowed = agent._build_api_kwargs(
         [
             {"role": "system", "content": "You are Hermes."},
             {"role": "user", "content": "Ping again"},
         ]
     )
-    assert sorted(tool["name"] for tool in restored["tools"]) == ["terminal", "web_search"]
+    assert [tool["name"] for tool in narrowed["tools"]] == ["web_search"]
 
 
-def test_conscience_repair_narrowing_persists_for_current_turn_with_cold_temperature(monkeypatch):
+def test_conscience_tool_policy_expires_after_one_actor_action(monkeypatch):
     agent = _build_stateful_custom_agent(monkeypatch)
     agent.tools.append({
         "type": "function",
@@ -532,16 +547,16 @@ def test_conscience_repair_narrowing_persists_for_current_turn_with_cold_tempera
     })
     agent.valid_tool_names.add("web_search")
     agent.conscience_repair_temperature = 0.2
-    agent.conscience_tool_narrowing_turns = 2
-
-    agent._prepare_conscience_tool_narrowing(
+    agent._prepare_conscience_tool_policy(
         run_agent.CritiqueTicket(
             verdict="repair",
             reason="needs_current_source",
             next_best_action="Use the web to verify it.",
             recommended_tools=["web_search"],
+            tool_policy={"mode": "allowlist", "tools": ["web_search"]},
         )
     )
+    agent._activate_conscience_tool_policy_for_actor_action()
 
     first = agent._build_api_kwargs(
         [
@@ -561,16 +576,16 @@ def test_conscience_repair_narrowing_persists_for_current_turn_with_cold_tempera
     assert [tool["name"] for tool in second["tools"]] == ["web_search"]
     assert second["temperature"] == 0.2
 
-    third = agent._build_api_kwargs(
+    agent._activate_conscience_tool_policy_for_actor_action()
+    restored = agent._build_api_kwargs(
         [
             {"role": "system", "content": "You are Hermes."},
-            {"role": "user", "content": "Still same repair turn"},
+            {"role": "user", "content": "New actor action"},
         ]
     )
-    assert [tool["name"] for tool in third["tools"]] == ["web_search"]
-    assert third["temperature"] == 0.2
+    assert sorted(tool["name"] for tool in restored["tools"]) == ["terminal", "web_search"]
 
-    agent._prepare_conscience_tool_narrowing(
+    agent._prepare_conscience_tool_policy(
         run_agent.CritiqueTicket(
             verdict="repair",
             reason="synthesis_needed",
@@ -578,32 +593,68 @@ def test_conscience_repair_narrowing_persists_for_current_turn_with_cold_tempera
             recommended_tools=[],
         )
     )
-    no_tools = agent._build_api_kwargs(
+    agent._activate_conscience_tool_policy_for_actor_action()
+    advisory_no_tools = agent._build_api_kwargs(
         [
             {"role": "system", "content": "You are Hermes."},
             {"role": "user", "content": "Synthesize now"},
+        ]
+    )
+    assert sorted(tool["name"] for tool in advisory_no_tools["tools"]) == ["terminal", "web_search"]
+
+    agent._prepare_conscience_tool_policy(
+        run_agent.CritiqueTicket(
+            verdict="repair",
+            reason="synthesize without another tool",
+            next_best_action="Answer now.",
+            recommended_tools=[],
+            tool_policy={"mode": "allowlist", "tools": []},
+        )
+    )
+    agent._activate_conscience_tool_policy_for_actor_action()
+    no_tools = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Synthesize with strict policy"},
         ]
     )
     assert no_tools["tools"] == []
     assert no_tools["tool_choice"] == "none"
     assert no_tools["temperature"] == 0.2
 
-    agent._prepare_conscience_tool_narrowing(
-        run_agent.CritiqueTicket(
-            verdict="repair",
-            reason="clear narrowing",
-            next_best_action="Return to normal.",
-            recommended_tools=None,
-        )
+
+def test_structured_tool_policy_conflict_uses_transient_parent_and_records_event(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._conscience_inflight_tool_policy = {
+        "mode": "allowlist",
+        "tools": ["terminal"],
+    }
+    agent._conscience_current_monitor = run_agent.ConscienceMonitor(
+        agent.session_id,
+        "Fix the file",
+        agent.conscience_mode,
     )
-    restored = agent._build_api_kwargs(
-        [
-            {"role": "system", "content": "You are Hermes."},
-            {"role": "user", "content": "Repair no longer needs tools"},
-        ]
+    monkeypatch.setattr(agent, "_handle_midtask_conscience_intervention", lambda *a, **k: False)
+    response = SimpleNamespace(
+        id="resp_policy_conflict",
+        metadata={
+            "hermes_tool_policy_conflict": json.dumps(
+                {
+                    "type": "undeclared_tool_call",
+                    "tool_names": ["write_file"],
+                }
+            )
+        },
     )
-    assert sorted(tool["name"] for tool in restored["tools"]) == ["terminal", "web_search"]
-    assert "temperature" not in restored
+
+    names = agent._extract_responses_tool_policy_conflict(response)
+    agent._handle_responses_tool_policy_conflict(response, [], names)
+
+    assert names == ["write_file"]
+    assert agent._responses_transient_repair_previous_response_id == "resp_policy_conflict"
+    assert agent._conscience_current_monitor.state.events[-1].event_type == "TOOL_POLICY_CONFLICT"
+    assert agent._conscience_current_monitor.state.events[-1].payload["executed"] is False
+    assert agent._pending_conscience_internal_messages[-1]["label"] == "TOOL_POLICY_CONFLICT"
 
 
 def test_build_api_kwargs_codex_clamps_minimal_effort(monkeypatch):

@@ -114,6 +114,10 @@ def test_llm_review_payload_includes_available_tools_and_parses_recommendation()
                                 "next_best_action": "Search and extract the current source.",
                                 "criterion_ids": ["criterion_001"],
                                 "recommended_tools": ["web_search", "web_extract"],
+                                "tool_policy": {
+                                    "mode": "allowlist",
+                                    "tools": ["web_search"],
+                                },
                                 "confidence": "high",
                             }
                         )
@@ -131,6 +135,10 @@ def test_llm_review_payload_includes_available_tools_and_parses_recommendation()
     assert verdict.should_intervene is True
     assert verdict.critique_ticket is not None
     assert verdict.critique_ticket.recommended_tools == ["web_search", "web_extract"]
+    assert verdict.critique_ticket.tool_policy == {
+        "mode": "allowlist",
+        "tools": ["web_search"],
+    }
 
 
 def test_progress_review_parses_explicit_active_tool_cancel_decision():
