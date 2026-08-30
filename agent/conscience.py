@@ -105,7 +105,6 @@ class ConscienceState:
     stateful_next_init_reason: Optional[str] = None
     stateful_intervention_hashes: Dict[str, str] = field(default_factory=dict)
     stateful_ticket_history: Dict[str, int] = field(default_factory=dict)
-    task_contract_refined: bool = False
 
 
 def asdict_safe(obj):
@@ -799,24 +798,15 @@ class ConscienceMonitor:
             "next_best_action (string), recommended_tools (array of strings or null), criterion_ids (array of strings), confidence (string), and optional active_tool_decision (cancel or continue)."
         )
 
-    @staticmethod
-    def _task_contract_refinement_prompt() -> str:
-        return (
-            "On stateful_mode='init_full', also include task_contract_refinement with explicit_asks, explicit_constraints, required_validation, and done_definition. "
-            "Each explicit_asks and explicit_constraints item must contain description and source_text, where source_text is an exact quote from task_contract.raw_user_request. Split only materially independent asks; preserve the raw request and do not invent requirements. "
-            "This one-time refinement may accompany an observe verdict. Omit task_contract_refinement on later deltas. "
-        )
-
     @classmethod
     def _midtask_review_json_contract_prompt(cls) -> str:
         return (
             "Return strict JSON. If no intervention is warranted, return only "
             '{"should_intervene": false, "verdict": "observe"} '
-            "and omit reason, evidence, next_best_action, recommended_tools, criterion_ids, and confidence, unless adding a one-time task_contract_refinement or a transition-only intervention_outcomes update. "
+            "and omit reason, evidence, next_best_action, recommended_tools, criterion_ids, and confidence, unless adding a transition-only intervention_outcomes update. "
             "Do not explain why you are observing. "
             "If intervention is warranted, "
             + cls._intervention_json_contract_prompt()
-            + cls._task_contract_refinement_prompt()
         )
 
     @classmethod
@@ -827,7 +817,6 @@ class ConscienceMonitor:
             "and omit reason, evidence, next_best_action, recommended_tools, criterion_ids, confidence, and intervention_outcomes. "
             "If the actor must not stop, "
             + cls._intervention_json_contract_prompt()
-            + cls._task_contract_refinement_prompt()
         )
 
     @classmethod
@@ -1097,76 +1086,6 @@ class ConscienceMonitor:
             )
         return applied
 
-    def _apply_task_contract_refinement(self, parsed: Dict[str, Any]) -> bool:
-        if self.state.task_contract_refined:
-            return False
-        refinement = parsed.get("task_contract_refinement")
-        if not isinstance(refinement, dict):
-            return False
-
-        raw_request = self.state.contract.raw_user_request or ""
-        normalized_request = _normalize_text(raw_request).casefold()
-        criteria: List[TaskCriterion] = []
-        seen: set[tuple[str, str]] = set()
-        for item in refinement.get("explicit_asks") or []:
-            if isinstance(item, str):
-                description = source_text = item.strip()
-            elif isinstance(item, dict):
-                description = str(item.get("description") or item.get("criterion") or "").strip()
-                source_text = str(item.get("source_text") or item.get("source_quote") or "").strip()
-            else:
-                continue
-            normalized_source = _normalize_text(source_text).casefold()
-            if not description or not normalized_source or normalized_source not in normalized_request:
-                continue
-            key = (description.casefold(), normalized_source)
-            if key in seen:
-                continue
-            seen.add(key)
-            criteria.append(
-                TaskCriterion(
-                    criterion_id=f"criterion_{len(criteria) + 1:03d}",
-                    source_text=source_text,
-                    description=description,
-                )
-            )
-            if len(criteria) >= 16:
-                break
-        if not criteria:
-            return False
-
-        self.state.contract.explicit_asks = criteria
-        constraints: List[str] = []
-        for item in (refinement.get("explicit_constraints") or [])[:16]:
-            if isinstance(item, dict):
-                description = str(item.get("description") or "").strip()
-                source_text = str(item.get("source_text") or item.get("source_quote") or "").strip()
-            else:
-                description = source_text = str(item).strip()
-            normalized_source = _normalize_text(source_text).casefold()
-            if description and normalized_source and normalized_source in normalized_request:
-                constraints.append(_text_head_tail(description, 700))
-        self.state.contract.explicit_constraints = constraints
-        self.state.contract.implied_checks = [
-            _text_head_tail(str(item), 700)
-            for item in (refinement.get("required_validation") or refinement.get("implied_checks") or [])[:16]
-            if str(item).strip()
-        ]
-        self.state.contract.done_definition = [
-            _text_head_tail(str(item), 700)
-            for item in (refinement.get("done_definition") or [])[:16]
-            if str(item).strip()
-        ] or [criterion.description or criterion.source_text for criterion in criteria]
-        self.state.ledger = {
-            criterion.criterion_id: CompletionLedgerEntry(
-                criterion_id=criterion.criterion_id,
-                status="open",
-            )
-            for criterion in criteria
-        }
-        self.state.task_contract_refined = True
-        return True
-
     def _mark_completion_ledger_from_stop_review(self, parsed: Dict[str, Any], should_intervene: bool) -> None:
         if should_intervene:
             for criterion_id in parsed.get("criterion_ids") or []:
@@ -1321,7 +1240,6 @@ class ConscienceMonitor:
         if not isinstance(parsed, dict):
             return ConscienceVerdict(should_intervene=False, source="llm", metadata={"parse_error": True})
 
-        contract_refined = self._apply_task_contract_refinement(parsed)
         applied_outcomes = self._apply_intervention_outcomes_from_review(parsed, review_type)
         should_intervene = bool(parsed.get("should_intervene"))
         if review_type == "stop":
@@ -1337,8 +1255,6 @@ class ConscienceMonitor:
             }
             if applied_outcomes:
                 metadata["intervention_outcomes_applied"] = applied_outcomes
-            if contract_refined:
-                metadata["task_contract_refined"] = True
             return ConscienceVerdict(
                 should_intervene=False,
                 critique_ticket=None,
@@ -1382,8 +1298,6 @@ class ConscienceMonitor:
         }
         if applied_outcomes:
             metadata["intervention_outcomes_applied"] = applied_outcomes
-        if contract_refined:
-            metadata["task_contract_refined"] = True
         if suppressed_reason:
             metadata["suppressed"] = suppressed_reason
             metadata["suppressed_ticket"] = asdict_safe(suppressed_ticket)

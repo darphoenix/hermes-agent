@@ -31,53 +31,6 @@ def test_contract_keeps_multi_part_request_as_one_semantic_goal():
     assert contract.explicit_asks[0].source_text == message
 
 
-def test_first_stateful_review_can_refine_atomic_source_grounded_contract():
-    message = "Fix the parser, run the tests, and do not change the public API."
-    monitor = ConscienceMonitor("task-contract-refine", message)
-
-    def fake_llm(*, provider, model, messages, temperature, max_tokens, stateful_payload=None):
-        return SimpleNamespace(
-            response_id="resp_contract",
-            conscience_stateful_used=True,
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content=json.dumps(
-                            {
-                                "should_intervene": False,
-                                "verdict": "observe",
-                                "task_contract_refinement": {
-                                    "explicit_asks": [
-                                        {"description": "Fix the parser", "source_text": "Fix the parser"},
-                                        {"description": "Run the tests", "source_text": "run the tests"},
-                                        {"description": "invented", "source_text": "publish a release"},
-                                    ],
-                                    "explicit_constraints": ["Do not change the public API"],
-                                    "required_validation": ["The relevant tests pass"],
-                                    "done_definition": ["Parser is fixed without an API change and tests pass"],
-                                },
-                            }
-                        )
-                    )
-                )
-            ],
-        )
-
-    verdict = monitor.audit_midtask_progress(
-        llm_callable=fake_llm,
-        provider="custom:conscience-local",
-        model="local-model",
-    )
-
-    assert verdict.metadata["task_contract_refined"] is True
-    assert [item.description for item in monitor.state.contract.explicit_asks] == [
-        "Fix the parser",
-        "Run the tests",
-    ]
-    assert set(monitor.state.ledger) == {"criterion_001", "criterion_002"}
-    assert monitor.state.contract.raw_user_request == message
-
-
 def test_record_event_appends_clean_artifacts():
     monitor = ConscienceMonitor("task3", "Debug this and run tests.")
     monitor.record_event(PLAN_SUMMARY, {"text": "I will inspect the file and verify the result."})
