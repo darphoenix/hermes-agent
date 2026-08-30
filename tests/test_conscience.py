@@ -31,6 +31,22 @@ def test_contract_keeps_multi_part_request_as_one_semantic_goal():
     assert contract.explicit_asks[0].source_text == message
 
 
+def test_contract_flattens_multimodal_user_request_without_image_payload():
+    message = [
+        {"type": "text", "text": "Inspect this screenshot directly."},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,very-large-payload"},
+        },
+    ]
+
+    contract = extract_task_contract("task-vision", message)
+
+    assert contract.raw_user_request == "Inspect this screenshot directly."
+    assert contract.explicit_asks[0].source_text == contract.raw_user_request
+    assert "very-large-payload" not in json.dumps(contract.raw_user_request)
+
+
 def test_record_event_appends_clean_artifacts():
     monitor = ConscienceMonitor("task3", "Debug this and run tests.")
     monitor.record_event(PLAN_SUMMARY, {"text": "I will inspect the file and verify the result."})

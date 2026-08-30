@@ -7,6 +7,8 @@ import time
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Dict, List, Optional
 
+from agent.stateful_responses import message_content_plain_text
+
 TASK_START = "TASK_START"
 PLAN_SUMMARY = "PLAN_SUMMARY"
 TOOL_CALL = "TOOL_CALL"
@@ -113,8 +115,8 @@ def asdict_safe(obj):
     return asdict(obj) if is_dataclass(obj) else obj
 
 
-def _normalize_text(text: str) -> str:
-    return " ".join((text or "").strip().split())
+def _normalize_text(text: Any) -> str:
+    return " ".join(message_content_plain_text(text).strip().split())
 
 
 def jsonish_payload(payload: Dict[str, Any]) -> str:
@@ -163,7 +165,7 @@ def _try_json_loads(value: Any) -> Any:
         return value
 
 
-def extract_task_contract(task_id: str, user_message: str) -> TaskContract:
+def extract_task_contract(task_id: str, user_message: Any) -> TaskContract:
     normalized = _normalize_text(user_message)
     criterion = TaskCriterion(
         criterion_id="criterion_001",
@@ -172,7 +174,7 @@ def extract_task_contract(task_id: str, user_message: str) -> TaskContract:
     done_definition = [criterion.source_text] if criterion.source_text else []
     return TaskContract(
         task_id=task_id,
-        raw_user_request=user_message,
+        raw_user_request=normalized,
         explicit_asks=[criterion] if criterion.source_text else [],
         explicit_constraints=[],
         implied_checks=[],
@@ -182,7 +184,7 @@ def extract_task_contract(task_id: str, user_message: str) -> TaskContract:
 
 
 class ConscienceMonitor:
-    def __init__(self, task_id: str, user_message: str, mode: str = "shadow"):
+    def __init__(self, task_id: str, user_message: Any, mode: str = "shadow"):
         self.mode = (mode or "shadow").strip().lower()
         contract = extract_task_contract(task_id, user_message)
         ledger = {
