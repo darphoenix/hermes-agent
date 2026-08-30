@@ -629,6 +629,28 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _codex_watchdog_timeout(
+    agent,
+    env_name: str,
+    cloud_default: float,
+    local_default: float,
+) -> float:
+    """Resolve a Codex stream watchdog without killing local model prefill.
+
+    Local Responses servers commonly emit ``response.created`` before a long
+    prompt prefill and then stay silent until generation begins. Their existing
+    local stale budget is the correct liveness deadline; cloud-oriented TTFB
+    and event-gap defaults are too short. An explicit environment override
+    still wins for diagnostics and operator policy.
+    """
+    if env_name in os.environ:
+        return _env_float(env_name, cloud_default)
+    base_url = str(getattr(agent, "base_url", "") or "")
+    if base_url and is_local_endpoint(base_url):
+        return local_default
+    return cloud_default
+
+
 def _estimate_chunk_bytes(chunk: Any) -> int:
     """Cheap per-chunk size estimate for the stream diagnostic counters.
 
@@ -1547,7 +1569,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # reconnect promptly when the socket is genuinely wedged. Set
     # HERMES_CODEX_TTFB_TIMEOUT_SECONDS=0 to disable this watchdog entirely.
     _ttfb_enabled = _codex_watchdog_enabled
-    _ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
+    _ttfb_timeout = _codex_watchdog_timeout(
+        agent,
+        "HERMES_CODEX_TTFB_TIMEOUT_SECONDS",
+        120.0,
+        _stale_timeout,
+    )
     if _ttfb_timeout <= 0:
         _ttfb_enabled = False
     elif _openai_codex_backend:
@@ -1584,9 +1611,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _ttfb_timeout = _ttfb_cap
 
     _codex_idle_enabled = _codex_watchdog_enabled
-    _codex_idle_timeout = _env_float(
+    _codex_idle_timeout = _codex_watchdog_timeout(
+        agent,
         "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS",
         _codex_idle_timeout_default,
+        _stale_timeout,
     )
     if _codex_idle_timeout <= 0:
         _codex_idle_enabled = False

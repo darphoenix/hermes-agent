@@ -57,6 +57,46 @@ def _make_codex_agent(tmp_path, monkeypatch):
     return agent
 
 
+def test_local_codex_watchdogs_inherit_local_stale_budget(monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    agent = SimpleNamespace(base_url="http://127.0.0.1:1236/v1")
+
+    assert h._codex_watchdog_timeout(
+        agent,
+        "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS",
+        60.0,
+        900.0,
+    ) == pytest.approx(900.0)
+
+
+def test_explicit_local_codex_watchdog_override_still_wins(monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "7.5")
+    agent = SimpleNamespace(base_url="http://localhost:1236/v1")
+
+    assert h._codex_watchdog_timeout(
+        agent,
+        "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS",
+        60.0,
+        900.0,
+    ) == pytest.approx(7.5)
+
+
+def test_remote_codex_watchdog_keeps_cloud_default(monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    agent = SimpleNamespace(base_url="https://chatgpt.com/backend-api/codex")
+
+    assert h._codex_watchdog_timeout(
+        agent,
+        "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS",
+        60.0,
+        900.0,
+    ) == pytest.approx(60.0)
+
+
 
 
 
@@ -345,7 +385,6 @@ def test_large_codex_request_hard_ceiling_reclaims_silent_stall(tmp_path, monkey
         assert "with no response" in str(excinfo.value)
     finally:
         stop["flag"] = True
-
 
 
 
