@@ -2227,11 +2227,38 @@ class CLICommandsMixin:
             _cprint("  (>_<) Cannot start background task: no valid credentials.")
             return
 
+        turn_route = self._resolve_turn_agent_config(prompt)
+        try:
+            from hermes_cli.background_runtime import (
+                BackgroundRuntimeDeferred,
+                resolve_background_runtime,
+            )
+        except Exception as exc:
+            _cprint(f"  (>_<) Cannot load background runtime: {exc}")
+            return
+        try:
+            resolved = resolve_background_runtime(
+                "cli_background",
+                parent_model=turn_route["model"],
+                parent_runtime=turn_route["runtime"],
+            )
+            if resolved is not None:
+                sidecar_model, sidecar_runtime = resolved
+                turn_route = {
+                    "model": sidecar_model,
+                    "runtime": sidecar_runtime,
+                    "request_overrides": None,
+                }
+        except BackgroundRuntimeDeferred as exc:
+            _cprint(f"  Background task deferred until the active turn finishes: {exc}")
+            return
+        except Exception as exc:
+            _cprint(f"  (>_<) Cannot start background task: {exc}")
+            return
+
         _cprint(f"  🔄 Background task #{task_num} started: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
         _cprint(f"  Task ID: {task_id}")
         _cprint("  You can continue chatting — results will appear when done.\n")
-
-        turn_route = self._resolve_turn_agent_config(prompt)
 
         def run_background():
             set_sudo_password_callback(self._sudo_password_callback)
@@ -2247,8 +2274,12 @@ class CLICommandsMixin:
                     base_url=turn_route["runtime"].get("base_url"),
                     provider=turn_route["runtime"].get("provider"),
                     api_mode=turn_route["runtime"].get("api_mode"),
+                    responses_stateful=bool(
+                        turn_route["runtime"].get("responses_stateful", False)
+                    ),
                     acp_command=turn_route["runtime"].get("command"),
                     acp_args=turn_route["runtime"].get("args"),
+                    credential_pool=turn_route["runtime"].get("credential_pool"),
                     max_tokens=turn_route["runtime"].get("max_tokens"),
                     max_iterations=self.max_turns,
                     enabled_toolsets=self.enabled_toolsets,

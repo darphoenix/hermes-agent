@@ -111,6 +111,30 @@ def test_routing_resolution_failure_falls_back_to_parent():
     assert rt["provider"] == "openai-codex"
 
 
+def test_auto_route_uses_central_sidecar_and_stateful_setting():
+    agent = _FakeAgent()
+    cfg = {
+        "auxiliary": {"background_review": {"provider": "auto", "model": ""}},
+        "background_runtime": {
+            "enabled": True,
+            "provider": "custom",
+            "model": "/models/review-sidecar",
+            "base_url": "http://127.0.0.1:1237/v1",
+            "api_key": "side-key",
+            "api_mode": "codex_responses",
+            "responses_stateful_for": {"background_review": True},
+            "use_for": {"background_review": True},
+        },
+    }
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        rt = br._resolve_review_runtime(agent)
+
+    assert rt["routed"] is True
+    assert rt["model"] == "/models/review-sidecar"
+    assert rt["base_url"] == "http://127.0.0.1:1237/v1"
+    assert rt["responses_stateful"] is True
+
+
 # ---------------------------------------------------------------------------
 # _digest_history — routed-path compact replay
 # ---------------------------------------------------------------------------
@@ -118,6 +142,21 @@ def test_routing_resolution_failure_falls_back_to_parent():
 def test_digest_under_tail_returns_full():
     msgs = [_msg("user", "hi"), _msg("assistant", "hello")]
     assert br._digest_history(msgs, tail=24) == msgs
+
+
+def test_digest_strips_parent_responses_identity_from_sidecar_replay():
+    original = {
+        "role": "assistant",
+        "content": "done",
+        "responses_response_id": "resp_main_only",
+        "codex_message_items": [{"id": "msg_main_only"}],
+        "codex_reasoning_items": [{"id": "reasoning_main_only"}],
+    }
+
+    out = br._digest_history([original], tail=24)
+
+    assert out == [{"role": "assistant", "content": "done"}]
+    assert original["responses_response_id"] == "resp_main_only"
 
 
 def test_digest_collapses_old_keeps_tail_verbatim():

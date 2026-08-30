@@ -2885,6 +2885,44 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
+def _resolve_background_agent_runtime(
+    task: str,
+    model: str,
+    runtime_kwargs: dict,
+    *,
+    user_config: Optional[dict] = None,
+    force_stateless: bool = False,
+) -> tuple[str, dict]:
+    """Route optional gateway work through the configured sidecar runtime."""
+    try:
+        from hermes_cli.background_runtime import (
+            BackgroundRuntimeError,
+            resolve_background_runtime,
+        )
+    except Exception:
+        logger.debug(
+            "Gateway background-runtime support is unavailable for %s",
+            task,
+            exc_info=True,
+        )
+        return model, runtime_kwargs
+
+    try:
+        resolved = resolve_background_runtime(
+            task,
+            parent_model=model,
+            parent_runtime=runtime_kwargs,
+            config=user_config,
+            force_stateless=force_stateless,
+        )
+    except BackgroundRuntimeError:
+        raise
+    except Exception:
+        logger.debug("Gateway sidecar routing failed for %s", task, exc_info=True)
+        return model, runtime_kwargs
+    return resolved if resolved is not None else (model, runtime_kwargs)
+
+
 @dataclasses.dataclass(frozen=True)
 class _GatewayModelContext:
     """Effective gateway model route and context-window resolution."""
@@ -20010,6 +20048,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key=session_key,
                             user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
                         )
+                        try:
+                            _hyg_model, _hyg_runtime = _resolve_background_agent_runtime(
+                                "gateway_hygiene",
+                                _hyg_model,
+                                _hyg_runtime,
+                                user_config=(
+                                    _hyg_data if isinstance(_hyg_data, dict) else None
+                                ),
+                                force_stateless=True,
+                            )
+                        except Exception as exc:
+                            from hermes_cli.background_runtime import (
+                                BackgroundRuntimeDeferred,
+                            )
+
+                            if isinstance(exc, BackgroundRuntimeDeferred):
+                                logger.info(
+                                    "Gateway hygiene compression deferred: %s", exc
+                                )
+                            else:
+                                logger.warning(
+                                    "Gateway hygiene compression skipped: %s", exc
+                                )
+                            _hyg_runtime = {}
                         if _hyg_runtime.get("api_key"):
                             # Pass the FULL transcript (tool results included).
                             # Filtering to user/assistant-only starved the
@@ -23037,6 +23099,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 user_config=user_config,
             )
+            try:
+                model, runtime_kwargs = _resolve_background_agent_runtime(
+                    "gateway_background",
+                    model,
+                    runtime_kwargs,
+                    user_config=user_config,
+                )
+            except Exception as exc:
+                from hermes_cli.background_runtime import BackgroundRuntimeDeferred
+
+                if isinstance(exc, BackgroundRuntimeDeferred):
+                    await adapter.send(
+                        source.chat_id,
+                        f"Background task {task_id} deferred until the active turn finishes.",
+                        metadata=_thread_metadata,
+                    )
+                    return
+                raise
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,

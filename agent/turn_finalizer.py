@@ -839,6 +839,13 @@ def finalize_turn(
         messages=messages,
     )
 
+    # The foreground turn is logically complete before optional review forks
+    # start. Release the sidecar admission gate now; the outer run wrapper also
+    # clears it in ``finally`` for early-return/error paths.
+    _end_foreground = getattr(agent, "_end_foreground_activity", None)
+    if callable(_end_foreground):
+        _end_foreground()
+
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
     # Suppressed when skip_background_review=True (e.g. cron) — review forks

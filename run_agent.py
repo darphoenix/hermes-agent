@@ -1395,6 +1395,49 @@ class AIAgent:
             ),
         }
 
+    def _should_register_foreground_activity(self) -> bool:
+        if getattr(self, "_subagent_id", None) or getattr(self, "_delegate_depth", 0) > 0:
+            return False
+        if getattr(self, "_memory_write_origin", None) == "background_review":
+            return False
+        if getattr(self, "_memory_write_context", None) == "background_review":
+            return False
+        if str(getattr(self, "platform", "") or "").lower() == "curator":
+            return False
+        if getattr(self, "quiet_mode", False) and not getattr(
+            self, "gateway_session_key", None
+        ):
+            return False
+        return True
+
+    def _begin_foreground_activity(self) -> None:
+        if getattr(
+            self, "_foreground_activity_token", None
+        ) or not self._should_register_foreground_activity():
+            return
+        try:
+            from hermes_cli.background_runtime import begin_foreground_activity
+
+            self._foreground_activity_token = begin_foreground_activity(
+                session_id=self.session_id or "",
+                platform=self.platform or "",
+                source="agent_run_conversation",
+            )
+        except Exception:
+            logger.debug("Could not register foreground activity", exc_info=True)
+
+    def _end_foreground_activity(self) -> None:
+        token = getattr(self, "_foreground_activity_token", None)
+        if not token:
+            return
+        self._foreground_activity_token = None
+        try:
+            from hermes_cli.background_runtime import end_foreground_activity
+
+            end_foreground_activity(token)
+        except Exception:
+            logger.debug("Could not clear foreground activity", exc_info=True)
+
     def _check_compression_model_feasibility(self) -> None:
         """Forwarder — see ``agent.conversation_compression.check_compression_model_feasibility``."""
         from agent.conversation_compression import check_compression_model_feasibility
@@ -9900,6 +9943,7 @@ class AIAgent:
                         with durable_turn_lease_activity_lock:
                             durable_turn_lease_turn_active = True
                         durable_turn_lease_thread.start()
+                    self._begin_foreground_activity()
                     result = run_conversation(
                         self,
                         user_message,
@@ -10001,6 +10045,7 @@ class AIAgent:
                         pass
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
+                    self._end_foreground_activity()
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
                     if token is not None:

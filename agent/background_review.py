@@ -355,35 +355,87 @@ def _resolve_review_runtime(
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
     task_api_key = (str(task.get("api_key", "")).strip() or None)
-    if not (task_provider and task_provider != "auto" and task_model):
-        return parent
-    if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
-        return parent  # same model/provider as parent -> not routed
+    explicit_route = bool(
+        task_provider and task_provider != "auto" and task_model
+    )
+    if explicit_route:
+        if (
+            task_provider == (agent.provider or "")
+            and task_model == (agent.model or "")
+        ):
+            return parent
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            rp = resolve_runtime_provider(
+                requested=task_provider,
+                target_model=task_model,
+                explicit_api_key=task_api_key,
+                explicit_base_url=task_base_url,
+            )
+            return {
+                "provider": rp.get("provider") or task_provider,
+                "model": rp.get("model") or task_model,
+                "api_key": rp.get("api_key"),
+                "base_url": rp.get("base_url"),
+                "api_mode": rp.get("api_mode"),
+                "responses_stateful": bool(
+                    rp.get("responses_stateful", False)
+                ),
+                "credential_pool": rp.get("credential_pool"),
+                "request_overrides": dict(rp.get("request_overrides") or {}),
+                "max_tokens": rp.get("max_output_tokens"),
+                "command": rp.get("command"),
+                "args": list(rp.get("args") or []),
+                "routed": True,
+            }
+        except Exception as e:
+            logger.debug(
+                "background-review aux routing failed (%s); using main model", e
+            )
+            return parent
+
     try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-        rp = resolve_runtime_provider(
-            requested=task_provider,
-            target_model=task_model,
-            explicit_api_key=task_api_key,
-            explicit_base_url=task_base_url,
+        from hermes_cli.background_runtime import (
+            BackgroundRuntimeError,
+            resolve_background_runtime,
         )
-        return {
-            "provider": rp.get("provider") or task_provider,
-            "model": rp.get("model") or task_model,
-            "api_key": rp.get("api_key"),
-            "base_url": rp.get("base_url"),
-            "api_mode": rp.get("api_mode"),
-            "responses_stateful": bool(rp.get("responses_stateful", False)),
-            "credential_pool": rp.get("credential_pool"),
-            "request_overrides": dict(rp.get("request_overrides") or {}),
-            "max_tokens": rp.get("max_output_tokens"),
-            "command": rp.get("command"),
-            "args": list(rp.get("args") or []),
-            "routed": True,
-        }
-    except Exception as e:
-        logger.debug("background-review aux routing failed (%s); using main model", e)
+    except Exception:
+        logger.debug(
+            "Background-review runtime support is unavailable", exc_info=True
+        )
         return parent
+
+    try:
+        sidecar = resolve_background_runtime(
+            "background_review",
+            parent_model=agent.model,
+            parent_runtime=parent_runtime,
+        )
+    except BackgroundRuntimeError:
+        raise
+    except Exception:
+        logger.debug("background-review sidecar routing failed", exc_info=True)
+        return parent
+    if sidecar is None:
+        return parent
+    sidecar_model, sidecar_runtime = sidecar
+    return {
+        "provider": sidecar_runtime.get("provider") or agent.provider,
+        "model": sidecar_model,
+        "api_key": sidecar_runtime.get("api_key"),
+        "base_url": sidecar_runtime.get("base_url"),
+        "api_mode": sidecar_runtime.get("api_mode"),
+        "responses_stateful": bool(
+            sidecar_runtime.get("responses_stateful", False)
+        ),
+        "credential_pool": sidecar_runtime.get("credential_pool"),
+        "request_overrides": {},
+        "max_tokens": sidecar_runtime.get("max_tokens"),
+        "command": sidecar_runtime.get("command"),
+        "args": list(sidecar_runtime.get("args") or []),
+        "routed": True,
+    }
 
 
 def _parent_can_emit_tool_calls(agent: Any) -> bool:
@@ -426,7 +478,16 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
     routed to a different model (cache cold regardless, so fewer cold-written
     tokens is a pure win). Never on the main-model path (full replay stays warm).
     """
-    msgs = list(messages_snapshot or [])
+    msgs = []
+    for message in messages_snapshot or []:
+        if not isinstance(message, dict):
+            continue
+        clean = copy.deepcopy(message)
+        if clean.get("role") == "assistant":
+            clean.pop("responses_response_id", None)
+            clean.pop("codex_message_items", None)
+            clean.pop("codex_reasoning_items", None)
+        msgs.append(clean)
     if len(msgs) <= tail:
         return msgs
     keep = msgs[-tail:]

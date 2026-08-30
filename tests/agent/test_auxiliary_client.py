@@ -261,6 +261,61 @@ class TestResolveTaskProviderModel:
         assert resolved_provider == "anthropic"
         assert model is None
 
+    def test_central_sidecar_route_uses_sidecar_model_not_parent_model(self):
+        cfg = {
+            "background_runtime": {
+                "enabled": True,
+                "provider": "custom",
+                "model": "/models/qwen-sidecar",
+                "base_url": "http://127.0.0.1:1237/v1",
+                "api_key": "side-key",
+                "api_mode": "codex_responses",
+                "use_for": {
+                    "auxiliary": False,
+                    "auxiliary:compression": True,
+                },
+            }
+        }
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={},
+        ), patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+            provider, model, base_url, api_key, api_mode = (
+                _resolve_task_provider_model(
+                    task="compression",
+                    model="/models/main",
+                )
+            )
+
+        assert provider == "custom"
+        assert model == "/models/qwen-sidecar"
+        assert base_url == "http://127.0.0.1:1237/v1"
+        assert api_key == "side-key"
+        assert api_mode == "codex_responses"
+
+
+class TestLocalAuxiliaryTimeout:
+    def test_local_runtime_has_no_client_deadline(self):
+        from agent.auxiliary_client import _resolve_call_timeout
+
+        assert (
+            _resolve_call_timeout(
+                "compression",
+                30.0,
+                base_url="http://127.0.0.1:1237/v1",
+            )
+            is None
+        )
+
+    def test_remote_runtime_keeps_configured_deadline(self):
+        from agent.auxiliary_client import _resolve_call_timeout
+
+        assert _resolve_call_timeout(
+            "title_generation",
+            12.5,
+            base_url="https://api.example.com/v1",
+        ) == pytest.approx(12.5)
+
 
 
 

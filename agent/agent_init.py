@@ -945,6 +945,7 @@ def init_agent(
     agent._background_review_agent = None
     agent._background_review_run = None
     agent._background_review_lock = threading.Lock()
+    agent._foreground_activity_token = None
 
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed

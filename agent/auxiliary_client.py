@@ -562,6 +562,16 @@ def _extract_url_query_params(url: str):
     return url, None
 
 
+def _is_local_base_url(base_url: Optional[str]) -> bool:
+    if not base_url:
+        return False
+    try:
+        host = (urlparse(str(base_url)).hostname or "").lower()
+    except Exception:
+        return False
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 # Module-level flag: only warn once per process about stale OPENAI_BASE_URL.
 _stale_base_url_warned = False
 
@@ -8294,6 +8304,40 @@ def _resolve_task_provider_model(
         if cfg_provider and cfg_provider != "auto":
             return cfg_provider, resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
 
+        try:
+            from hermes_cli.background_runtime import (
+                BackgroundRuntimeError,
+                resolve_background_runtime,
+            )
+        except Exception:
+            logger.debug(
+                "Auxiliary background-runtime support is unavailable for %s",
+                task,
+                exc_info=True,
+            )
+        else:
+            try:
+                sidecar = resolve_background_runtime(
+                    f"auxiliary:{task}",
+                    parent_model=resolved_model,
+                )
+            except BackgroundRuntimeError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Auxiliary sidecar routing failed for %s", task, exc_info=True
+                )
+                sidecar = None
+            if sidecar is not None:
+                sidecar_model, sidecar_runtime = sidecar
+                return (
+                    sidecar_runtime.get("provider") or "custom",
+                    sidecar_model,
+                    sidecar_runtime.get("base_url"),
+                    sidecar_runtime.get("api_key"),
+                    sidecar_runtime.get("api_mode"),
+                )
+
         return "auto", resolved_model, None, None, resolved_api_mode
 
     return "auto", resolved_model, None, None, resolved_api_mode
@@ -8386,6 +8430,29 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     if timeout is None and task == "compression":
         effective = max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS)
     return effective
+
+
+def _resolve_call_timeout(
+    task: str,
+    timeout: float | str | None,
+    *,
+    base_url: Optional[str] = None,
+) -> float | None:
+    """Resolve the request deadline without disconnecting local generations."""
+    parsed: float | None
+    if isinstance(timeout, str):
+        value = timeout.strip().lower()
+        if value in {"none", "no_timeout", "no-timeout", "off", "disabled"}:
+            return None
+        try:
+            parsed = float(value)
+        except ValueError:
+            parsed = None
+    else:
+        parsed = timeout
+    if _is_local_base_url(base_url):
+        return None
+    return _effective_aux_timeout(task, parsed)
 
 
 def _get_task_extra_body(task: str) -> Dict[str, Any]:
@@ -9580,7 +9647,6 @@ def _call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
         request_provider,
@@ -9593,6 +9659,11 @@ def _call_llm_impl(
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
+    effective_timeout = _resolve_call_timeout(
+        task,
+        timeout,
+        base_url=_base_info or resolved_base_url,
+    )
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
                      task, request_provider or "auto", final_model or "default",
@@ -10399,7 +10470,6 @@ async def _async_call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
         request_provider,
@@ -10414,6 +10484,11 @@ async def _async_call_llm_impl(
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
+    effective_timeout = _resolve_call_timeout(
+        task,
+        timeout,
+        base_url=_client_base or resolved_base_url,
+    )
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
