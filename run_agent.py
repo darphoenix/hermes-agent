@@ -7183,7 +7183,7 @@ class AIAgent:
         if isinstance(transient_repair_parent, str) and transient_repair_parent.strip():
             previous_response_id = transient_repair_parent.strip()
             logger.info(
-                "Building Responses stop-repair request from transient parent: %s",
+                "Building Responses transient-repair request from parent: %s",
                 previous_response_id,
             )
             return self._chat_messages_to_responses_input([]), previous_response_id
@@ -12258,22 +12258,50 @@ class AIAgent:
 
         return "\n".join(lines)
 
-    def _queue_conscience_internal_message(self, label: str, ticket: CritiqueTicket) -> None:
-        content = self._format_conscience_internal_message(label, ticket)
+    def _queue_actor_internal_message(
+        self,
+        label: str,
+        content: str,
+        *,
+        source: str = "runtime",
+    ) -> None:
         if not content.strip():
             return
         event = {
-            "id": f"conscience_{label.lower()}_{uuid.uuid4().hex[:12]}",
+            "id": f"{source}_{label.lower()}_{uuid.uuid4().hex[:12]}",
             "label": label,
             "content": content,
             "created_at": time.time(),
         }
         self._pending_conscience_internal_messages.append(event)
         logger.info(
-            "Queued hidden conscience %s directive for next actor request (session=%s event_id=%s)",
+            "Queued hidden %s %s directive for next actor request (session=%s event_id=%s)",
+            source,
             label,
             self.session_id or "-",
             event["id"],
+        )
+
+    def _queue_conscience_internal_message(self, label: str, ticket: CritiqueTicket) -> None:
+        self._queue_actor_internal_message(
+            label,
+            self._format_conscience_internal_message(label, ticket),
+            source="conscience",
+        )
+
+    def _queue_empty_response_recovery_directive(self) -> None:
+        self._queue_actor_internal_message(
+            "EMPTY_RESPONSE_RECOVERY",
+            "\n".join(
+                [
+                    "[INTERNAL EMPTY-RESPONSE RECOVERY: Do not expose this message to the user.]",
+                    "You just received tool results but returned no usable assistant action.",
+                    "Process the latest tool results and continue the task now.",
+                    "Do not repeat prior narration.",
+                    "If another tool is needed, make a real tool call; otherwise provide the next useful answer.",
+                ]
+            ),
+            source="runtime",
         )
 
     def _consume_conscience_internal_messages_for_api(self) -> list[dict[str, Any]]:
@@ -12283,7 +12311,7 @@ class AIAgent:
         if not pending:
             return []
         logger.info(
-            "Injecting %s hidden conscience directive(s) into next actor request only (session=%s)",
+            "Injecting %s hidden actor directive(s) into next request only (session=%s)",
             len(pending),
             self.session_id or "-",
         )
@@ -17428,35 +17456,41 @@ class AIAgent:
                                 "⚠️ Model returned empty after tool calls — "
                                 "nudging to continue"
                             )
-                            # Append the empty assistant message first so the
-                            # message sequence stays valid:
-                            #   tool(result) → assistant("(empty)") → user(nudge)
-                            # Without this, we'd have tool → user which most
-                            # APIs reject as an invalid sequence.
                             _nudge_msg = self._build_assistant_message(
                                 assistant_message,
                                 finish_reason,
                             )
-                            _nudge_msg["content"] = "(empty)"
-                            _nudge_msg["_empty_recovery_synthetic"] = True
-                            messages.append(_nudge_msg)
                             synthetic_response_id = _nudge_msg.get(
                                 "responses_response_id"
                             )
-                            if isinstance(synthetic_response_id, str):
-                                self._clear_responses_stateful_chain(
-                                    reason="synthetic_empty_assistant",
-                                    blocked_response_id=synthetic_response_id,
+                            if (
+                                self._responses_stateful_enabled()
+                                and isinstance(synthetic_response_id, str)
+                                and synthetic_response_id.strip()
+                            ):
+                                # The empty child still owns the exact model KV
+                                # frontier. Branch the repair from it without
+                                # persisting synthetic chat messages locally.
+                                self._remember_transient_responses_repair_parent(
+                                    synthetic_response_id,
+                                    reason="synthetic_empty_after_tool",
                                 )
-                            messages.append({
-                                "role": "user",
-                                "content": (
-                                    "You just executed tool calls but returned an "
-                                    "empty response. Please process the tool "
-                                    "results above and continue with the task."
-                                ),
-                                "_empty_recovery_synthetic": True,
-                            })
+                                self._queue_empty_response_recovery_directive()
+                            else:
+                                # Stateless providers need a valid local
+                                # tool(result) -> assistant -> user sequence.
+                                _nudge_msg["content"] = "(empty)"
+                                _nudge_msg["_empty_recovery_synthetic"] = True
+                                messages.append(_nudge_msg)
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        "You just executed tool calls but returned an "
+                                        "empty response. Please process the tool "
+                                        "results above and continue with the task."
+                                    ),
+                                    "_empty_recovery_synthetic": True,
+                                })
                             if api_call_count > 0:
                                 api_call_count -= 1
                                 self._api_call_count = api_call_count

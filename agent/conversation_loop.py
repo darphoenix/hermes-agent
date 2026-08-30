@@ -3526,24 +3526,31 @@ def run_conversation(
                             "⚠️ Model returned empty after tool calls — "
                             "nudging to continue"
                         )
-                        # Append the empty assistant message first so the
-                        # message sequence stays valid:
-                        #   tool(result) → assistant("(empty)") → user(nudge)
-                        # Without this, we'd have tool → user which most
-                        # APIs reject as an invalid sequence.
                         _nudge_msg = agent._build_assistant_message(assistant_message, finish_reason)
-                        _nudge_msg["content"] = "(empty)"
-                        _nudge_msg["_empty_recovery_synthetic"] = True
-                        messages.append(_nudge_msg)
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "You just executed tool calls but returned an "
-                                "empty response. Please process the tool "
-                                "results above and continue with the task."
-                            ),
-                            "_empty_recovery_synthetic": True,
-                        })
+                        synthetic_response_id = _nudge_msg.get("responses_response_id")
+                        if (
+                            agent._responses_stateful_enabled()
+                            and isinstance(synthetic_response_id, str)
+                            and synthetic_response_id.strip()
+                        ):
+                            agent._remember_transient_responses_repair_parent(
+                                synthetic_response_id,
+                                reason="synthetic_empty_after_tool",
+                            )
+                            agent._queue_empty_response_recovery_directive()
+                        else:
+                            _nudge_msg["content"] = "(empty)"
+                            _nudge_msg["_empty_recovery_synthetic"] = True
+                            messages.append(_nudge_msg)
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "You just executed tool calls but returned an "
+                                    "empty response. Please process the tool "
+                                    "results above and continue with the task."
+                                ),
+                                "_empty_recovery_synthetic": True,
+                            })
                         continue
 
                     # ── Thinking-only prefill continuation ──────────
