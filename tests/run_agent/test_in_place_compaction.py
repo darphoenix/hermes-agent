@@ -141,6 +141,116 @@ class TestInPlaceCompaction:
             roles = [m["role"] for m in compressed if m.get("role") != "system"]
             assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1))
 
+    def test_stateful_responses_rebases_after_in_place_compaction(self):
+        """Compaction must not continue from the uncompressed server branch."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+        from agent.stateful_responses import build_delta_messages, remember_response_id
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260831_stateful_rebase"
+            _seed(db, sid, "stateful")
+            agent = _make_agent(db, sid, in_place=True)
+            agent.api_mode = "codex_responses"
+            agent.provider = "custom"
+            agent.responses_stateful = True
+            agent._responses_previous_response_id = "resp_old"
+            agent._responses_transient_repair_previous_response_id = "resp_repair"
+
+            def _stateful_compress(
+                messages, current_tokens=None, focus_topic=None, force=False
+            ):
+                return [
+                    {
+                        "role": "user",
+                        "content": "[CONTEXT COMPACTION] bounded summary",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "recent reply",
+                        "responses_response_id": "resp_old",
+                    },
+                ]
+
+            agent.context_compressor.compress = _stateful_compress
+            original = [
+                {"role": "user", "content": f"long message {i}"}
+                for i in range(8)
+            ]
+            compacted, _ = compress_context(
+                agent,
+                original,
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+
+            assert agent._responses_previous_response_id is None
+            assert agent._responses_transient_repair_previous_response_id is None
+            assert agent._responses_force_fresh_until_success is True
+            assert all("responses_response_id" not in msg for msg in compacted)
+            assert all(
+                "responses_response_id" not in msg
+                for msg in db.get_messages_as_conversation(sid)
+            )
+
+            first_input, first_parent = build_delta_messages(agent, compacted)
+            assert first_parent is None
+            assert first_input == compacted
+
+            remember_response_id(agent, "resp_new_root")
+            continued = [
+                *compacted,
+                {
+                    "role": "assistant",
+                    "content": "new root",
+                    "responses_response_id": "resp_new_root",
+                },
+                {"role": "user", "content": "continue"},
+            ]
+            delta, parent = build_delta_messages(agent, continued)
+            assert parent == "resp_new_root"
+            assert delta == [{"role": "user", "content": "continue"}]
+
+    def test_stateful_responses_keeps_anchor_when_compaction_makes_no_progress(self):
+        """An aborted/no-op compaction must not throw away a valid live branch."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260831_stateful_noop"
+            _seed(db, sid, "stateful-noop")
+            agent = _make_agent(db, sid, in_place=True)
+            agent.api_mode = "codex_responses"
+            agent.provider = "custom"
+            agent.responses_stateful = True
+            agent._responses_previous_response_id = "resp_live"
+            agent.context_compressor.compress = (
+                lambda messages, current_tokens=None, focus_topic=None, force=False: list(
+                    messages
+                )
+            )
+
+            original = [
+                {"role": "user", "content": "keep this branch"},
+                {
+                    "role": "assistant",
+                    "content": "anchored",
+                    "responses_response_id": "resp_live",
+                },
+            ]
+            returned, _ = compress_context(
+                agent,
+                original,
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+
+            assert returned == original
+            assert agent._responses_previous_response_id == "resp_live"
+            assert agent._responses_force_fresh_until_success is False
+
 
     def test_rotation_still_preflushes(self):
         """Rotation MUST pre-flush so current-turn messages survive in the

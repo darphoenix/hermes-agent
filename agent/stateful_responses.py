@@ -155,6 +155,59 @@ def clear_chain(
         )
 
 
+def strip_compacted_response_anchors(messages: List[Dict[str, Any]]) -> int:
+    """Remove server-branch identities from a rewritten local transcript.
+
+    A compaction summary is a new prompt projection, not a suffix of any
+    response that helped produce the pre-compaction transcript. Persisting an
+    old ``responses_response_id`` lets a later process silently resurrect that
+    obsolete server-side branch and defeats the compaction.
+    """
+    removed = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        response_id = message.pop("responses_response_id", None)
+        if isinstance(response_id, str) and response_id.strip():
+            removed += 1
+    return removed
+
+
+def commit_compaction_rebase(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    *,
+    anchors_removed: int = 0,
+) -> int:
+    """Start a new Responses chain after local transcript compaction.
+
+    The next request carries the complete compacted prompt without a parent.
+    Once that request succeeds, ``remember_response_id`` installs its response
+    as the new durable anchor and ordinary delta-only continuation resumes.
+    """
+    if not is_enabled(agent):
+        return anchors_removed
+
+    anchors_removed += strip_compacted_response_anchors(messages)
+    previous = getattr(agent, "_responses_previous_response_id", None)
+    transient = getattr(
+        agent, "_responses_transient_repair_previous_response_id", None
+    )
+    agent._responses_previous_response_id = None
+    agent._responses_transient_repair_previous_response_id = None
+    agent._responses_force_fresh_until_success = True
+    logger.info(
+        "Stateful Responses compaction rebase: session=%s "
+        "old_parent=%s transient_parent=%s removed_anchors=%d "
+        "next_request=fresh_root",
+        getattr(agent, "session_id", None) or "-",
+        previous or "none",
+        transient or "none",
+        anchors_removed,
+    )
+    return anchors_removed
+
+
 def remember_response_id(agent: Any, response_id: Any) -> None:
     if not isinstance(response_id, str) or not response_id.strip():
         return
@@ -249,7 +302,7 @@ def build_delta_messages(
     """Return the request-local message delta and its durable parent id."""
     if bool(getattr(agent, "_responses_force_fresh_until_success", False)):
         logger.info(
-            "Building fresh Responses request after rejected/poisoned stateful resume"
+            "Building forced-fresh Responses request after stateful branch reset"
         )
         return messages, None
 

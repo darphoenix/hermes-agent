@@ -3505,6 +3505,7 @@ def compress_context(
 
         _session_commit_succeeded = False
         split_status = "not_applicable"
+        _responses_anchors_removed = 0
         if agent._session_db:
             split_status = "pending"
             try:
@@ -3622,6 +3623,22 @@ def compress_context(
                         )
                     _release_lock()
                     return messages, _existing_sp
+
+                # A compacted transcript is a new local prompt projection, not
+                # a suffix of the server-side Responses branch that preceded
+                # it. Remove old response anchors before the projection is
+                # persisted so a restart cannot resurrect the uncompressed
+                # parent chain. The live chain is reset only after the boundary
+                # commit succeeds below.
+                from agent.stateful_responses import (
+                    is_enabled as _stateful_responses_enabled,
+                    strip_compacted_response_anchors,
+                )
+
+                if _stateful_responses_enabled(agent):
+                    _responses_anchors_removed = (
+                        strip_compacted_response_anchors(compressed)
+                    )
 
                 if in_place:
                     # ── In-place compaction: keep the same session_id ──────────
@@ -4105,12 +4122,21 @@ def compress_context(
         except Exception:
             pass
 
+        _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        if _commit_status == "committed":
+            from agent.stateful_responses import commit_compaction_rebase
+
+            _responses_anchors_removed = commit_compaction_rebase(
+                agent,
+                compressed,
+                anchors_removed=_responses_anchors_removed,
+            )
+
         logger.info(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
         )
-        _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,
