@@ -11,6 +11,7 @@ from agent.conscience import (
     TOOL_RESULT,
     DRAFT_ANSWER,
     INTENT_TO_STOP,
+    ConscienceMemoryPressureError,
     ConscienceMonitor,
     extract_task_contract,
 )
@@ -22,6 +23,33 @@ def test_extract_task_contract_preserves_raw_request_as_single_criterion():
     assert len(contract.explicit_asks) == 1
     assert contract.explicit_asks[0].source_text == message
     assert contract.raw_user_request == message
+
+
+def test_review_prompts_recognize_native_image_delivery_as_direct_inspection():
+    marker = "TASK_START.native_image_delivery.delivered_to_actor"
+
+    assert marker in ConscienceMonitor._midtask_review_system_prompt()
+    assert marker in ConscienceMonitor._stop_review_system_prompt()
+
+
+def test_midtask_prompt_judges_semantic_loops_by_information_gain():
+    prompt = ConscienceMonitor._midtask_review_system_prompt()
+
+    assert "same underlying investigative objective" in prompt
+    assert "information gained" in prompt
+    assert "movement across the user's explicit deliverables" in prompt
+    assert "information gathering alone is not deliverable progress" in prompt
+    assert "minimal end-to-end slice" in prompt
+    assert "tolerant parsing or explicit fallbacks" in prompt
+    assert "preceding two actor/tool cycles" in prompt
+    assert "decision-changing evidence" in prompt
+    assert "intervene now rather than waiting for another variant" in prompt
+    assert "new parser error" in prompt
+    assert "actually retrieves needed evidence" in prompt
+    assert "materially different source searches" in prompt
+    assert "preserving that measurement as unavailable or uncertain" in prompt
+    assert "unless that measurement blocks the whole task" in prompt
+    assert "Do not recommend another variant of the same investigation" in prompt
 
 
 def test_contract_keeps_multi_part_request_as_one_semantic_goal():
@@ -108,6 +136,275 @@ def test_llm_stop_audit_records_llm_result_and_blocks():
     assert verdict.critique_ticket.reason == "missing_deliverable"
     assert verdict.critique_ticket.recommended_tools == ["write_file"]
     assert monitor.state.llm_audits[-1]["review_type"] == "stop"
+
+
+def test_active_repair_contract_persists_until_all_checks_resolve():
+    monitor = ConscienceMonitor("task-repair", "Verify Docker, search, and browser")
+    monitor.record_event(
+        TASK_START,
+        {"available_tools": ["terminal", "web_search", "browser_exec"]},
+    )
+    responses = iter(
+        [
+            {
+                "should_intervene": True,
+                "verdict": "block_stop",
+                "reason": "verification claims are unsupported",
+                "evidence": ["the required checks have no tool results"],
+                "next_best_action": "Run all three verification checks.",
+                "recommended_tools": ["terminal", "web_search", "browser_exec"],
+                "criterion_ids": ["criterion_001"],
+                "confidence": "high",
+                "repair_contract": {
+                    "objective": "Collect evidence for every verification claim.",
+                    "checks": [
+                        {
+                            "id": "docker",
+                            "description": "Verify the Docker services.",
+                            "expected_evidence": "A successful docker ps result.",
+                            "recommended_tools": ["terminal"],
+                            "status": "pending",
+                        },
+                        {
+                            "id": "search",
+                            "description": "Verify local search.",
+                            "expected_evidence": "A clean search result.",
+                            "recommended_tools": ["web_search"],
+                            "status": "pending",
+                        },
+                        {
+                            "id": "browser",
+                            "description": "Verify browser control.",
+                            "expected_evidence": "A browser title returned by the tool.",
+                            "recommended_tools": ["browser_exec"],
+                            "status": "pending",
+                        },
+                    ],
+                },
+            },
+            {
+                "should_intervene": False,
+                "verdict": "observe",
+                "repair_check_updates": [
+                    {
+                        "id": "docker",
+                        "status": "resolved",
+                        "outcome": "Docker services are running.",
+                        "evidence": ["docker ps exited 0"],
+                    }
+                ],
+            },
+            {
+                "should_intervene": False,
+                "verdict": "observe",
+                "repair_check_updates": [
+                    {
+                        "id": "search",
+                        "status": "resolved",
+                        "outcome": "Search returned clean results.",
+                        "evidence": ["search success true"],
+                    },
+                    {
+                        "id": "browser",
+                        "status": "resolved",
+                        "outcome": "Browser returned the page title.",
+                        "evidence": ["Example Domain"],
+                    },
+                ],
+            },
+        ]
+    )
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens):
+        payload = json.loads(messages[1]["content"])
+        if payload["review_type"] == "midtask":
+            assert payload["active_repair_contract"]["status"] == "active"
+        content = json.dumps(next(responses))
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+    verdict = monitor.audit_stop_decision(
+        "Everything works.",
+        llm_callable=fake_llm,
+        provider="custom",
+        model="local",
+    )
+    assert verdict.should_intervene is True
+    assert monitor.active_repair_contract_payload() is not None
+
+    monitor.record_event(TOOL_CALL, {"tool_name": "terminal"})
+    monitor.record_event(TOOL_RESULT, {"tool_name": "terminal", "success": True})
+    monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom",
+        model="local",
+    )
+    contract = monitor.active_repair_contract_payload()
+    assert contract is not None
+    statuses = {check["id"]: check["status"] for check in contract["checks"]}
+    assert statuses == {"docker": "resolved", "search": "pending", "browser": "pending"}
+
+    monitor.record_event(TOOL_CALL, {"tool_name": "web_search"})
+    monitor.record_event(TOOL_RESULT, {"tool_name": "web_search", "success": True})
+    monitor.record_event(TOOL_CALL, {"tool_name": "browser_exec"})
+    monitor.record_event(TOOL_RESULT, {"tool_name": "browser_exec", "success": True})
+    monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom",
+        model="local",
+    )
+    assert monitor.active_repair_contract_payload() is None
+    resolved = monitor.active_repair_contract_payload(include_resolved=True)
+    assert resolved is not None
+    assert resolved["status"] == "resolved"
+    assert all(check["status"] == "resolved" for check in resolved["checks"])
+
+
+def test_active_structured_repair_contract_blocks_allow_stop_until_resolved():
+    monitor = ConscienceMonitor("task-repair-gate", "Verify Docker and browser")
+    responses = iter(
+        [
+            {
+                "should_intervene": True,
+                "verdict": "block_stop",
+                "reason": "verification missing",
+                "next_best_action": "Verify Docker and browser.",
+                "recommended_tools": ["terminal", "browser_exec"],
+                "repair_contract": {
+                    "objective": "Verify both claims.",
+                    "checks": [
+                        {
+                            "id": "docker",
+                            "description": "Verify Docker.",
+                            "recommended_tools": ["terminal"],
+                        },
+                        {
+                            "id": "browser",
+                            "description": "Verify browser control.",
+                            "recommended_tools": ["browser_exec"],
+                        },
+                    ],
+                },
+            },
+            {"should_intervene": False, "verdict": "allow_stop"},
+            {
+                "should_intervene": False,
+                "verdict": "allow_stop",
+                "repair_check_updates": [
+                    {
+                        "id": "docker",
+                        "status": "resolved",
+                        "outcome": "Docker verified.",
+                        "evidence": ["docker ps exited 0"],
+                    },
+                    {
+                        "id": "browser",
+                        "status": "resolved",
+                        "outcome": "Browser verified.",
+                        "evidence": ["browser title returned"],
+                    },
+                ],
+            },
+        ]
+    )
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=json.dumps(next(responses)))
+                )
+            ]
+        )
+
+    first = monitor.audit_stop_decision(
+        "Done.", llm_callable=fake_llm, provider="custom", model="local"
+    )
+    assert first.should_intervene is True
+
+    premature = monitor.audit_stop_decision(
+        "Docker is verified.",
+        llm_callable=fake_llm,
+        provider="custom",
+        model="local",
+    )
+    assert premature.should_intervene is True
+    assert premature.critique_ticket is not None
+    assert premature.critique_ticket.reason == "active_repair_contract_incomplete"
+    assert premature.metadata["active_repair_contract_enforced"] is True
+    assert set(premature.critique_ticket.recommended_tools or []) == {
+        "terminal",
+        "browser_exec",
+    }
+
+    complete = monitor.audit_stop_decision(
+        "Both checks are verified.",
+        llm_callable=fake_llm,
+        provider="custom",
+        model="local",
+    )
+    assert complete.should_intervene is False
+    assert complete.metadata["repair_check_updates_applied"] == [
+        {"id": "docker", "status": "resolved", "review_type": "stop"},
+        {"id": "browser", "status": "resolved", "review_type": "stop"},
+    ]
+    assert monitor.active_repair_contract_payload() is None
+
+
+def test_repeated_structured_stop_cannot_drop_an_existing_pending_check():
+    monitor = ConscienceMonitor("task-repair-merge", "Verify Docker and browser")
+    responses = iter(
+        [
+            {
+                "should_intervene": True,
+                "verdict": "block_stop",
+                "reason": "verification missing",
+                "next_best_action": "Verify Docker and browser.",
+                "repair_contract": {
+                    "objective": "Verify both claims.",
+                    "checks": [
+                        {"id": "docker", "description": "Verify Docker."},
+                        {"id": "browser", "description": "Verify browser control."},
+                    ],
+                },
+            },
+            {
+                "should_intervene": True,
+                "verdict": "block_stop",
+                "reason": "Docker is still unverified",
+                "next_best_action": "Verify Docker.",
+                "repair_contract": {
+                    "objective": "Verify both claims.",
+                    "checks": [
+                        {"id": "docker", "description": "Verify Docker now."}
+                    ],
+                },
+            },
+        ]
+    )
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=json.dumps(next(responses)))
+                )
+            ]
+        )
+
+    monitor.audit_stop_decision(
+        "Done.", llm_callable=fake_llm, provider="custom", model="local"
+    )
+    monitor.audit_stop_decision(
+        "Docker only.", llm_callable=fake_llm, provider="custom", model="local"
+    )
+
+    contract = monitor.active_repair_contract_payload()
+    assert contract is not None
+    assert [check["id"] for check in contract["checks"]] == ["docker", "browser"]
+    assert all(check["status"] == "pending" for check in contract["checks"])
+    assert contract["checks"][0]["description"] == "Verify Docker now."
 
 
 def test_llm_review_payload_includes_available_tools_and_parses_recommendation():
@@ -300,7 +597,7 @@ def test_stateful_conscience_compacts_after_prompt_token_limit():
 
     assert calls[1]["previous_response_id"] is None
     assert calls[1]["input_payload"]["stateful_mode"] == "compact_restart"
-    assert calls[1]["input_payload"]["stateful_compaction"]["prompt_token_limit"] == 50_000
+    assert calls[1]["input_payload"]["stateful_compaction"]["prompt_token_limit"] == 36_000
     assert calls[1]["input_payload"]["stateful_compaction"]["last_prompt_tokens"] == 50_001
     assert calls[1]["input_payload"]["recent_events"]
     assert "trajectory_memory" in calls[1]["input_payload"]
@@ -362,6 +659,63 @@ def test_stateful_conscience_compacts_before_projected_delta_exceeds_limit():
     assert "trajectory_memory" in calls[1]["input_payload"]
 
 
+def test_stateful_conscience_compacts_and_retires_parent_on_memory_pressure():
+    monitor = ConscienceMonitor("task-memory-pressure", "Check current setup")
+    monitor.record_event(TASK_START, {"available_tools": ["terminal"]})
+    monitor.state.stateful_initialized = True
+    monitor.state.stateful_previous_response_id = "resp_old"
+    monitor.state.stateful_last_prompt_tokens = 20_000
+    monitor.state.stateful_last_event_index = 1
+    monitor.record_event(TOOL_CALL, {"tool_name": "terminal", "tool_args": "pwd"})
+    calls = []
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens, stateful_payload=None):
+        calls.append(stateful_payload)
+        if len(calls) == 1:
+            raise ConscienceMemoryPressureError(
+                "compact",
+                details={"code": "conscience_compaction_required"},
+            )
+        return SimpleNamespace(
+            response_id="resp_compact",
+            conscience_response_id="resp_compact",
+            conscience_previous_response_id=None,
+            conscience_stateful_used=True,
+            usage=SimpleNamespace(
+                prompt_tokens=4_000,
+                completion_tokens=10,
+                total_tokens=4_010,
+            ),
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {"should_intervene": False, "verdict": "observe"}
+                        )
+                    ),
+                )
+            ],
+        )
+
+    verdict = monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+
+    assert verdict.should_intervene is False
+    assert calls[0]["previous_response_id"] == "resp_old"
+    assert calls[0]["input_payload"]["stateful_mode"] == "delta"
+    assert calls[1]["previous_response_id"] is None
+    assert calls[1]["retire_previous_response_id"] == "resp_old"
+    assert calls[1]["input_payload"]["stateful_mode"] == "compact_restart"
+    assert calls[1]["input_payload"]["stateful_compaction"]["reason"] == "wrapper_memory_admission"
+    assert monitor.state.stateful_previous_response_id == "resp_compact"
+    assert monitor.state.stateful_retire_response_id is None
+    assert monitor.state.llm_audits[-1]["stateful"]["memory_pressure_retry"] is True
+
+
 def test_stateful_conscience_compact_restart_is_budgeted():
     monitor = ConscienceMonitor("task-stateful-budgeted-compact", "Fix the solver and verify sol.csv")
     monitor.state.stateful_initialized = True
@@ -409,13 +763,44 @@ def test_stateful_conscience_compact_restart_is_budgeted():
 
     assert payload["stateful_mode"] == "compact_restart"
     assert len(payload["recent_events"]) <= 12
-    assert len(memory["action_ledger"]) <= 24
+    assert len(memory["action_ledger"]) <= 8
     assert len(memory["intervention_ledger"]) <= 8
     assert compaction["omitted"]["recent_events"] > 0
     assert compaction["omitted"]["action_ledger"] > 0
     assert compaction["omitted"]["intervention_ledger"] > 0
-    assert compaction["payload_chars"] <= compaction["payload_char_budget"] + 5_000
+    assert len(json.dumps(payload, ensure_ascii=False)) <= compaction["payload_char_budget"]
     assert compaction["estimated_payload_tokens"] < monitor.state.stateful_prompt_token_limit // 2
+
+
+def test_stateful_conscience_compact_restart_bounds_one_multifield_tool_result():
+    monitor = ConscienceMonitor("task-stateful-one-huge-event", "Inspect the failure and repair it")
+    monitor.state.stateful_initialized = True
+    monitor.state.stateful_last_prompt_tokens = 50_001
+    monitor.record_event(TASK_START, {"available_tools": ["terminal", "read_file"]})
+    monitor.record_event(
+        TOOL_RESULT,
+        {
+            "tool_name": "terminal",
+            "success": False,
+            "exit_code": 1,
+            "duration_seconds": 90.0,
+            "result_preview": "traceback\n" * 12_000,
+            "output_head": "head\n" * 12_000,
+            "output_tail": "tail\n" * 12_000,
+            "content": "duplicate\n" * 12_000,
+            "artifact_path": "/workdir/.hermes_tool_outputs/result.txt",
+        },
+    )
+
+    payload = monitor.build_stateful_review_payload("midtask")
+    encoded = json.dumps(payload, ensure_ascii=False)
+
+    assert payload["stateful_mode"] == "compact_restart"
+    assert len(encoded) <= payload["stateful_compaction"]["payload_char_budget"]
+    event = payload["recent_events"][-1]
+    assert event["raw_event_truncated"] is True
+    assert event["payload"]["exit_code"] == 1
+    assert event["payload"]["artifact_path"].endswith("result.txt")
 
 
 def test_stateful_conscience_delta_does_not_resend_full_trajectory_memory():

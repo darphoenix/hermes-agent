@@ -1612,10 +1612,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_commentary_message(text: str) -> None:
         agent._fire_streamed_codex_commentary(text)
 
-    def _on_event(event: Any) -> None:
-        # TTFB watchdog and activity touch — runs once per SSE event.
+    def _mark_stream_activity() -> None:
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
+
+    def _on_event(event: Any) -> None:
+        # Keep this downstream touch as a fallback for transformed Relay events.
+        _mark_stream_activity()
 
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
@@ -1641,6 +1644,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         def _accept_codex_chunk(_chunk: Any) -> bool:
             token = writer_token["value"]
             if token is None or stream_writer_is_current(agent, token):
+                # Observe liveness at the raw provider boundary. Relay may
+                # buffer or suppress no-content heartbeat events before its
+                # consumer iterator yields anything.
+                _mark_stream_activity()
                 return True
             logger.warning(
                 "Codex streaming attempt superseded by a newer stream; "

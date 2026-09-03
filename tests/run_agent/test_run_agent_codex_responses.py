@@ -1031,6 +1031,40 @@ def test_run_codex_stream_returns_collected_items_when_stream_ends_without_termi
     assert response.output == [output_item]
 
 
+def test_run_codex_stream_marks_raw_provider_heartbeats_before_relay_yields(
+    monkeypatch,
+):
+    """Relay buffering must not hide live wrapper SSE traffic from watchdogs."""
+    from agent import codex_runtime, relay_llm
+
+    agent = _build_agent(monkeypatch)
+    agent._codex_stream_last_event_ts = None
+    sentinel = SimpleNamespace(
+        status="completed",
+        incomplete_details=None,
+        error=None,
+    )
+
+    def _fake_relay_stream(_request, _stream_factory, **kwargs):
+        heartbeat = SimpleNamespace(type="response.in_progress")
+        assert kwargs["accept_chunk"](heartbeat) is True
+        assert agent._codex_stream_last_event_ts is not None
+        # Simulate Relay consuming/buffering the heartbeat instead of yielding it.
+        return iter(())
+
+    monkeypatch.setattr(relay_llm, "stream", _fake_relay_stream)
+    monkeypatch.setattr(
+        codex_runtime,
+        "_consume_codex_event_stream",
+        lambda *_args, **_kwargs: sentinel,
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response is sentinel
+    assert agent._codex_stream_last_event_ts is not None
+
+
 def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkeypatch):
     from agent.codex_runtime import _consume_codex_event_stream
 

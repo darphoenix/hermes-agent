@@ -20,6 +20,10 @@ DRAFT_ANSWER = "DRAFT_ANSWER"
 INTENT_TO_STOP = "INTENT_TO_STOP"
 IRREVERSIBLE_ACTION_INTENT = "IRREVERSIBLE_ACTION_INTENT"
 
+_COMPACT_RESTART_MAX_CHARS = 18_000
+_COMPACT_RESTART_RECENT_CHARS = 6_500
+_COMPACT_RESTART_EVENT_MAX_CHARS = 3_200
+
 
 @dataclass
 class TaskCriterion:
@@ -75,6 +79,7 @@ class CritiqueTicket:
     recommended_tools: Optional[List[str]] = None
     tool_policy: Optional[Dict[str, Any]] = None
     active_tool_decision: Optional[str] = None
+    repair_contract: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -83,6 +88,14 @@ class ConscienceVerdict:
     critique_ticket: Optional[CritiqueTicket] = None
     source: str = "llm"
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class ConscienceMemoryPressureError(RuntimeError):
+    """The local sidecar requested a bounded stateful compaction and retry."""
+
+    def __init__(self, message: str, *, details: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.details = dict(details or {})
 
 
 @dataclass
@@ -102,13 +115,15 @@ class ConscienceState:
     stateful_previous_response_id: Optional[str] = None
     stateful_initialized: bool = False
     stateful_last_event_index: int = 0
-    stateful_prompt_token_limit: int = 50_000
+    stateful_prompt_token_limit: int = 36_000
     stateful_last_prompt_tokens: int = 0
     stateful_last_total_tokens: int = 0
     stateful_reset_count: int = 0
     stateful_next_init_reason: Optional[str] = None
+    stateful_retire_response_id: Optional[str] = None
     stateful_intervention_hashes: Dict[str, str] = field(default_factory=dict)
     stateful_ticket_history: Dict[str, int] = field(default_factory=dict)
+    active_repair_contract: Optional[Dict[str, Any]] = None
 
 
 def asdict_safe(obj):
@@ -205,6 +220,9 @@ class ConscienceMonitor:
             "intervention_ledger": list(self.state.intervention_ledger),
             "critique_tickets": self._critique_tickets_payload(),
             "llm_audits": list(self.state.llm_audits),
+            "active_repair_contract": self.active_repair_contract_payload(
+                include_resolved=True
+            ),
         }
 
     def record_event(self, event_type: str, payload: Optional[Dict[str, Any]] = None) -> ConscienceEvent:
@@ -261,7 +279,13 @@ class ConscienceMonitor:
         )
         return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
-    def _dedupe_or_admit_ticket(self, ticket: CritiqueTicket, review_type: str) -> tuple[bool, str]:
+    def _dedupe_or_admit_ticket(
+        self,
+        ticket: CritiqueTicket,
+        review_type: str,
+        *,
+        enforce_pending_contract: bool = False,
+    ) -> tuple[bool, str]:
         fingerprint = self._issue_fingerprint(ticket, review_type)
         event_index = len(self.state.events)
 
@@ -270,7 +294,11 @@ class ConscienceMonitor:
             return True, ""
 
         last_seen = self.state.seen_issue_fingerprints.get(fingerprint)
-        if last_seen is not None and event_index - last_seen < 2:
+        if (
+            not enforce_pending_contract
+            and last_seen is not None
+            and event_index - last_seen < 2
+        ):
             return False, "duplicate_recent_issue"
         if self.state.repair_rounds >= self.state.max_repair_rounds:
             return False, "repair_limit_exhausted"
@@ -357,6 +385,118 @@ class ConscienceMonitor:
             "timestamp": event.timestamp,
             "payload": payload,
         }
+
+    def _restart_event_payload(self, event: ConscienceEvent) -> Dict[str, Any]:
+        """Keep small recent events raw and hard-bound oversized tool payloads."""
+        raw = asdict(event)
+        if self._json_chars(raw) <= _COMPACT_RESTART_EVENT_MAX_CHARS:
+            return raw
+
+        compact = self._compact_event_for_review(event, profile="restart")
+        if self._json_chars(compact) <= _COMPACT_RESTART_EVENT_MAX_CHARS:
+            compact["raw_event_truncated"] = True
+            return compact
+
+        source = event.payload or {}
+        payload: Dict[str, Any] = {}
+        scalar_keys = (
+            "tool_name",
+            "success",
+            "exit_code",
+            "duration_seconds",
+            "result_preview_truncated",
+            "output_preview_truncated",
+            "output_chars",
+            "omitted_chars",
+            "artifact_path",
+            "artifact_sha256",
+            "path",
+        )
+        for key in scalar_keys:
+            if key in source and source.get(key) not in (None, ""):
+                value = source.get(key)
+                payload[key] = (
+                    _text_head_tail(str(value), 240)
+                    if isinstance(value, str)
+                    else value
+                )
+
+        if source.get("tool_args") is not None:
+            payload["tool_args"] = self._compact_value_for_review(
+                "tool_args", source.get("tool_args"), limit=600
+            )
+        for key in (
+            "result_preview",
+            "output_tail",
+            "error",
+            "tool_error",
+            "text",
+            "content",
+        ):
+            value = source.get(key)
+            if value not in (None, ""):
+                payload[key] = _text_head_tail(str(value), 700)
+                break
+
+        summarized = {
+            "event_type": event.event_type,
+            "timestamp": event.timestamp,
+            "payload": payload,
+            "raw_event_truncated": True,
+            "raw_event_chars": self._json_chars(raw),
+            "raw_event_sha256": _short_hash(
+                json.dumps(raw, ensure_ascii=False, sort_keys=True)
+            ),
+        }
+        return summarized
+
+    def _restart_task_contract_payload(self, *, request_limit: int = 2_000) -> Dict[str, Any]:
+        contract = self.state.contract
+        asks = []
+        for criterion in contract.explicit_asks[:6]:
+            asks.append(
+                {
+                    "criterion_id": _text_head_tail(str(criterion.criterion_id or ""), 120),
+                    "required": bool(criterion.required),
+                    "status": _text_head_tail(str(criterion.status or ""), 80),
+                    "source_text": _text_head_tail(str(criterion.source_text or ""), 320),
+                }
+            )
+
+        def compact_rows(values: List[str], *, count: int = 4) -> List[str]:
+            return [_text_head_tail(str(value), 240) for value in values[:count]]
+
+        return {
+            "task_id": _text_head_tail(str(contract.task_id or ""), 160),
+            "raw_user_request": _text_head_tail(
+                str(contract.raw_user_request or ""), request_limit
+            ),
+            "explicit_asks": asks,
+            "explicit_constraints": compact_rows(contract.explicit_constraints),
+            "implied_checks": compact_rows(contract.implied_checks),
+            "open_assumptions": compact_rows(contract.open_assumptions, count=3),
+        }
+
+    def _restart_repair_contract_payload(self, *, max_checks: int = 6) -> Optional[Dict[str, Any]]:
+        contract = self.active_repair_contract_payload()
+        if not isinstance(contract, dict):
+            return None
+        compact = dict(contract)
+        checks = [check for check in compact.get("checks") or [] if isinstance(check, dict)]
+        pending = [check for check in checks if check.get("status") == "pending"]
+        recent = checks[-max_checks:]
+        by_id = {
+            str(check.get("id") or id(check)): check
+            for check in pending[-max_checks:] + recent
+        }
+        selected = [
+            check
+            for check in checks
+            if str(check.get("id") or id(check)) in by_id
+        ][-max_checks:]
+        compact["checks"] = selected
+        compact["omitted_checks"] = max(0, len(checks) - len(selected))
+        return compact
 
     def _recent_events_payload(self, limit: int = 24, *, profile: str = "review") -> List[Dict[str, Any]]:
         return [self._compact_event_for_review(event, profile=profile) for event in self.state.events[-limit:]]
@@ -566,10 +706,13 @@ class ConscienceMonitor:
         }
 
     def _stateful_compact_restart_char_budget(self) -> int:
-        token_limit = int(self.state.stateful_prompt_token_limit or 50_000)
-        return max(30_000, min(60_000, int(token_limit * 3 * 0.35)))
+        return _COMPACT_RESTART_MAX_CHARS
 
     def _reset_stateful_session(self, reason: str) -> None:
+        if self.state.stateful_previous_response_id:
+            self.state.stateful_retire_response_id = (
+                self.state.stateful_previous_response_id
+            )
         self.state.stateful_previous_response_id = None
         self.state.stateful_initialized = False
         self.state.stateful_last_event_index = 0
@@ -613,6 +756,7 @@ class ConscienceMonitor:
             "recent_events": self._recent_events_payload(),
             "draft_answer": draft_answer,
             "ticket_history": self._ticket_history_payload(),
+            "active_repair_contract": self.active_repair_contract_payload(),
             "repair_rounds_used": self.state.repair_rounds,
             "max_repair_rounds": self.state.max_repair_rounds,
             "stop_repair_rounds_used": self.state.repair_rounds,
@@ -628,24 +772,24 @@ class ConscienceMonitor:
         restart_reason: str,
     ) -> Dict[str, Any]:
         char_budget = self._stateful_compact_restart_char_budget()
-        recent_budget = int(char_budget * 0.30)
-        action_budget = int(char_budget * 0.22)
+        recent_budget = min(_COMPACT_RESTART_RECENT_CHARS, int(char_budget * 0.40))
+        action_budget = int(char_budget * 0.09)
         intervention_budget = int(char_budget * 0.18)
 
-        recent_candidates = self._recent_events_payload(limit=24, profile="restart")
+        raw_recent = self.state.events[-12:]
+        recent_candidates = [self._restart_event_payload(event) for event in raw_recent]
         recent_events, recent_omitted = self._budget_tail_items(
             recent_candidates,
             max_chars=recent_budget,
             max_items=12,
-            min_items=min(4, len(recent_candidates)),
+            min_items=min(1, len(recent_candidates)),
         )
 
-        action_candidates = self._action_ledger_payload(limit=48, profile="restart")
+        action_candidates = self._action_ledger_payload(limit=16, profile="restart")
         action_ledger, action_omitted = self._budget_tail_items(
             action_candidates,
             max_chars=action_budget,
-            max_items=24,
-            min_items=min(6, len(action_candidates)),
+            max_items=8,
         )
 
         intervention_ledger, intervention_omitted = self._restart_intervention_ledger_payload(
@@ -654,20 +798,20 @@ class ConscienceMonitor:
         )
 
         all_artifacts = self._artifact_ledger_payload()
-        artifact_ledger = all_artifacts[-16:]
+        artifact_ledger = all_artifacts[-6:]
         trajectory_memory = {
             "action_ledger": action_ledger,
             "artifact_ledger": artifact_ledger,
             "intervention_ledger": intervention_ledger,
         }
-        ticket_history = self._ticket_history_payload()[-24:]
-        compact_draft = _text_head_tail(str(draft_answer or ""), 2400)
+        ticket_history = self._ticket_history_payload()[-8:]
+        compact_draft = _text_head_tail(str(draft_answer or ""), 1200)
         compaction = self._stateful_compaction_metadata(restart_reason)
         compaction.update(
             {
                 "payload_char_budget": char_budget,
                 "recent_event_window": 12,
-                "action_ledger_window": 24,
+                "action_ledger_window": 8,
                 "intervention_ledger_window": 8,
                 "omitted": {
                     "recent_events": max(0, len(recent_candidates) - len(recent_events), recent_omitted),
@@ -687,12 +831,13 @@ class ConscienceMonitor:
         payload = {
             "review_type": review_type,
             "mode": self.mode,
-            "task_contract": asdict(self.state.contract),
+            "task_contract": self._restart_task_contract_payload(),
             "available_tools": self._available_tools_payload(),
             "trajectory_memory": trajectory_memory,
             "recent_events": recent_events,
             "draft_answer": compact_draft,
             "ticket_history": ticket_history,
+            "active_repair_contract": self._restart_repair_contract_payload(),
             "repair_rounds_used": self.state.repair_rounds,
             "max_repair_rounds": self.state.max_repair_rounds,
             "stop_repair_rounds_used": self.state.repair_rounds,
@@ -710,6 +855,92 @@ class ConscienceMonitor:
             "ticket_history": self._json_chars(ticket_history),
         }
         for _ in range(2):
+            compaction["payload_chars"] = self._json_chars(payload)
+            compaction["estimated_payload_tokens"] = self._estimated_payload_tokens(payload)
+
+        if self._json_chars(payload) > char_budget:
+            fallback_recent = [
+                self._restart_event_payload(event)
+                for event in self.state.events[-3:]
+            ]
+            fallback_recent, _ = self._budget_tail_items(
+                fallback_recent,
+                max_chars=4_500,
+                max_items=3,
+                min_items=min(1, len(fallback_recent)),
+            )
+            payload["task_contract"] = self._restart_task_contract_payload(request_limit=1_200)
+            payload["recent_events"] = fallback_recent
+            trajectory_memory["action_ledger"] = []
+            trajectory_memory["artifact_ledger"] = artifact_ledger[-3:]
+            trajectory_memory["intervention_ledger"] = intervention_ledger[-4:]
+            payload["ticket_history"] = []
+            compaction["hard_fallback"] = True
+            compaction["component_chars"] = {
+                "task_contract": self._json_chars(payload["task_contract"]),
+                "trajectory_memory": self._json_chars(trajectory_memory),
+                "recent_events": self._json_chars(fallback_recent),
+                "draft_answer": self._json_chars(compact_draft),
+                "ticket_history": 2,
+            }
+            compaction["payload_chars"] = self._json_chars(payload)
+            compaction["estimated_payload_tokens"] = self._estimated_payload_tokens(payload)
+
+        if self._json_chars(payload) > char_budget:
+            # Last-resort structural envelope. Every field here has a fixed
+            # cardinality and text cap, so compaction cannot quietly recreate
+            # the near-complete trajectory it was meant to replace.
+            latest_interventions = []
+            for entry in self.state.intervention_ledger[-2:]:
+                latest_interventions.append(
+                    {
+                        "id": _text_head_tail(str(entry.get("id") or ""), 100),
+                        "status": _text_head_tail(str(entry.get("status") or ""), 80),
+                        "reason": _text_head_tail(str(entry.get("reason") or ""), 300),
+                        "next_best_action": _text_head_tail(
+                            str(entry.get("next_best_action") or entry.get("required_action") or ""),
+                            300,
+                        ),
+                    }
+                )
+            latest_events = [
+                self._restart_event_payload(event)
+                for event in self.state.events[-1:]
+            ]
+            payload = {
+                "review_type": _text_head_tail(str(review_type or ""), 40),
+                "mode": _text_head_tail(str(self.mode or ""), 40),
+                "task_contract": self._restart_task_contract_payload(request_limit=800),
+                "available_tools": [
+                    _text_head_tail(str(tool), 100)
+                    for tool in self._available_tools_payload()[:24]
+                ],
+                "trajectory_memory": {
+                    "action_ledger": [],
+                    "artifact_ledger": [],
+                    "intervention_ledger": latest_interventions,
+                },
+                "recent_events": latest_events,
+                "draft_answer": _text_head_tail(str(draft_answer or ""), 400),
+                "ticket_history": [],
+                "active_repair_contract": self._restart_repair_contract_payload(max_checks=3),
+                "repair_rounds_used": self.state.repair_rounds,
+                "max_repair_rounds": self.state.max_repair_rounds,
+                "stop_repair_rounds_used": self.state.repair_rounds,
+                "max_stop_repair_rounds": self.state.max_repair_rounds,
+                "stateful_mode": "compact_restart",
+                "event_cursor_start": 0,
+                "event_cursor_end": event_count,
+                "stateful_compaction": compaction,
+            }
+            compaction["minimal_envelope"] = True
+            compaction["component_chars"] = {
+                "task_contract": self._json_chars(payload["task_contract"]),
+                "trajectory_memory": self._json_chars(payload["trajectory_memory"]),
+                "recent_events": self._json_chars(latest_events),
+                "draft_answer": self._json_chars(payload["draft_answer"]),
+                "ticket_history": 2,
+            }
             compaction["payload_chars"] = self._json_chars(payload)
             compaction["estimated_payload_tokens"] = self._estimated_payload_tokens(payload)
         return payload
@@ -772,6 +1003,7 @@ class ConscienceMonitor:
             "event_cursor_start": start,
             "event_cursor_end": event_count,
             "ledger_delta": self._ledger_delta_payload(start, event_count),
+            "active_repair_contract": self.active_repair_contract_payload(),
             "draft_answer": draft_answer,
             "repair_rounds_used": self.state.repair_rounds,
             "max_repair_rounds": self.state.max_repair_rounds,
@@ -799,9 +1031,12 @@ class ConscienceMonitor:
             "Hermes records attempted automatically when the actor takes the next tool action. Include intervention_outcomes only for a semantic status transition to resolved, ignored, or still_failing; never narrate attempted-to-attempted progress or repeat the current status. "
             "Mark resolved only when a recent tool result or equivalent evidence directly proves the required action succeeded. Starting a command is attempted, not resolved. "
             "Each outcome object must use keys id, status, outcome, evidence, confidence. "
+            "When blocking a stop that needs one or more further actions, include repair_contract with keys objective and checks. Each check must be one independently verifiable outcome with stable id, description, expected_evidence, recommended_tools, and status='pending'. Do not combine several checks into one prose item. Use exact advisory tool names from payload.available_tools and do not create a tool allowlist. "
+            "When payload.active_repair_contract exists, preserve its check ids. After new evidence, include repair_check_updates only for checks whose semantic status changed. Each update must use id, status ('resolved', 'obsolete', or 'pending'), outcome, and evidence. Mark a check resolved only from direct evidence; mark obsolete only when new evidence makes it genuinely unnecessary. "
+            "For a stop review with an active repair contract, allow_stop only when the existing contract has no pending checks after applying repair_check_updates from this response. Otherwise block the stop and keep every unresolved check pending. "
             "For a TOOL_PROGRESS review, set active_tool_decision to cancel only when the available command, elapsed time, and progress evidence make continued execution clearly wasteful; otherwise set it to continue. For other reviews omit active_tool_decision. "
             "Return strict JSON with keys: should_intervene (bool), verdict (string), reason (string), evidence (array of strings), "
-            "next_best_action (string), recommended_tools (array of strings or null), tool_policy (object or null), criterion_ids (array of strings), confidence (string), and optional active_tool_decision (cancel or continue)."
+            "next_best_action (string), recommended_tools (array of strings or null), tool_policy (object or null), criterion_ids (array of strings), confidence (string), and optional repair_contract, repair_check_updates, intervention_outcomes, and active_tool_decision (cancel or continue)."
         )
 
     @classmethod
@@ -809,7 +1044,7 @@ class ConscienceMonitor:
         return (
             "Return strict JSON. If no intervention is warranted, return only "
             '{"should_intervene": false, "verdict": "observe"} '
-            "and omit reason, evidence, next_best_action, recommended_tools, tool_policy, criterion_ids, and confidence, unless adding a transition-only intervention_outcomes update. "
+            "and omit reason, evidence, next_best_action, recommended_tools, tool_policy, criterion_ids, and confidence, unless adding transition-only intervention_outcomes or repair_check_updates. "
             "Do not explain why you are observing. "
             "If intervention is warranted, "
             + cls._intervention_json_contract_prompt()
@@ -820,7 +1055,7 @@ class ConscienceMonitor:
         return (
             "Return strict JSON. If the actor may stop, return only "
             '{"should_intervene": false, "verdict": "allow_stop"} '
-            "and omit reason, evidence, next_best_action, recommended_tools, tool_policy, criterion_ids, confidence, and intervention_outcomes. "
+            "and omit reason, evidence, next_best_action, recommended_tools, tool_policy, criterion_ids, confidence, and intervention_outcomes, unless repair_check_updates are needed to resolve or obsolete active checks. "
             "If the actor must not stop, "
             + cls._intervention_json_contract_prompt()
         )
@@ -830,16 +1065,25 @@ class ConscienceMonitor:
         return (
             "You are Hermes conscience sidecar. For review_type='midtask', you are a sparse trajectory monitor, not a completion judge and not the main actor. "
             "Judge only from the task request and recent event stream. The actor is still working, so do not require the task to be complete yet. "
+            "When TASK_START.native_image_delivery.delivered_to_actor is true, the actor received the original image directly in multimodal model input; do not require a separate vision tool call merely to establish that the actor inspected it. "
             "Default to should_intervene=false. "
             "Intervene only when the recent trajectory is clearly bad and likely to waste more calls or damage task state: "
-            "the actor repeats the same tool, same arguments, same browser action, same selector, same URL/page, or same error without materially new evidence; "
+            "the actor repeats the same underlying investigative objective without materially new evidence, even if it changes the tool, command, arguments, parser, browser action, selector, URL/page, or implementation approach; "
             "the actor ignores a previous conscience correction; "
             "the actor continues after evidence shows the current strategy is failing; "
             "the actor is about to use clearly wrong tools or no-op actions; "
             "or the actor has enough evidence for the next move but is circling instead. "
+            "Judge progress by information gained and movement across the user's explicit deliverables, not by surface novelty. "
+            "For implementation tasks, information gathering alone is not deliverable progress. Once recent evidence identifies a plausible target interface, input contract, and validation path, treat continued read-only discovery that leaves code, tests, or other requested artifacts untouched as circling, even when each read yields another detail. Tell the actor to implement a minimal end-to-end slice, represent remaining uncertainty with tolerant parsing or explicit fallbacks, and refine it from fixtures and test results instead of exhaustively reverse-engineering every live input variant first. "
+            "Before returning observe, compare the latest action and result with the preceding two actor/tool cycles: identify what materially new, decision-changing evidence was gained and which explicit deliverable advanced. "
+            "If neither changed and the same underlying objective has consumed at least two unsuccessful or non-decisive cycles, intervene now rather than waiting for another variant. "
+            "A command change, a new parser error, a different failure message, or finer precision around an already-supported conclusion is not material progress by itself. "
+            "A successful recovery that actually retrieves needed evidence or resolves the uncertainty is material progress. "
+            "For research and audit work, when materially different source searches have already failed to produce a requested measurement, preserving that measurement as unavailable or uncertain and advancing the remaining deliverables is progress; continuing to search equivalent sources is circling unless that measurement blocks the whole task. "
+            "If a non-blocking subproblem keeps consuming calls while requested deliverables remain untouched, tell the actor to preserve the uncertainty and move to the next unmet deliverable or synthesize from the evidence already available. "
             "Do not intervene merely because the task is not finished yet, you can think of a better next step, the actor is gathering new evidence, the actor made one ordinary mistake, or you are uncertain. "
             "If unsure, observe silently: should_intervene=false. "
-            "When intervening, give one concise course correction. Name the repeated or wrong behavior to stop, and the different strategy to try next. "
+            "When intervening, give one concise course correction. Name the underlying repeated or wrong behavior to stop and choose one: a genuinely different decisive check, or preservation of the uncertainty followed by the next unmet deliverable or synthesis. Do not recommend another variant of the same investigation. "
             "Separate diagnosis from invocation details: if the exact command or procedure is not supported by the evidence, recommend one targeted inspection step instead of inventing a command. "
             "Do not produce a final answer unless the actor is explicitly looping on final-answer generation and no further tool use is needed. "
             "Do not rely on fixed heuristics, regex rules, or hand-crafted trigger categories. Infer directly from the evidence whether intervention is warranted right now. "
@@ -851,6 +1095,7 @@ class ConscienceMonitor:
         return (
             "You are Hermes conscience sidecar. For review_type='stop', you are a strict completion auditor, not the main actor. "
             "Judge only from the provided task request, draft answer, and event stream. "
+            "When TASK_START.native_image_delivery.delivered_to_actor is true, the actor received the original image directly in multimodal model input; treat an answer grounded in that image as direct inspection and do not demand a duplicate vision tool call solely because no such tool event exists. "
             "Your core question is: if a careful user read this draft, would they correctly conclude the request was fully completed, with nothing material still missing? "
             "Do not trust the draft answer at face value. Reason from first principles about whether the user's request is actually satisfied. "
             "Interpret the user's request pragmatically, not narrowly. Include the ordinary implications needed for the answer to be trustworthy, not just the literal shortest reading. "
@@ -887,6 +1132,7 @@ class ConscienceMonitor:
             "summaries as evidence, and do not assume omitted bulk content is unavailable to the actor. Retain and use "
             "the prior task contract, tools, compact event stream, tickets, and earlier audit context from this thread. "
             "Each user message is JSON and includes review_type. Apply only the section matching review_type. "
+            "If active_repair_contract is present, retain its stable check ids and evaluate new tool evidence against its pending checks. "
             "For review_type='midtask': "
             + cls._midtask_review_system_prompt()
             + " For review_type='stop': "
@@ -1017,25 +1263,294 @@ class ConscienceMonitor:
             return "stateful_degenerate_output"
         return ""
 
-    def _append_intervention_ledger(self, ticket: CritiqueTicket, review_type: str) -> None:
-        self.state.intervention_ledger.append(
+    def _append_intervention_ledger(
+        self, ticket: CritiqueTicket, review_type: str
+    ) -> Dict[str, Any]:
+        entry = {
+            "id": f"intervention_{len(self.state.intervention_ledger) + 1:03d}",
+            "fingerprint": self._issue_fingerprint(ticket, review_type),
+            "review_type": review_type,
+            "verdict": ticket.verdict,
+            "event_index": len(self.state.events),
+            "issued_at": time.time(),
+            "reason": ticket.reason,
+            "required_action": ticket.next_best_action,
+            "next_best_action": ticket.next_best_action,
+            "recommended_tools": list(ticket.recommended_tools or []),
+            "tool_policy": dict(ticket.tool_policy) if ticket.tool_policy else None,
+            "evidence": list(ticket.evidence[:5]),
+            "criterion_ids": list(ticket.criterion_ids),
+            "status": "issued",
+        }
+        self.state.intervention_ledger.append(entry)
+        return entry
+
+    @staticmethod
+    def _repair_check_status(value: Any) -> str:
+        status = str(value or "pending").strip().lower()
+        return status if status in {"pending", "resolved", "obsolete"} else "pending"
+
+    @staticmethod
+    def _repair_check_tools(value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+
+    def _normalized_repair_checks(
+        self,
+        raw_contract: Any,
+        ticket: CritiqueTicket,
+    ) -> List[Dict[str, Any]]:
+        raw_checks = raw_contract.get("checks") if isinstance(raw_contract, dict) else None
+        checks: List[Dict[str, Any]] = []
+        if isinstance(raw_checks, list):
+            seen_ids = set()
+            for index, raw_check in enumerate(raw_checks, start=1):
+                if not isinstance(raw_check, dict):
+                    continue
+                check_id = str(raw_check.get("id") or f"check_{index:03d}").strip()
+                if not check_id or check_id in seen_ids:
+                    check_id = f"check_{index:03d}"
+                seen_ids.add(check_id)
+                description = str(
+                    raw_check.get("description")
+                    or raw_check.get("required_action")
+                    or raw_check.get("outcome")
+                    or ""
+                ).strip()
+                if not description:
+                    continue
+                expected_evidence = str(
+                    raw_check.get("expected_evidence")
+                    or raw_check.get("evidence_required")
+                    or ""
+                ).strip()
+                checks.append(
+                    {
+                        "id": check_id,
+                        "description": _text_head_tail(description, 500),
+                        "expected_evidence": _text_head_tail(expected_evidence, 400),
+                        "recommended_tools": self._repair_check_tools(
+                            raw_check.get("recommended_tools")
+                        ),
+                        "status": self._repair_check_status(raw_check.get("status")),
+                    }
+                )
+        if checks:
+            return checks
+        fallback = str(ticket.next_best_action or ticket.reason or "").strip()
+        if not fallback:
+            return []
+        return [
             {
-                "id": f"intervention_{len(self.state.intervention_ledger) + 1:03d}",
-                "fingerprint": self._issue_fingerprint(ticket, review_type),
-                "review_type": review_type,
-                "verdict": ticket.verdict,
-                "event_index": len(self.state.events),
-                "issued_at": time.time(),
-                "reason": ticket.reason,
-                "required_action": ticket.next_best_action,
-                "next_best_action": ticket.next_best_action,
+                "id": "check_001",
+                "description": _text_head_tail(fallback, 500),
+                "expected_evidence": "",
                 "recommended_tools": list(ticket.recommended_tools or []),
-                "tool_policy": dict(ticket.tool_policy) if ticket.tool_policy else None,
-                "evidence": list(ticket.evidence[:5]),
-                "criterion_ids": list(ticket.criterion_ids),
-                "status": "issued",
+                "status": "pending",
             }
+        ]
+
+    def _activate_repair_contract(
+        self,
+        ticket: CritiqueTicket,
+        intervention_entry: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        raw_contract = ticket.repair_contract if isinstance(ticket.repair_contract, dict) else {}
+        existing = self.state.active_repair_contract
+        existing_active = isinstance(existing, dict) and existing.get("status") == "active"
+        has_structured_checks = isinstance(raw_contract.get("checks"), list) and bool(
+            raw_contract.get("checks")
         )
+
+        if existing_active and not has_structured_checks:
+            existing["updated_at"] = time.time()
+            existing["latest_intervention_id"] = intervention_entry.get("id")
+            existing.setdefault("intervention_ids", []).append(intervention_entry.get("id"))
+            intervention_entry["repair_contract_id"] = existing.get("id")
+            return existing
+
+        checks = self._normalized_repair_checks(raw_contract, ticket)
+        if not checks:
+            return existing if existing_active else None
+
+        if existing_active:
+            incoming_checks = {
+                str(check.get("id") or ""): check for check in checks
+            }
+            merged_checks: List[Dict[str, Any]] = []
+            for previous in existing.get("checks") or []:
+                if not isinstance(previous, dict):
+                    continue
+                check_id = str(previous.get("id") or "")
+                incoming = incoming_checks.pop(check_id, None)
+                if incoming is None:
+                    merged_checks.append(dict(previous))
+                    continue
+                merged = dict(previous)
+                merged.update(
+                    {
+                        key: incoming[key]
+                        for key in (
+                            "description",
+                            "expected_evidence",
+                            "recommended_tools",
+                        )
+                        if key in incoming
+                    }
+                )
+                merged_checks.append(merged)
+            for incoming in incoming_checks.values():
+                incoming["status"] = "pending"
+                merged_checks.append(incoming)
+            checks = merged_checks
+        else:
+            for check in checks:
+                check["status"] = "pending"
+
+        now = time.time()
+        contract_id = (
+            str(existing.get("id") or "")
+            if existing_active
+            else f"repair_{len(self.state.intervention_ledger):03d}"
+        )
+        intervention_ids = list(existing.get("intervention_ids") or []) if existing_active else []
+        intervention_ids.append(intervention_entry.get("id"))
+        response_only = (
+            bool(existing.get("response_only"))
+            if existing_active and ticket.recommended_tools is None
+            else ticket.recommended_tools == []
+        )
+        if any(check.get("recommended_tools") for check in checks):
+            response_only = False
+
+        contract = {
+            "id": contract_id,
+            "status": "active" if any(check["status"] == "pending" for check in checks) else "resolved",
+            "objective": _text_head_tail(
+                str(raw_contract.get("objective") or ticket.reason or ticket.next_best_action or ""),
+                700,
+            ),
+            "checks": checks,
+            "response_only": response_only,
+            "created_at": existing.get("created_at", now) if existing_active else now,
+            "updated_at": now,
+            "source_intervention_id": (
+                existing.get("source_intervention_id") if existing_active else intervention_entry.get("id")
+            ),
+            "latest_intervention_id": intervention_entry.get("id"),
+            "intervention_ids": list(dict.fromkeys(item for item in intervention_ids if item)),
+            "enforced": bool(
+                (existing.get("enforced") if existing_active else False)
+                or has_structured_checks
+            ),
+        }
+        if contract["status"] == "resolved":
+            contract["resolved_at"] = now
+        self.state.active_repair_contract = contract
+        intervention_entry["repair_contract_id"] = contract_id
+        intervention_entry["repair_contract"] = self._compact_repair_contract(contract)
+        return contract
+
+    def _compact_repair_contract(self, contract: Dict[str, Any]) -> Dict[str, Any]:
+        checks = []
+        for raw_check in contract.get("checks") or []:
+            if not isinstance(raw_check, dict):
+                continue
+            check = {
+                "id": str(raw_check.get("id") or ""),
+                "status": self._repair_check_status(raw_check.get("status")),
+                "description": _text_head_tail(str(raw_check.get("description") or ""), 500),
+                "expected_evidence": _text_head_tail(
+                    str(raw_check.get("expected_evidence") or ""), 400
+                ),
+                "recommended_tools": self._repair_check_tools(raw_check.get("recommended_tools")),
+            }
+            for key, limit in (("outcome", 500), ("evidence", 700)):
+                if raw_check.get(key):
+                    value = raw_check.get(key)
+                    if isinstance(value, list):
+                        check[key] = [_text_head_tail(str(item), 300) for item in value[:4]]
+                    else:
+                        check[key] = _text_head_tail(str(value), limit)
+            checks.append(check)
+        return {
+            "id": str(contract.get("id") or ""),
+            "status": str(contract.get("status") or ""),
+            "objective": _text_head_tail(str(contract.get("objective") or ""), 700),
+            "checks": checks,
+            "response_only": bool(contract.get("response_only")),
+            "enforced": bool(contract.get("enforced")),
+        }
+
+    def active_repair_contract_payload(
+        self, *, include_resolved: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        contract = self.state.active_repair_contract
+        if not isinstance(contract, dict):
+            return None
+        if not include_resolved and contract.get("status") != "active":
+            return None
+        return self._compact_repair_contract(contract)
+
+    def _apply_repair_check_updates_from_review(
+        self, parsed: Dict[str, Any], review_type: str
+    ) -> List[Dict[str, Any]]:
+        contract = self.state.active_repair_contract
+        raw_updates = parsed.get("repair_check_updates")
+        if not isinstance(contract, dict) or not isinstance(raw_updates, list):
+            return []
+        checks = {
+            str(check.get("id") or ""): check
+            for check in contract.get("checks") or []
+            if isinstance(check, dict) and str(check.get("id") or "")
+        }
+        applied: List[Dict[str, Any]] = []
+        now = time.time()
+        for raw_update in raw_updates:
+            if not isinstance(raw_update, dict):
+                continue
+            check_id = str(raw_update.get("id") or "").strip()
+            check = checks.get(check_id)
+            if check is None:
+                continue
+            status = self._repair_check_status(raw_update.get("status"))
+            if status == "pending" and check.get("status") == "pending":
+                continue
+            if check.get("status") in {"resolved", "obsolete"}:
+                continue
+            check["status"] = status
+            check["updated_at"] = now
+            if status in {"resolved", "obsolete"}:
+                check["resolved_at"] = now
+            outcome = str(raw_update.get("outcome") or raw_update.get("reason") or "").strip()
+            if outcome:
+                check["outcome"] = _text_head_tail(outcome, 500)
+            evidence = raw_update.get("evidence") or []
+            if not isinstance(evidence, list):
+                evidence = [evidence]
+            if evidence:
+                check["evidence"] = [_text_head_tail(str(item), 300) for item in evidence[:4]]
+            applied.append(
+                {
+                    "id": check_id,
+                    "status": status,
+                    "review_type": review_type,
+                }
+            )
+
+        contract["updated_at"] = now
+        if not any(check.get("status") == "pending" for check in checks.values()):
+            contract["status"] = "resolved"
+            contract["resolved_at"] = now
+            for intervention_id in contract.get("intervention_ids") or []:
+                source = self._find_intervention_entry(str(intervention_id or ""))
+                if source and source.get("status") != "resolved":
+                    source["status"] = "resolved"
+                    source["outcome"] = "All active repair-contract checks were resolved or made obsolete."
+                    source["outcome_review_type"] = review_type
+                    source["outcome_updated_at"] = now
+        return applied
 
     def _find_intervention_entry(self, intervention_id: str) -> Optional[Dict[str, Any]]:
         intervention_id = str(intervention_id or "").strip()
@@ -1140,10 +1655,30 @@ class ConscienceMonitor:
             call_kwargs["stateful_payload"] = {
                 "thread_id": f"conscience:{self.state.contract.task_id}",
                 "previous_response_id": self.state.stateful_previous_response_id,
+                "retire_previous_response_id": self.state.stateful_retire_response_id,
                 "instructions": self._stateful_review_system_prompt(),
                 "input_payload": stateful_payload,
             }
-        response = llm_callable(**call_kwargs)
+        memory_pressure_retry = False
+        try:
+            response = llm_callable(**call_kwargs)
+        except ConscienceMemoryPressureError as exc:
+            if "stateful_payload" not in call_kwargs:
+                raise
+            retired_response_id = self.state.stateful_previous_response_id
+            self._reset_stateful_session("wrapper_memory_admission")
+            stateful_payload = self.build_stateful_review_payload(
+                review_type, draft_answer
+            )
+            call_kwargs["stateful_payload"] = {
+                "thread_id": f"conscience:{self.state.contract.task_id}",
+                "previous_response_id": None,
+                "retire_previous_response_id": retired_response_id,
+                "instructions": self._stateful_review_system_prompt(),
+                "input_payload": stateful_payload,
+            }
+            memory_pressure_retry = True
+            response = llm_callable(**call_kwargs)
         active_stateful_payload = stateful_payload
         stateful_used = bool(getattr(response, "conscience_stateful_used", False))
 
@@ -1180,6 +1715,7 @@ class ConscienceMonitor:
                     "response_id": response_id,
                     "mode": sent_payload.get("stateful_mode") if isinstance(sent_payload, dict) else None,
                     "event_cursor_end": sent_payload.get("event_cursor_end") if isinstance(sent_payload, dict) else None,
+                    "memory_pressure_retry": memory_pressure_retry,
                 },
                 "response_status": self._response_status(response_obj),
                 "finish_reason": self._response_finish_reason(response_obj),
@@ -1205,6 +1741,7 @@ class ConscienceMonitor:
             fallback_stateful_payload = {
                 "thread_id": f"conscience:{self.state.contract.task_id}:stop-fallback",
                 "previous_response_id": None,
+                "retire_previous_response_id": self.state.stateful_previous_response_id,
                 "instructions": self._review_system_prompt(review_type),
                 "input_payload": payload,
                 "fresh_fallback": True,
@@ -1219,6 +1756,7 @@ class ConscienceMonitor:
                 fallback_reason=unreliable_reason,
             )
             self.state.stateful_previous_response_id = None
+            self.state.stateful_retire_response_id = None
             self.state.stateful_initialized = False
             self.state.stateful_last_event_index = 0
         elif stateful_used and isinstance(response_id, str) and response_id.strip():
@@ -1229,6 +1767,7 @@ class ConscienceMonitor:
             if total_tokens:
                 self.state.stateful_last_total_tokens = total_tokens
             self.state.stateful_previous_response_id = response_id.strip()
+            self.state.stateful_retire_response_id = None
             self.state.stateful_initialized = True
             self.state.stateful_last_event_index = len(self.state.events)
             self.state.stateful_next_init_reason = None
@@ -1248,7 +1787,57 @@ class ConscienceMonitor:
             return ConscienceVerdict(should_intervene=False, source="llm", metadata={"parse_error": True})
 
         applied_outcomes = self._apply_intervention_outcomes_from_review(parsed, review_type)
+        applied_repair_updates = self._apply_repair_check_updates_from_review(
+            parsed, review_type
+        )
         should_intervene = bool(parsed.get("should_intervene"))
+        enforced_pending_contract = False
+        if review_type == "stop" and not should_intervene:
+            contract = self.state.active_repair_contract
+            pending_checks = [
+                check
+                for check in ((contract or {}).get("checks") or [])
+                if isinstance(check, dict) and check.get("status") == "pending"
+            ]
+            if (
+                isinstance(contract, dict)
+                and contract.get("status") == "active"
+                and contract.get("enforced")
+                and pending_checks
+            ):
+                enforced_pending_contract = True
+                should_intervene = True
+                pending_descriptions = [
+                    str(check.get("description") or check.get("id") or "required check")
+                    for check in pending_checks
+                ]
+                recommended_tools = list(
+                    dict.fromkeys(
+                        tool
+                        for check in pending_checks
+                        for tool in self._repair_check_tools(check.get("recommended_tools"))
+                    )
+                )
+                parsed = dict(parsed)
+                parsed.update(
+                    {
+                        "should_intervene": True,
+                        "verdict": "block_stop",
+                        "reason": "active_repair_contract_incomplete",
+                        "evidence": [
+                            f"Pending repair check: {description}"
+                            for description in pending_descriptions[:5]
+                        ],
+                        "next_best_action": (
+                            "Complete the remaining repair checks: "
+                            + "; ".join(pending_descriptions[:5])
+                        ),
+                        "recommended_tools": recommended_tools or None,
+                        "tool_policy": None,
+                        "criterion_ids": [],
+                        "confidence": "high",
+                    }
+                )
         if review_type == "stop":
             self._mark_completion_ledger_from_stop_review(parsed, should_intervene)
         if not should_intervene:
@@ -1262,6 +1851,8 @@ class ConscienceMonitor:
             }
             if applied_outcomes:
                 metadata["intervention_outcomes_applied"] = applied_outcomes
+            if applied_repair_updates:
+                metadata["repair_check_updates_applied"] = applied_repair_updates
             return ConscienceVerdict(
                 should_intervene=False,
                 critique_ticket=None,
@@ -1300,10 +1891,19 @@ class ConscienceMonitor:
                 if str(parsed.get("active_tool_decision") or "").strip().lower() in {"cancel", "continue"}
                 else None
             ),
+            repair_contract=(
+                dict(parsed.get("repair_contract"))
+                if isinstance(parsed.get("repair_contract"), dict)
+                else None
+            ),
         )
         suppressed_reason = ""
         suppressed_ticket = None
-        admitted, suppressed_reason = self._dedupe_or_admit_ticket(ticket, review_type)
+        admitted, suppressed_reason = self._dedupe_or_admit_ticket(
+            ticket,
+            review_type,
+            enforce_pending_contract=enforced_pending_contract,
+        )
         if not admitted:
             suppressed_ticket = ticket
             should_intervene = False
@@ -1313,13 +1913,19 @@ class ConscienceMonitor:
         if should_intervene and review_type == "midtask":
             self.state.last_midtask_intervention_index = len(self.state.events)
         if should_intervene and ticket is not None:
-            self._append_intervention_ledger(ticket, review_type)
+            intervention_entry = self._append_intervention_ledger(ticket, review_type)
+            if review_type == "stop":
+                self._activate_repair_contract(ticket, intervention_entry)
         metadata = {
             "confidence": str(parsed.get("confidence") or ""),
             "review_type": review_type,
         }
         if applied_outcomes:
             metadata["intervention_outcomes_applied"] = applied_outcomes
+        if applied_repair_updates:
+            metadata["repair_check_updates_applied"] = applied_repair_updates
+        if enforced_pending_contract:
+            metadata["active_repair_contract_enforced"] = True
         if suppressed_reason:
             metadata["suppressed"] = suppressed_reason
             metadata["suppressed_ticket"] = asdict_safe(suppressed_ticket)
