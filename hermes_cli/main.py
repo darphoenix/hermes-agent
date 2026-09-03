@@ -14495,6 +14495,107 @@ def main():
         "proven-vs-unattributed difference attribution",
     )
 
+    sessions_capsule = sessions_subparsers.add_parser(
+        "capsule",
+        help="Session Replay Capsule: freeze, replay and compare a session's model trajectory",
+        description=(
+            "Create portable local capsules from completed sessions and "
+            "replay their model-facing trajectory against a local wrapper. "
+            "Recorded tool results are supplied during replay — tools are "
+            "never re-executed and no external side effects occur. "
+            "Limitations: the system prompt and tool schemas are not stored "
+            "in the session DB (only the prompt hash), so stateless "
+            "full-replay turns run without them unless hydrated; baseline "
+            "performance telemetry depends on wrapper logs still covering "
+            "the session window (rotated logs degrade comparisons, and the "
+            "verdict is then 'unverified', never 'exact')."
+        ),
+    )
+    capsule_sub = sessions_capsule.add_subparsers(dest="capsule_action")
+
+    cap_create = capsule_sub.add_parser(
+        "create",
+        help="Freeze a completed session's trajectory into a capsule",
+        description=(
+            "Reads the session read-only and writes the trajectory (prompts, "
+            "tool args, recorded tool output) into ~/.hermes/capsules/<name>/ "
+            "— treat that directory like your session DB (content stays local). "
+            "Optionally hydrates the original system prompt from a live "
+            "wrapper that still stores the session's responses."
+        ),
+    )
+    cap_create.add_argument("session_id", help="Session id or unique prefix")
+    cap_create.add_argument("--name", help="Capsule name (default: session id)")
+    cap_create.add_argument(
+        "--hydrate-endpoint", metavar="URL",
+        help="Wrapper base URL (e.g. http://127.0.0.1:1236/v1) to fetch the "
+             "original instructions from; failures are tolerated",
+    )
+    cap_create.add_argument("--api-key", help="Bearer key for --hydrate-endpoint")
+    cap_create.add_argument(
+        "--instructions-file",
+        help="Use this file as the capsule's system prompt (overrides hydration)",
+    )
+    cap_create.add_argument("--force", action="store_true", help="Overwrite existing capsule")
+
+    capsule_sub.add_parser("list", help="List local capsules")
+
+    cap_show = capsule_sub.add_parser("show", help="Inspect a capsule (manifest, lineage, warnings)")
+    cap_show.add_argument("capsule", help="Capsule name or path")
+    cap_show.add_argument("--json", action="store_true", help="Emit manifest JSON")
+
+    cap_replay = capsule_sub.add_parser(
+        "replay",
+        help="Replay a capsule against a local wrapper (tools are NOT re-executed)",
+        description=(
+            "Re-drives each recorded model call against /v1/responses on the "
+            "endpoint, supplying recorded tool results as input. Chain modes: "
+            "golden = continue from the ORIGINAL response ids (max cache "
+            "reuse, needs them still in the wrapper's response store); "
+            "replay = chain the freshly generated ids; full = resend the "
+            "whole transcript each turn (stateless). auto picks golden when "
+            "lineage coverage is complete, else full. A rejected parent "
+            "falls back to full-prompt replay for that turn and is counted "
+            "as a chain break — never silently. Non-loopback endpoints are "
+            "refused unless --allow-remote (capsule content leaves the box)."
+        ),
+    )
+    cap_replay.add_argument("capsule", help="Capsule name or path")
+    cap_replay.add_argument(
+        "--endpoint", metavar="URL",
+        help="Wrapper base URL (default: the URL the session originally used)",
+    )
+    cap_replay.add_argument("--api-key", help="Bearer key (or env HERMES_REPLAY_API_KEY)")
+    cap_replay.add_argument(
+        "--chain", choices=["auto", "golden", "replay", "full"], default="auto",
+        help="Lineage mode (default: auto)",
+    )
+    cap_replay.add_argument("--turns", type=int, help="Replay only the first N turns")
+    cap_replay.add_argument("--timeout", type=float, default=300.0, help="Per-request timeout seconds")
+    cap_replay.add_argument("--temperature", type=float, help="Pin sampling temperature")
+    cap_replay.add_argument("--max-tokens", type=int, help="Cap output tokens per turn")
+    cap_replay.add_argument("--allow-remote", action="store_true",
+                            help="Allow a non-loopback endpoint (content leaves this machine)")
+    cap_replay.add_argument("--json", action="store_true", help="Emit run JSON")
+
+    cap_compare = capsule_sub.add_parser(
+        "compare",
+        help="Compare a replay run against the original recording (or two runs)",
+        description=(
+            "Verdicts: exact = every turn behaviourally identical AND every "
+            "chained turn got an exact continuation AND baseline evidence "
+            "exists for all turns; equivalent-unverified = behaviour matches "
+            "but evidence is missing; equivalent-rebuilt = behaviour matches "
+            "but the wrapper rebuilt prompts instead of continuing the cache; "
+            "similar/diverged/failed otherwise. An exact replay is never "
+            "claimed silently when required evidence is unavailable."
+        ),
+    )
+    cap_compare.add_argument("capsule", help="Capsule name or path")
+    cap_compare.add_argument("--run", help="Run id to compare (default: newest)")
+    cap_compare.add_argument("--base-run", help="Compare against another run (A/B) instead of the recording")
+    cap_compare.add_argument("--json", action="store_true", help="Emit comparison JSON")
+
     sessions_rename = sessions_subparsers.add_parser(
         "rename", help="Set or change a session's title"
     )

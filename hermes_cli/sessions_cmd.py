@@ -121,6 +121,122 @@ def _prune_never_active_keyed(db, args):
     )
 
 
+def _cmd_capsule(args) -> int:
+    """``hermes sessions capsule <create|list|show|replay|compare>``."""
+    import json as _json
+
+    from agent import replay_capsule as rc
+
+    action = getattr(args, "capsule_action", None)
+    if not action:
+        print("Usage: hermes sessions capsule <create|list|show|replay|compare>")
+        print("Run 'hermes sessions capsule --help' for details.")
+        return 2
+
+    try:
+        if action == "create":
+            manifest = rc.create_capsule(
+                args.session_id,
+                name=args.name,
+                hydrate_endpoint=getattr(args, "hydrate_endpoint", None),
+                hydrate_api_key=getattr(args, "api_key", None),
+                instructions_file=getattr(args, "instructions_file", None),
+                force=getattr(args, "force", False),
+            )
+            print(rc.format_manifest(manifest))
+            print(f"\nCapsule written to {manifest['_path']}")
+            return 0
+
+        if action == "list":
+            capsules = rc.list_capsules()
+            if not capsules:
+                print("No capsules yet. Create one with:")
+                print("  hermes sessions capsule create <session-id-or-prefix>")
+                return 0
+            for m in capsules:
+                lin = m.get("lineage") or {}
+                print(
+                    f"  {m.get('name'):<34} turns {m.get('turns')!s:<4} "
+                    f"lineage {lin.get('coverage')!s:<6} "
+                    f"runs {len(m.get('_runs') or [])}  {m.get('_path')}"
+                )
+            return 0
+
+        if action == "show":
+            cap = rc.load_capsule(args.capsule)
+            if getattr(args, "json", False):
+                print(_json.dumps(cap["manifest"], indent=2, ensure_ascii=False))
+            else:
+                print(rc.format_manifest(cap["manifest"]))
+            return 0
+
+        if action == "replay":
+            run = rc.replay_capsule(
+                args.capsule,
+                endpoint=getattr(args, "endpoint", None),
+                api_key=getattr(args, "api_key", None),
+                chain=getattr(args, "chain", "auto"),
+                max_turns=getattr(args, "turns", None),
+                timeout=getattr(args, "timeout", 300.0),
+                allow_remote=getattr(args, "allow_remote", False),
+                temperature=getattr(args, "temperature", None),
+                max_tokens=getattr(args, "max_tokens", None),
+            )
+            if getattr(args, "json", False):
+                print(_json.dumps(run, indent=2, ensure_ascii=False))
+            else:
+                print(rc.format_run(run))
+                print(f"\nRun saved to {run['_path']}")
+                print(
+                    "Compare it with: hermes sessions capsule compare "
+                    f"{run['capsule']} --run {run['run_id']}"
+                )
+            failed = run.get("turns_failed") or 0
+            return 1 if failed == run.get("turns_requested") else 0
+
+        if action == "compare":
+            if getattr(args, "base_run", None):
+                cmp = rc.compare_runs(args.capsule, args.base_run, args.run or _newest_run(args.capsule, rc))
+            else:
+                cmp = rc.compare_run(args.capsule, run_id=getattr(args, "run", None))
+            if getattr(args, "json", False):
+                print(_json.dumps(cmp, indent=2, ensure_ascii=False))
+            elif getattr(args, "base_run", None):
+                print(rc.format_runs_comparison(cmp))
+            else:
+                print(rc.format_comparison(cmp))
+            return 0
+
+        print(f"Unknown capsule action '{action}'")
+        return 2
+    except rc.CapsuleNotFound as exc:
+        print(f"Error: {exc}")
+        return 1
+    except rc.NonLoopbackEndpoint as exc:
+        print(f"Error: {exc}")
+        return 1
+    except rc.CapsuleExists as exc:
+        print(f"Error: {exc}")
+        return 1
+    except rc.CapsuleError as exc:
+        print(f"Error: {exc}")
+        return 1
+    except Exception as exc:  # tolerance contract: never traceback on data gaps
+        print(f"Error: capsule command failed: {exc.__class__.__name__}: {exc}")
+        return 1
+
+
+def _newest_run(capsule_name: str, rc) -> str:
+    from pathlib import Path
+
+    cap = rc.load_capsule(capsule_name)
+    runs_root = Path(cap["dir"]) / rc.RUNS_DIR_NAME
+    available = sorted(d.name for d in runs_root.iterdir() if d.is_dir()) if runs_root.is_dir() else []
+    if not available:
+        raise rc.CapsuleError("capsule has no replay runs yet")
+    return available[-1]
+
+
 def _cmd_profile(args) -> int:
     """`hermes sessions profile <id> [--json] [--compare BASE]`.
 
@@ -364,6 +480,9 @@ def cmd_sessions(args, sessions_parser=None):
 
     if action == "profile":
         return _cmd_profile(args)
+
+    if action == "capsule":
+        return _cmd_capsule(args)
 
     try:
         from hermes_state import SessionDB
