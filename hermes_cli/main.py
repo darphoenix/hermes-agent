@@ -10930,6 +10930,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "skills",
         "tools",
         "mcp",
+        "session",
         "sessions",
         "insights",
         "update",
@@ -12378,7 +12379,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "project", "proxy",
         "prompt-size",
         "resume",
-        "send", "sessions", "setup",
+        "send", "session", "sessions", "setup",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
@@ -14059,6 +14060,7 @@ def main():
     # =========================================================================
     sessions_parser = subparsers.add_parser(
         "sessions",
+        aliases=["session"],
         help="Manage session history (list, rename, export, prune, delete)",
         description="View and manage the SQLite session store",
     )
@@ -14466,6 +14468,32 @@ def main():
     )
 
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
+
+    sessions_profile = sessions_subparsers.add_parser(
+        "profile",
+        help="Read-only performance profile of one session (Session Observatory)",
+        description=(
+            "Combine the state DB, main-wrapper and sidecar logs (current + "
+            "rotated) and durable conscience artifacts into a structural "
+            "performance profile. Never reads or prints prompt content, tool "
+            "arguments, or raw output."
+        ),
+    )
+    sessions_profile.add_argument(
+        "session_id",
+        help="Session id or unique prefix (ambiguous prefixes are rejected)",
+    )
+    sessions_profile.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the full profile as JSON instead of formatted text",
+    )
+    sessions_profile.add_argument(
+        "--compare",
+        metavar="BASE_ID",
+        help="Compare against a base session (id or unique prefix) with "
+        "proven-vs-unattributed difference attribution",
+    )
 
     sessions_rename = sessions_subparsers.add_parser(
         "rename", help="Set or change a session's title"

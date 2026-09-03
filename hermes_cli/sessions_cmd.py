@@ -121,6 +121,54 @@ def _prune_never_active_keyed(db, args):
     )
 
 
+def _cmd_profile(args) -> int:
+    """`hermes sessions profile <id> [--json] [--compare BASE]`.
+
+    Read-only Session Observatory: state DB + wrapper logs + conscience
+    artifacts. Never opens the DB for writing, never prints content.
+    """
+    import json as _json
+
+    from agent import session_observatory as obs
+
+    try:
+        report = obs.profile_session(args.session_id)
+    except obs.SessionNotFound as exc:
+        print(f"✗ {exc}")
+        return 1
+    except obs.AmbiguousSessionPrefix as exc:
+        print(f"✗ {exc}")
+        return 1
+    except obs.ObservatoryError as exc:
+        print(f"✗ Session Observatory: {exc}")
+        return 1
+
+    if getattr(args, "compare", None):
+        try:
+            base_report = obs.profile_session(args.compare)
+        except obs.ObservatoryError as exc:
+            print(f"✗ compare base: {exc}")
+            return 1
+        comparison = obs.compare_profiles(base_report, report)
+        if getattr(args, "json", False):
+            print(_json.dumps(
+                {"base": base_report, "target": report, "comparison": comparison},
+                indent=2,
+                default=str,
+            ))
+        else:
+            print(obs.format_report(report))
+            print()
+            print(obs.format_comparison(comparison))
+        return 0
+
+    if getattr(args, "json", False):
+        print(_json.dumps(report, indent=2, default=str))
+    else:
+        print(obs.format_report(report))
+    return 0
+
+
 def cmd_sessions(args, sessions_parser=None):
     import json as _json
 
@@ -313,6 +361,9 @@ def cmd_sessions(args, sessions_parser=None):
         if result is None and getattr(args, "path", None):
             return 1
         return
+
+    if action == "profile":
+        return _cmd_profile(args)
 
     try:
         from hermes_state import SessionDB
