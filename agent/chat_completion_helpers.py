@@ -1997,6 +1997,14 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             is_xai_responses=is_xai_responses,
             is_github_responses=is_github_responses,
         )
+        _cache_role_metadata = None
+        if _stateful_responses and is_local_endpoint(agent.base_url):
+            _cache_role_metadata = {
+                "hermes_cache_role": "actor",
+                "hermes_cache_scope": str(
+                    getattr(agent, "session_id", None) or "hermes"
+                ),
+            }
 
         # xAI's /responses endpoint rejects ``pattern`` and ``format`` keywords
         # in tool schemas (HTTP 400 "Invalid arguments passed to the model").
@@ -2055,6 +2063,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             previous_response_id=_previous_response_id,
             instructions=_instructions,
             runtime_instructions=_runtime_instructions,
+            metadata=_cache_role_metadata,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────

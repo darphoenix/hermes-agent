@@ -9508,6 +9508,12 @@ class AIAgent:
                         ],
                         "store": store_response,
                         "max_output_tokens": max_tokens,
+                        "metadata": {
+                            "hermes_cache_role": "conscience",
+                            "hermes_cache_scope": str(
+                                stateful_payload.get("thread_id") or "conscience"
+                            ),
+                        },
                     }
                     if temperature is not None:
                         request_kwargs["temperature"] = temperature

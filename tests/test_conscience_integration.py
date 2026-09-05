@@ -212,6 +212,10 @@ def test_conscience_call_llm_uses_stateful_responses_for_local_custom(tmp_path):
     assert kwargs["store"] is True
     assert kwargs["previous_response_id"] == "resp_previous"
     assert kwargs["max_output_tokens"] == 1200
+    assert kwargs["metadata"] == {
+        "hermes_cache_role": "conscience",
+        "hermes_cache_scope": "conscience",
+    }
     assert kwargs["extra_headers"]["X-Hermes-Actor"] == "conscience"
     assert kwargs["extra_headers"]["X-Hermes-Conscience-Review-Type"] == "stop"
     sent_payload = json.loads(kwargs["input"][0]["content"])

@@ -104,6 +104,25 @@ def test_codex_api_preflight_sanitizes_tuple_values_in_tool_schemas():
     ]
 
 
+def test_codex_api_preflight_preserves_structured_cache_role_metadata():
+    metadata = {
+        "hermes_cache_role": "actor",
+        "hermes_cache_scope": "session-1",
+    }
+    normalized = _preflight_codex_api_kwargs(
+        {
+            "model": "local-qwen",
+            "instructions": "test",
+            "input": [{"role": "user", "content": "hello"}],
+            "store": True,
+            "metadata": metadata,
+        }
+    )
+
+    assert normalized["metadata"] == metadata
+    assert normalized["metadata"] is not metadata
+
+
 def test_codex_api_preflight_rejects_reserved_token_in_structural_key():
     kwargs = {
         "model": "gpt-5-codex",
