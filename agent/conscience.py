@@ -1666,10 +1666,23 @@ class ConscienceMonitor:
             if "stateful_payload" not in call_kwargs:
                 raise
             retired_response_id = self.state.stateful_previous_response_id
-            self._reset_stateful_session("wrapper_memory_admission")
+            self._reset_stateful_session("wrapper_live_byte_budget_exceeded")
             stateful_payload = self.build_stateful_review_payload(
                 review_type, draft_answer
             )
+            compaction = stateful_payload.get("stateful_compaction")
+            if isinstance(compaction, dict):
+                compaction["wrapper_memory"] = {
+                    key: exc.details.get(key)
+                    for key in (
+                        "current_session_bytes",
+                        "projected_session_bytes",
+                        "conscience_session_max_bytes",
+                        "available_bytes",
+                        "required_bytes",
+                    )
+                    if exc.details.get(key) is not None
+                }
             call_kwargs["stateful_payload"] = {
                 "thread_id": f"conscience:{self.state.contract.task_id}",
                 "previous_response_id": None,

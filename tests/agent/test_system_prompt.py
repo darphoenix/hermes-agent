@@ -152,7 +152,11 @@ class TestExecutionGuidanceInjection:
         for model in ("qwen/qwen-3-max", "z-ai/glm-5.2",
                       "minimax/minimax-m2", "xiaomi/mimo-v2",
                       "mistralai/mistral-large-3"):
-            assert "Execution discipline" in self._prompt(model), model
+            prompt = self._prompt(model)
+            assert "Execution discipline" in prompt, model
+            assert "implement a minimal end-to-end slice" in prompt, model
+            assert "tolerant input boundary with explicit fallbacks" in prompt, model
+            assert "Do not repeatedly investigate the same ambiguity" in prompt, model
 
     def test_gpt_still_gets_guidance(self):
         assert "Execution discipline" in self._prompt("openai/gpt-5.5")

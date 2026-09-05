@@ -21068,6 +21068,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    cwd: str = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -21091,6 +21092,7 @@ def main(
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
         worktree: Run in an isolated git worktree (for parallel agents). Alias: -w
         w: Shorthand for --worktree
+        cwd: Absolute working directory selected by the outer CLI --in option
     
     Examples:
         python cli.py                            # Start interactive mode
@@ -21104,6 +21106,12 @@ def main(
         python cli.py -w -q "Fix issue #123"     # Single query in worktree
     """
     global _active_worktree
+
+    if cwd:
+        resolved_cwd = os.path.abspath(os.path.expanduser(cwd))
+        os.chdir(resolved_cwd)
+        os.environ["TERMINAL_CWD"] = resolved_cwd
+        CLI_CONFIG.setdefault("terminal", {})["cwd"] = resolved_cwd
 
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would

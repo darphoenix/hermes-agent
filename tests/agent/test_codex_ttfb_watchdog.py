@@ -188,6 +188,130 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     assert "codex_ttfb_kill" not in closes
 
 
+def test_codex_events_outlive_generic_nonstream_stale_timeout(tmp_path, monkeypatch):
+    """A Responses call with live SSE events is not a non-streaming stall."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    agent.provider = "custom"
+    agent.base_url = "http://127.0.0.1:1236/v1"
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *_: 0.25)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "0.3")
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        deadline = time.time() + 0.9
+        while time.time() < deadline:
+            agent._codex_stream_last_event_ts = time.time()
+            time.sleep(0.05)
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    response = h.interruptible_api_call(agent, {"model": "local-qwen", "input": "hi"})
+
+    assert response is sentinel
+    assert "stale_call_kill" not in closes
+    assert "codex_stream_idle_kill" not in closes
+
+
+def test_codex_event_idle_owns_liveness_after_first_event(tmp_path, monkeypatch):
+    """After first byte, a real SSE gap is reclaimed by the idle watchdog."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    agent.provider = "custom"
+    agent.base_url = "http://127.0.0.1:1236/v1"
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *_: 0.15)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "0.35")
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    stop = {"value": False}
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = time.time()
+        while not stop["value"]:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    try:
+        with pytest.raises(TimeoutError):
+            h.interruptible_api_call(agent, {"model": "local-qwen", "input": "hi"})
+        assert "codex_stream_idle_kill" in closes
+        assert "stale_call_kill" not in closes
+    finally:
+        stop["value"] = True
+
+
+def test_openai_codex_hard_ceiling_still_wins_while_events_flow(tmp_path, monkeypatch):
+    """The cloud absolute ceiling remains distinct from stream liveness."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *_: 60.0)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("HERMES_CODEX_HARD_TIMEOUT_SECONDS", "0.35")
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    stop = {"value": False}
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        while not stop["value"]:
+            agent._codex_stream_last_event_ts = time.time()
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    try:
+        with pytest.raises(TimeoutError):
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+        assert "stale_call_kill" in closes
+        assert "codex_stream_idle_kill" not in closes
+    finally:
+        stop["value"] = True
+
+
 
 
 
@@ -385,6 +509,5 @@ def test_large_codex_request_hard_ceiling_reclaims_silent_stall(tmp_path, monkey
         assert "with no response" in str(excinfo.value)
     finally:
         stop["flag"] = True
-
 
 

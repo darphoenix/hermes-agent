@@ -60,6 +60,12 @@ def test_conscience_status_summary_formats_latest_review(tmp_path):
     (conscience_dir / "stop-audit.json").write_text('{}')
     (conscience_dir / "task-contract.json").write_text('{"explicit_asks":[{"criterion_id":"criterion_001","source_text":"answer the question"}]}')
     (conscience_dir / "completion-ledger.json").write_text('{"criterion_001":{"status":"open"}}')
+    (conscience_dir / "active-repair-contract.json").write_text(
+        '{"id":"repair_001","status":"active","checks":['
+        '{"id":"check_docker","description":"verify Docker","status":"resolved"},'
+        '{"id":"check_browser","description":"verify in browser","status":"pending"}'
+        ']}'
+    )
 
     summary = build_conscience_status_summary(artifact_dir=str(conscience_dir))
     text = format_conscience_status_text(summary)
@@ -69,3 +75,6 @@ def test_conscience_status_summary_formats_latest_review(tmp_path):
     assert "answer the question" in text
     assert '"review_type": "stop"' in text
     assert "missing_deliverable" in text
+    assert summary["active_repair_contract"]["id"] == "repair_001"
+    assert "[resolved] verify Docker" in text
+    assert "[pending] verify in browser" in text

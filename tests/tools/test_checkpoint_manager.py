@@ -169,6 +169,16 @@ class TestTakeCheckpoint:
         (work_dir / "main.py").write_text("print('modified')\n")
         assert mgr.ensure_checkpoint(str(work_dir), "turn 2") is True
 
+    def test_container_only_workdir_skips_before_git(self, mgr, tmp_path, caplog):
+        container_workdir = tmp_path / "not-mounted" / "workdir"
+
+        with patch.object(mgr, "_take", wraps=mgr._take) as take:
+            with caplog.at_level(logging.ERROR, logger="tools.checkpoint_manager"):
+                assert mgr.ensure_checkpoint(str(container_workdir), "docker") is False
+
+        take.assert_not_called()
+        assert not caplog.records
+
 
 # =========================================================================
 # CheckpointManager — listing

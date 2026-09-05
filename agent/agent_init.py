@@ -1916,6 +1916,8 @@ def init_agent(
     agent._trace_task_id = None
     agent._trace_turn_started_at = time.time()
     agent._active_api_trace_row = None
+    agent._foreground_cache_lease_id = None
+    agent._foreground_cache_lease_emitted = False
 
     # LM Studio can either be explicitly preloaded through LM Studio's
     # management API (the historical Hermes behavior) or left to LM Studio's

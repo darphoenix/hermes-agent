@@ -38,6 +38,7 @@ def build_conscience_status_summary(conscience: dict | None = None, artifact_dir
     stop_audit = _load_json(artifact_path / "stop-audit.json", {})
     task_contract = _load_json(artifact_path / "task-contract.json", {})
     completion_ledger = _load_json(artifact_path / "completion-ledger.json", {})
+    active_repair_contract = _load_json(artifact_path / "active-repair-contract.json", {})
 
     latest_ticket = critique_tickets[-1] if critique_tickets else None
     review_type = last_review.get("review_type") or stop_audit.get("review_type")
@@ -69,6 +70,7 @@ def build_conscience_status_summary(conscience: dict | None = None, artifact_dir
         "stop_audit": stop_audit,
         "task_contract": task_contract,
         "completion_ledger": completion_ledger,
+        "active_repair_contract": active_repair_contract,
     }
 
 
@@ -80,6 +82,7 @@ def format_conscience_status_text(summary: Dict[str, Any]) -> str:
     last_review = summary.get("last_review") or {}
     verdict = (last_review.get("verdict") or {}) if isinstance(last_review.get("verdict"), dict) else {}
     open_criteria = summary.get("open_criteria") or []
+    repair_contract = summary.get("active_repair_contract") or {}
 
     lines = [
         "Conscience status",
@@ -103,6 +106,19 @@ def format_conscience_status_text(summary: Dict[str, Any]) -> str:
             lines.append(f"  - {criterion.get('source_text') or criterion}")
     else:
         lines.append("- open criteria: none")
+
+    if repair_contract:
+        lines.append(
+            f"- repair contract: {repair_contract.get('status') or 'active'} "
+            f"({repair_contract.get('id') or 'unknown'})"
+        )
+        for check in repair_contract.get("checks") or []:
+            lines.append(
+                f"  - [{check.get('status') or 'pending'}] "
+                f"{check.get('description') or check.get('id') or 'unnamed check'}"
+            )
+    else:
+        lines.append("- repair contract: none")
 
     lines.append("- exact sidecar payload:")
     lines.append(summary.get("payload_json") or "{}")

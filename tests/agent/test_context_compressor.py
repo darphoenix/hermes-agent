@@ -8,11 +8,14 @@ from unittest.mock import patch, MagicMock
 
 from agent.context_compressor import (
     ContextCompressor,
+    HISTORICAL_STATE_HEADING,
     HISTORICAL_TASK_HEADING,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
     _PRUNE_MIN_CHARS,
+    _lean_recovery_stub,
     _summarize_tool_result,
+    _tool_evidence_digest,
     _is_summary_access_or_quota_error,
 )
 from hermes_state import SessionDB
@@ -23,6 +26,148 @@ class StubProviderError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.response = response
+
+
+class TestPristineTailEvidence:
+    @staticmethod
+    def _tool_call(call_id="call-1", name="execute_code"):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": "{}"},
+            }],
+        }
+
+    def test_prune_respects_boundary_fixed_on_pristine_transcript(self, compressor):
+        decisive = "corrected jump target=0x14001801\n" + "x" * 420
+        messages = [
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old response"},
+            self._tool_call(),
+            {"role": "tool", "tool_call_id": "call-1", "content": decisive},
+            {"role": "assistant", "content": "checked result"},
+            {"role": "user", "content": "latest request"},
+            {"role": "assistant", "content": "latest response"},
+        ]
+
+        result, _ = compressor._prune_old_tool_results(
+            messages,
+            protect_tail_count=2,
+            protect_from_index=2,
+        )
+
+        assert result[3]["content"] == decisive
+
+    def test_end_to_end_tail_alignment_happens_before_pruning(self):
+        decisive = "correction: 0x14001801 enters runCommand body\n" + "z" * 410
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100_000,
+        ):
+            compressor = ContextCompressor(
+                model="test/model",
+                protect_first_n=1,
+                protect_last_n=2,
+                quiet_mode=True,
+                tail_mode="lean",
+            )
+        compressor.tail_token_budget = None
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old response"},
+            {"role": "user", "content": "inspect the binary"},
+            self._tool_call(),
+            {"role": "tool", "tool_call_id": "call-1", "content": decisive},
+            {"role": "assistant", "content": "the first patch was wrong"},
+            {"role": "user", "content": "fix it and verify"},
+            {"role": "assistant", "content": "working"},
+        ]
+
+        with patch.object(
+            compressor, "_find_tail_cut_by_tokens", return_value=4
+        ), patch.object(
+            compressor, "_generate_summary", return_value="historical summary"
+        ):
+            result = compressor.compress(messages, current_tokens=90_000)
+
+        retained = next(
+            message for message in result
+            if message.get("tool_call_id") == "call-1"
+        )
+        assert retained["content"] == decisive
+
+    def test_recovery_stub_is_content_bearing_and_verifiable(self):
+        content = "HEAD-EVIDENCE\n" + "m" * 2_000 + "\nTAIL-EVIDENCE"
+        stub = _lean_recovery_stub(
+            "terminal", content, "session-1", "call-9"
+        )
+
+        assert "HEAD-EVIDENCE" in stub
+        assert "TAIL-EVIDENCE" in stub
+        assert f"sha256={_tool_evidence_digest(content)}" in stub
+        assert "original_chars=2028" in stub
+        assert "session_search" in stub
+
+    def test_missing_protected_result_aborts_compaction(self):
+        decisive = "verified final state\n" + "v" * 420
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100_000,
+        ):
+            compressor = ContextCompressor(
+                model="test/model",
+                protect_first_n=1,
+                protect_last_n=2,
+                quiet_mode=True,
+                tail_mode="lean",
+            )
+        compressor.tail_token_budget = None
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old response"},
+            {"role": "user", "content": "inspect"},
+            self._tool_call(),
+            {"role": "tool", "tool_call_id": "call-1", "content": decisive},
+            {"role": "assistant", "content": "checked"},
+            {"role": "user", "content": "finish"},
+            {"role": "assistant", "content": "working"},
+        ]
+
+        def drop_protected_result(compacted):
+            return [
+                message for message in compacted
+                if message.get("tool_call_id") != "call-1"
+            ]
+
+        with patch.object(
+            compressor, "_find_tail_cut_by_tokens", return_value=4
+        ), patch.object(
+            compressor, "_generate_summary", return_value="historical summary"
+        ), patch.object(
+            compressor, "_sanitize_tool_pairs", side_effect=drop_protected_result
+        ):
+            result = compressor.compress(messages, current_tokens=90_000)
+
+        assert compressor._last_compress_aborted is True
+        assert compressor.compression_count == 0
+        assert any(
+            message.get("tool_call_id") == "call-1"
+            and message.get("content") == decisive
+            for message in result
+        )
+
+    def test_active_state_heading_is_always_normalized(self):
+        summary = ContextCompressor._with_summary_prefix(
+            "## Active State\nold state\n\n## Key Decisions\nkeep it"
+        )
+
+        assert HISTORICAL_STATE_HEADING in summary
+        assert "## Active State" not in summary
 
 
 @pytest.fixture()

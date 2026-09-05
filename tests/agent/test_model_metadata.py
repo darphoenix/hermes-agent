@@ -799,6 +799,42 @@ class TestFetchEndpointModelMetadata:
         not_found.close.assert_called_once()
         success.close.assert_called_once()
 
+    def test_preserves_explicit_vision_capability(self):
+        import agent.model_metadata as mm
+
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "data": [
+                {
+                    "id": "Qwen3.8-Flash-Next-Uncensored-MLX-Serve-4bit",
+                    "capabilities": ["chat", "tool_use", "vision"],
+                    "input_modalities": ["text", "image", "video"],
+                }
+            ]
+        }
+
+        with patch("agent.model_metadata.requests.get", return_value=response):
+            result = mm.fetch_endpoint_model_metadata("http://127.0.0.1:1236/v1")
+
+        assert result["Qwen3.8-Flash-Next-Uncensored-MLX-Serve-4bit"][
+            "supports_vision"
+        ] is True
+
+    def test_query_vision_matches_configured_model_path(self):
+        import agent.model_metadata as mm
+
+        model_id = "Qwen3.8-Flash-Next-Uncensored-MLX-Serve-4bit"
+        with patch(
+            "agent.model_metadata.fetch_endpoint_model_metadata",
+            return_value={model_id: {"supports_vision": True}},
+        ):
+            assert mm.query_endpoint_supports_vision(
+                f"/models/ARC4NUM/{model_id}",
+                "http://127.0.0.1:1236/v1",
+                api_key="test-key",
+            ) is True
+
 
 # =========================================================================
 # Nous Portal context-window resolution (provider="nous")

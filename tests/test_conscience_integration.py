@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.conscience import ConscienceMemoryPressureError
 from run_agent import AIAgent
 
 
@@ -24,6 +25,30 @@ def _tool_defs():
             "function": {
                 "name": "write_file",
                 "description": "write",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "description": "run a command",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "search the web",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_exec",
+                "description": "control a browser",
                 "parameters": {"type": "object", "properties": {}},
             },
         },
@@ -187,12 +212,183 @@ def test_conscience_call_llm_uses_stateful_responses_for_local_custom(tmp_path):
     assert kwargs["store"] is True
     assert kwargs["previous_response_id"] == "resp_previous"
     assert kwargs["max_output_tokens"] == 1200
+    assert kwargs["extra_headers"]["X-Hermes-Actor"] == "conscience"
+    assert kwargs["extra_headers"]["X-Hermes-Conscience-Review-Type"] == "stop"
     sent_payload = json.loads(kwargs["input"][0]["content"])
     assert sent_payload["stateful_mode"] == "delta"
     assert response.conscience_stateful_used is True
     assert response.conscience_response_id == "resp_stateful_1"
     assert response.choices[0].message.content == '{"should_intervene": false}'
     assert response.usage.prompt_tokens == 12
+
+
+def test_conscience_stateful_memory_admission_error_does_not_fall_back_to_chat(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    agent.conscience_stateful = True
+    error = RuntimeError("sidecar rejected")
+    error.status_code = 409
+    error.body = {
+        "error": {
+            "code": "state_compaction_required",
+            "details": {"available_bytes": 10, "required_bytes": 20},
+        }
+    }
+    fake_create = MagicMock(side_effect=error)
+    fake_client = SimpleNamespace(
+        base_url="http://127.0.0.1:1237/v1/",
+        responses=SimpleNamespace(create=fake_create),
+    )
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "local-model", None, None, None),
+        ),
+        patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(fake_client, "local-model"),
+        ),
+        patch("agent.auxiliary_client.call_llm") as fallback,
+        pytest.raises(ConscienceMemoryPressureError) as exc_info,
+    ):
+        agent._conscience_call_llm(
+            provider="custom:conscience-local",
+            model="local-model",
+            messages=[{"role": "system", "content": "s"}],
+            temperature=0,
+            max_tokens=1200,
+            stateful_payload={
+                "previous_response_id": "resp_previous",
+                "retire_previous_response_id": "resp_retired",
+                "instructions": "Stateful audit.",
+                "input_payload": {"review_type": "midtask", "stateful_mode": "delta"},
+            },
+        )
+
+    fallback.assert_not_called()
+    assert exc_info.value.details["available_bytes"] == 10
+    assert exc_info.value.details["code"] == "state_compaction_required"
+    kwargs = fake_create.call_args.kwargs
+    assert kwargs["extra_headers"]["X-Hermes-Retire-Response-Id"] == "resp_retired"
+
+
+def test_conscience_shared_memory_pressure_preserves_stateful_chain(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    agent.conscience_stateful = True
+    error = RuntimeError("sidecar busy")
+    error.status_code = 503
+    error.body = {
+        "error": {
+            "code": "shared_memory_pressure",
+            "details": {"available_bytes": 10, "required_bytes": 20},
+        }
+    }
+    fake_create = MagicMock(side_effect=error)
+    fake_client = SimpleNamespace(
+        base_url="http://127.0.0.1:1237/v1/",
+        responses=SimpleNamespace(create=fake_create),
+    )
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "local-model", None, None, None),
+        ),
+        patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(fake_client, "local-model"),
+        ),
+        patch("agent.auxiliary_client.call_llm") as fallback,
+        pytest.raises(RuntimeError, match="sidecar busy"),
+    ):
+        agent._conscience_call_llm(
+            provider="custom:conscience-local",
+            model="local-model",
+            messages=[{"role": "system", "content": "s"}],
+            temperature=0,
+            max_tokens=1200,
+            stateful_payload={
+                "previous_response_id": "resp_previous",
+                "instructions": "Stateful audit.",
+                "input_payload": {"review_type": "midtask", "stateful_mode": "delta"},
+            },
+        )
+
+    fallback.assert_not_called()
+
+
+def test_conscience_waits_for_main_prefill_without_losing_stateful_chain(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    agent.conscience_stateful = True
+    busy = RuntimeError("main prefill owns shared memory")
+    busy.status_code = 503
+    busy.body = {
+        "error": {
+            "code": "shared_memory_pressure",
+            "details": {
+                "reason": "main_prefill_in_progress",
+                "retry_after_seconds": 0.25,
+            },
+        }
+    }
+    completed = SimpleNamespace(
+        id="resp_after_prefill",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(
+                        type="output_text",
+                        text='{"should_intervene": false}',
+                    )
+                ],
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=24, output_tokens=8, total_tokens=32),
+    )
+    fake_create = MagicMock(side_effect=[busy, completed])
+    fake_client = SimpleNamespace(
+        base_url="http://127.0.0.1:1237/v1/",
+        responses=SimpleNamespace(create=fake_create),
+    )
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "local-model", None, None, None),
+        ),
+        patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(fake_client, "local-model"),
+        ),
+        patch("agent.auxiliary_client.call_llm") as fallback,
+        patch("run_agent.time.sleep") as sleep,
+    ):
+        response = agent._conscience_call_llm(
+            provider="custom:conscience-local",
+            model="local-model",
+            messages=[{"role": "system", "content": "s"}],
+            temperature=0,
+            max_tokens=1200,
+            stateful_payload={
+                "previous_response_id": "resp_previous",
+                "instructions": "Stateful audit.",
+                "input_payload": {
+                    "review_type": "midtask",
+                    "stateful_mode": "delta",
+                },
+            },
+        )
+
+    assert response.conscience_response_id == "resp_after_prefill"
+    assert fake_create.call_count == 2
+    first_kwargs = fake_create.call_args_list[0].kwargs
+    second_kwargs = fake_create.call_args_list[1].kwargs
+    assert first_kwargs["previous_response_id"] == "resp_previous"
+    assert second_kwargs["previous_response_id"] == "resp_previous"
+    sleep.assert_called_once_with(0.25)
+    fallback.assert_not_called()
 
 
 def test_conscience_stateful_responses_propagates_incomplete_status(tmp_path):
@@ -622,9 +818,256 @@ def test_conscience_chat_messages_emit_stop_gate_interim(tmp_path):
     assert len(actor_calls) >= 2
     repair_messages = actor_calls[1].kwargs["messages"]
     assert any(
-        "[INTERNAL CONSCIENCE STOP-GATE" in str(m.get("content", ""))
+        "[INTERNAL CONSCIENCE ACTIVE REPAIR CONTRACT" in str(m.get("content", ""))
         for m in repair_messages
         if m.get("role") == "system"
+    )
+
+
+def test_stop_repair_contract_survives_tool_results_until_all_checks_resolve(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("Everything is verified."),
+        _mock_response(
+            "Checking Docker",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _tool_call(
+                    "terminal",
+                    {"command": "docker ps"},
+                    call_id="call_docker",
+                )
+            ],
+        ),
+        _mock_response(
+            "Checking the remaining evidence",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _tool_call(
+                    "web_search",
+                    {"query": "Hermes Agent"},
+                    call_id="call_search",
+                ),
+                _tool_call(
+                    "browser_exec",
+                    {"code": "print(document.title)"},
+                    call_id="call_browser",
+                ),
+            ],
+        ),
+        _mock_response("Docker, search, and browser control are verified."),
+    ]
+
+    stop_contract = {
+        "should_intervene": True,
+        "verdict": "block_stop",
+        "reason": "The draft has no verification evidence.",
+        "evidence": ["No verification tools have run."],
+        "next_best_action": "Run Docker, search, and browser checks.",
+        "recommended_tools": ["terminal", "web_search", "browser_exec"],
+        "criterion_ids": ["criterion_001"],
+        "confidence": "high",
+        "repair_contract": {
+            "objective": "Verify every success claim with live evidence.",
+            "checks": [
+                {
+                    "id": "docker",
+                    "description": "Verify Docker services.",
+                    "expected_evidence": "docker ps succeeds",
+                    "recommended_tools": ["terminal"],
+                    "status": "pending",
+                },
+                {
+                    "id": "search",
+                    "description": "Verify local search.",
+                    "expected_evidence": "search returns clean results",
+                    "recommended_tools": ["web_search"],
+                    "status": "pending",
+                },
+                {
+                    "id": "browser",
+                    "description": "Verify browser control.",
+                    "expected_evidence": "browser returns a page title",
+                    "recommended_tools": ["browser_exec"],
+                    "status": "pending",
+                },
+            ],
+        },
+    }
+    conscience_responses = [
+        stop_contract,
+        {
+            "should_intervene": False,
+            "verdict": "observe",
+            "repair_check_updates": [
+                {
+                    "id": "docker",
+                    "status": "resolved",
+                    "outcome": "Docker services are running.",
+                    "evidence": ["docker ps exited 0"],
+                }
+            ],
+        },
+        {
+            "should_intervene": False,
+            "verdict": "observe",
+            "repair_check_updates": [
+                {
+                    "id": "search",
+                    "status": "resolved",
+                    "outcome": "Search returned results.",
+                    "evidence": ["success true"],
+                },
+                {
+                    "id": "browser",
+                    "status": "resolved",
+                    "outcome": "Browser returned Example Domain.",
+                    "evidence": ["Example Domain"],
+                },
+            ],
+        },
+        {"should_intervene": False, "verdict": "allow_stop"},
+    ]
+    conscience_side_effects = [
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))]
+        )
+        for payload in conscience_responses
+    ]
+
+    with (
+        patch.object(
+            agent,
+            "_conscience_call_llm",
+            side_effect=conscience_side_effects,
+        ),
+        patch("run_agent.handle_function_call", return_value='{"success": true}'),
+    ):
+        result = agent.run_conversation("Verify Docker, Firecrawl, and Chrome access")
+
+    assert result["final_response"] == "Docker, search, and browser control are verified."
+    assert result["api_calls"] == 4
+    assert result["conscience"]["blocked_stop_count"] == 1
+
+    actor_calls = agent.client.chat.completions.create.call_args_list
+    first_repair_messages = actor_calls[1].kwargs["messages"]
+    first_contract = "\n".join(
+        str(message.get("content") or "")
+        for message in first_repair_messages
+        if message.get("role") == "system"
+    )
+    assert "ACTIVE REPAIR CONTRACT" in first_contract
+    assert "Verify Docker services" in first_contract
+    assert "Verify local search" in first_contract
+    assert "Verify browser control" in first_contract
+
+    second_repair_messages = actor_calls[2].kwargs["messages"]
+    second_contract = "\n".join(
+        str(message.get("content") or "")
+        for message in second_repair_messages
+        if message.get("role") == "system"
+    )
+    assert "ACTIVE REPAIR CONTRACT" in second_contract
+    assert "Docker services are running" in second_contract
+    assert "Verify local search" in second_contract
+    assert "Verify browser control" in second_contract
+
+    final_messages = actor_calls[3].kwargs["messages"]
+    assert not any(
+        "ACTIVE REPAIR CONTRACT" in str(message.get("content") or "")
+        for message in final_messages
+    )
+    assert not any(
+        "ACTIVE REPAIR CONTRACT" in str(message.get("content") or "")
+        for message in result["messages"]
+    )
+    repair_contract = result["conscience"]["artifacts"]["active_repair_contract"]
+    assert repair_contract["status"] == "resolved"
+    assert all(check["status"] == "resolved" for check in repair_contract["checks"])
+
+
+def test_response_only_stop_repair_rewrites_without_tool_rounds(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("This first draft is one word over the requested limit."),
+        _mock_response("Concise final answer."),
+    ]
+    conscience_responses = [
+        {
+            "should_intervene": True,
+            "verdict": "block_stop",
+            "reason": "The draft exceeds the explicit word limit.",
+            "evidence": ["The draft has 301 words."],
+            "next_best_action": "Rewrite the final answer under the limit.",
+            "recommended_tools": [],
+            "criterion_ids": ["criterion_001"],
+            "confidence": "high",
+            "repair_contract": {
+                "objective": "Return a concise final answer.",
+                "checks": [
+                    {
+                        "id": "word_limit",
+                        "description": "Final answer is under the word limit.",
+                        "expected_evidence": "The rewritten draft is comfortably under the limit.",
+                        "recommended_tools": [],
+                        "status": "pending",
+                    }
+                ],
+            },
+        },
+        {
+            "should_intervene": False,
+            "verdict": "allow_stop",
+            "repair_check_updates": [
+                {
+                    "id": "word_limit",
+                    "status": "resolved",
+                    "outcome": "The final answer is below the limit.",
+                    "evidence": "The concise rewrite satisfies the constraint.",
+                }
+            ],
+        },
+    ]
+    conscience_side_effects = [
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))]
+        )
+        for payload in conscience_responses
+    ]
+
+    with (
+        patch.object(
+            agent,
+            "_conscience_call_llm",
+            side_effect=conscience_side_effects,
+        ),
+        patch("run_agent.handle_function_call") as handle_function_call,
+    ):
+        result = agent.run_conversation("Answer in fewer than 10 words.")
+
+    assert result["final_response"] == "Concise final answer."
+    assert result["api_calls"] == 2
+    handle_function_call.assert_not_called()
+
+    actor_calls = agent.client.chat.completions.create.call_args_list
+    assert len(actor_calls) == 2
+    repair_kwargs = actor_calls[1].kwargs
+    assert not repair_kwargs.get("tools")
+    repair_instructions = "\n".join(
+        str(message.get("content") or "")
+        for message in repair_kwargs["messages"]
+        if message.get("role") == "system"
+    )
+    assert "response-only repair" in repair_instructions
+    assert "No tools are available for this one action" in repair_instructions
+    assert "Do not write the draft to a file" in repair_instructions
+
+    repair_contract = result["conscience"]["artifacts"]["active_repair_contract"]
+    assert repair_contract["response_only"] is True
+    assert repair_contract["status"] == "resolved"
+    assert not any(
+        "ACTIVE REPAIR CONTRACT" in str(message.get("content") or "")
+        for message in result["messages"]
     )
 
 

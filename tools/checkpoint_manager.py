@@ -916,6 +916,19 @@ class CheckpointManager:
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
 
+        # Checkpoints use a host-side shadow Git worktree. Remote/container
+        # paths (for example Docker's /workdir) are valid tool paths but are
+        # not mounted into this process, so they cannot be snapshotted here.
+        # Decline before store initialization or any Git subprocess; treating
+        # this expected backend boundary as a Git failure floods long sandbox
+        # runs with misleading errors.
+        host_dir = Path(abs_dir)
+        if not host_dir.is_dir():
+            logger.debug(
+                "Checkpoint skipped: directory is not host-visible (%s)", abs_dir
+            )
+            return False
+
         if abs_dir in self._checkpointed_dirs:
             return False
 

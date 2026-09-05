@@ -1767,9 +1767,27 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             break
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
-        if _elapsed > _stale_timeout:
+        # Stale-call detector: kill the connection if no response arrives
+        # within the configured timeout. Codex Responses is internally
+        # streaming even though this helper presents a single final response
+        # to its caller. Once any SSE event has arrived, the event-idle
+        # watchdog above owns liveness; applying this wall-clock "no response"
+        # timer as well would kill healthy long generations that continue to
+        # emit progress events. The OpenAI-Codex absolute hard ceiling remains
+        # authoritative even while events flow.
+        _codex_stream_active = (
+            _codex_watchdog_enabled
+            and getattr(agent, "_codex_stream_last_event_ts", None) is not None
+        )
+        _codex_hard_ceiling_expired = (
+            _codex_watchdog_enabled
+            and _openai_codex_backend
+            and _codex_hard_timeout > 0
+            and _elapsed > _codex_hard_timeout
+        )
+        if _elapsed > _stale_timeout and (
+            not _codex_stream_active or _codex_hard_ceiling_expired
+        ):
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
             if callable(_hint_fn):

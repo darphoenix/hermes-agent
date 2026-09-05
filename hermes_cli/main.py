@@ -3122,36 +3122,41 @@ def _resolve_use_tui(args) -> bool:
         return False
 
 
+def _apply_explicit_in_dir(args) -> tuple[str | None, str | None]:
+    """Apply ``--in`` before any agent or tool initialization."""
+    in_dir = getattr(args, "in_dir", None)
+    if not in_dir:
+        return None, None
+
+    # Git Bash / MSYS hands the CLI POSIX-style paths (`--in ~` expands to
+    # `/c/Users/x` before Python ever sees it; MSYS2's path conversion is
+    # disabled for native executables). Translate the MSYS/Cygwin/WSL
+    # drive-root spellings to native Windows form first — no-op elsewhere.
+    from tools.environments.local import _msys_to_windows_path
+
+    target_dir = os.path.abspath(os.path.expanduser(_msys_to_windows_path(in_dir)))
+    if not os.path.isdir(target_dir):
+        print(f"Error: --in directory not found: {in_dir}")
+        sys.exit(1)
+    try:
+        os.chdir(target_dir)
+    except OSError as e:
+        print(f"Error: cannot enter --in directory {in_dir}: {e}")
+        sys.exit(1)
+    os.environ["TERMINAL_CWD"] = target_dir
+    args.no_restore_cwd = True
+    return in_dir, target_dir
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
 
     _apply_safe_mode(args)
 
-    # --in DIR: run in DIR. Must happen before any session resolution so the
-    # workspace-scoped "latest"/-c lookups key off DIR, and it pins the
-    # session there — an explicit --in wins over a resumed session's
-    # recorded cwd (so the restore step below is skipped).
-    in_dir = getattr(args, "in_dir", None)
-    if in_dir:
-        # Git Bash / MSYS hands the CLI POSIX-style paths (`--in ~` expands to
-        # `/c/Users/x` before Python ever sees it; MSYS2's path conversion is
-        # disabled for native executables). Translate the MSYS/Cygwin/WSL
-        # drive-root spellings to native Windows form first — no-op elsewhere.
-        from tools.environments.local import _msys_to_windows_path
-
-        _target_dir = os.path.abspath(
-            os.path.expanduser(_msys_to_windows_path(in_dir))
-        )
-        if not os.path.isdir(_target_dir):
-            print(f"Error: --in directory not found: {in_dir}")
-            sys.exit(1)
-        try:
-            os.chdir(_target_dir)
-        except OSError as e:
-            print(f"Error: cannot enter --in directory {in_dir}: {e}")
-            sys.exit(1)
-        args.no_restore_cwd = True
+    # Apply before session resolution so workspace-scoped lookups and tools
+    # agree on the explicit directory.
+    in_dir, _target_dir = _apply_explicit_in_dir(args)
 
     # --resume latest: keyword for "most recent session" — same resolution
     # as `-c` with no name (workspace-scoped MRU, then global fallback).
@@ -3402,6 +3407,13 @@ def cmd_chat(args):
     # Import and run the CLI
     from cli import main as cli_main
 
+    # cli.load_cli_config() runs at import time and normalizes the default
+    # local cwd against the launch directory. Reassert an explicit --in after
+    # that import so prompt construction and tool initialization stay pinned
+    # to the requested workspace.
+    if in_dir:
+        os.environ["TERMINAL_CWD"] = _target_dir
+
     # --query-file: read the single query from a file (or stdin via '-') so
     # callers never have to shell-quote message bodies. This is the transport
     # the Bot Mode DM protocol uses — interpolating arbitrary text into a
@@ -3448,6 +3460,8 @@ def cmd_chat(args):
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
     }
+    if in_dir:
+        kwargs["cwd"] = _target_dir
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
@@ -12666,6 +12680,8 @@ def _try_fast_chat_launch() -> bool:
 
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
+    if getattr(args, "oneshot", None):
+        _apply_explicit_in_dir(args)
     _prepare_agent_startup(args)
 
     if getattr(args, "oneshot", None):
@@ -12726,6 +12742,7 @@ def _try_termux_fast_cli_launch() -> bool:
         return True
 
     if getattr(args, "oneshot", None):
+        _apply_explicit_in_dir(args)
         _prepare_agent_startup(args)
         _confirm_startup_expensive_model_override(args)
         _run_and_exit_oneshot(
@@ -14713,6 +14730,9 @@ def main():
     # value is already False and --yolo silently does nothing.
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
+
+    if getattr(args, "oneshot", None):
+        _apply_explicit_in_dir(args)
 
     # Discover Python plugins and register shell hooks once, before any
     # command that can fire lifecycle hooks.  Both are idempotent; gated

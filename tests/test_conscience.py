@@ -674,7 +674,11 @@ def test_stateful_conscience_compacts_and_retires_parent_on_memory_pressure():
         if len(calls) == 1:
             raise ConscienceMemoryPressureError(
                 "compact",
-                details={"code": "conscience_compaction_required"},
+                details={
+                    "code": "state_compaction_required",
+                    "current_session_bytes": 3_600_000_000,
+                    "projected_session_bytes": 4_100_000_000,
+                },
             )
         return SimpleNamespace(
             response_id="resp_compact",
@@ -710,7 +714,12 @@ def test_stateful_conscience_compacts_and_retires_parent_on_memory_pressure():
     assert calls[1]["previous_response_id"] is None
     assert calls[1]["retire_previous_response_id"] == "resp_old"
     assert calls[1]["input_payload"]["stateful_mode"] == "compact_restart"
-    assert calls[1]["input_payload"]["stateful_compaction"]["reason"] == "wrapper_memory_admission"
+    assert calls[1]["input_payload"]["stateful_compaction"]["reason"] == (
+        "wrapper_live_byte_budget_exceeded"
+    )
+    assert calls[1]["input_payload"]["stateful_compaction"]["wrapper_memory"][
+        "current_session_bytes"
+    ] == 3_600_000_000
     assert monitor.state.stateful_previous_response_id == "resp_compact"
     assert monitor.state.stateful_retire_response_id is None
     assert monitor.state.llm_audits[-1]["stateful"]["memory_pressure_retry"] is True

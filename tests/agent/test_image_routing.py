@@ -17,10 +17,26 @@ from agent.image_routing import (
     build_native_content_parts,
     decide_image_input_mode,
     extract_image_refs,
+    native_image_delivery_summary,
 )
 
 
 # ─── _coerce_mode ────────────────────────────────────────────────────────────
+
+
+def test_native_image_delivery_summary_uses_structured_actor_content():
+    content = [
+        {"type": "text", "text": "Inspect both images."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        {"type": "input_image", "image_url": "https://example.test/image.png"},
+    ]
+
+    assert native_image_delivery_summary(content) == {
+        "delivered_to_actor": True,
+        "delivery": "native_multimodal_model_input",
+        "image_count": 2,
+    }
+    assert native_image_delivery_summary("plain text") is None
 
 
 class TestCoerceMode:
@@ -157,6 +173,44 @@ class TestLookupSupportsVisionOverride:
         # Caller didn't pass cfg at all — old call sites must still work.
         with patch("agent.models_dev.get_model_capabilities", return_value=None):
             assert _lookup_supports_vision("openrouter", "x", None) is None
+
+    def test_custom_endpoint_live_capability_is_authoritative(self):
+        cfg = {
+            "model": {
+                "provider": "custom",
+                "base_url": "http://127.0.0.1:1236/v1",
+                "api_key": "test-key",
+            }
+        }
+        with patch(
+            "agent.models_dev.get_model_capabilities", return_value=None
+        ), patch(
+            "agent.model_metadata.query_endpoint_supports_vision",
+            return_value=True,
+        ) as probe:
+            assert _lookup_supports_vision(
+                "custom", "/models/ARC4NUM/qwen-vision", cfg
+            ) is True
+
+        probe.assert_called_once_with(
+            "/models/ARC4NUM/qwen-vision",
+            "http://127.0.0.1:1236/v1",
+            api_key="test-key",
+        )
+
+    def test_explicit_false_override_beats_live_endpoint(self):
+        cfg = {
+            "model": {
+                "provider": "custom",
+                "base_url": "http://127.0.0.1:1236/v1",
+                "supports_vision": False,
+            }
+        }
+        with patch(
+            "agent.model_metadata.query_endpoint_supports_vision"
+        ) as probe:
+            assert _lookup_supports_vision("custom", "qwen-vision", cfg) is False
+        probe.assert_not_called()
 
 
 # ─── _should_probe_ollama_vision ──────────────────────────────────────────────

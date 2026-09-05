@@ -385,13 +385,58 @@ def active_previous_response_id(
     return None
 
 
-def should_reset_after_error(agent: Any, exc: Exception) -> bool:
-    """Reset only when the endpoint explicitly rejects the stored parent."""
+def _structured_error_payload(exc: Exception) -> Dict[str, Any]:
+    """Return the provider's structured error object when one is available."""
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return {}
+    error = body.get("error")
+    return error if isinstance(error, dict) else body
+
+
+def reset_reason_after_error(agent: Any, exc: Exception) -> Optional[str]:
+    """Explain why a stateful branch should be rebuilt from local history.
+
+    Besides an explicitly rejected parent, a compatible local server can
+    reject the accumulated server-side branch before Hermes' canonical local
+    transcript reaches its compaction threshold. Qwen-late tool schemas and
+    other request-only policy are intentionally absent from that transcript,
+    so lossless fresh-root replay is the first recovery for a structured
+    branch-capacity overflow. If the canonical transcript is itself too large,
+    the fresh retry reaches normal compression recovery on its next failure.
+    """
     if not is_enabled(agent):
-        return False
+        return None
+
+    payload = _structured_error_payload(exc)
+    error_type = str(payload.get("type") or "").strip().lower()
+    error_code = str(payload.get("code") or "").strip().lower()
+    error_reason = str(payload.get("reason") or "").strip().lower()
+    is_structured_capacity_overflow = (
+        error_reason == "memory_capacity"
+        and (
+            error_type == "context_overflow_error"
+            or error_code == "context_overflow"
+        )
+    ) or (
+        error_type == "context_overflow_error"
+        and error_code == "context_overflow"
+    )
+    if is_structured_capacity_overflow:
+        current = getattr(agent, "_responses_previous_response_id", None)
+        transient = getattr(
+            agent, "_responses_transient_repair_previous_response_id", None
+        )
+        if any(
+            isinstance(candidate, str) and candidate.strip()
+            for candidate in (current, transient)
+        ):
+            return "stateful_branch_capacity_overflow"
+        return None
+
     message = str(exc or "").lower()
     if not message:
-        return False
+        return None
     poison_markers = (
         "cache_poisoned",
         "stored_response_cache_poisoned",
@@ -399,9 +444,16 @@ def should_reset_after_error(agent: Any, exc: Exception) -> bool:
         "poisoned previous response",
     )
     if any(marker in message for marker in poison_markers):
-        return True
+        return "previous_response_id_rejected_or_poisoned"
     if "previous_response_id" in message and any(
         marker in message for marker in ("not found", "unknown", "404")
     ):
-        return True
-    return "previous response" in message and "not found" in message
+        return "previous_response_id_rejected_or_poisoned"
+    if "previous response" in message and "not found" in message:
+        return "previous_response_id_rejected_or_poisoned"
+    return None
+
+
+def should_reset_after_error(agent: Any, exc: Exception) -> bool:
+    """Return whether the next request must start a fresh Responses chain."""
+    return reset_reason_after_error(agent, exc) is not None

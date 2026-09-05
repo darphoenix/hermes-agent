@@ -24,6 +24,7 @@ import re
 import ssl
 import sys
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -1944,6 +1945,8 @@ def run_conversation(
 
     conscience_monitor = None
     if getattr(agent, "_conscience_active", False):
+        from agent.image_routing import native_image_delivery_summary
+
         conscience_monitor = ConscienceMonitor(
             agent.session_id,
             original_user_message,
@@ -1955,16 +1958,17 @@ def run_conversation(
         agent._conscience_last_review = None
         agent._conscience_last_review_payload = None
         agent._conscience_last_useful_final_response = None
-        agent._conscience_record_event(
-            TASK_START,
-            {
-                "task_id": effective_task_id,
-                "user_message": original_user_message,
-                "available_tools": sorted(agent.valid_tool_names)
-                if agent.valid_tool_names
-                else [],
-            },
-        )
+        task_start_payload = {
+            "task_id": effective_task_id,
+            "user_message": original_user_message,
+            "available_tools": sorted(agent.valid_tool_names)
+            if agent.valid_tool_names
+            else [],
+        }
+        native_image_delivery = native_image_delivery_summary(user_message)
+        if native_image_delivery is not None:
+            task_start_payload["native_image_delivery"] = native_image_delivery
+        agent._conscience_record_event(TASK_START, task_start_payload)
         agent._conscience_record_event(PLAN_SUMMARY, {"text": user_message})
     else:
         agent._conscience_current_monitor = None
@@ -2542,6 +2546,12 @@ def run_conversation(
         api_messages = agent._drop_thinking_only_and_merge_users(
             api_messages,
             drop_codex_reasoning_items=agent.api_mode != "codex_responses",
+            preserve_response_anchors=(
+                agent._responses_stateful_enabled()
+                and not bool(
+                    getattr(agent, "_responses_force_fresh_until_success", False)
+                )
+            ),
         )
 
         # Normalize message whitespace and tool-call JSON for consistent
@@ -3059,18 +3069,28 @@ def run_conversation(
                     trace_row["request_tool_count"] = len(
                         api_kwargs.get("tools") or []
                     )
-                    if (
-                        agent.api_mode in {"chat_completions", "codex_responses"}
-                        and is_local_endpoint(agent.base_url)
-                    ):
-                        api_kwargs = agent._trace_apply_headers(
-                            api_kwargs,
-                            request_id=str(trace_row.get("request_id") or ""),
-                            actor=str(
-                                trace_row.get("actor")
-                                or agent._trace_actor_name()
-                            ),
-                        )
+                # Cache ownership is a correctness contract, not telemetry:
+                # keep the Hermes identity headers on local calls even when
+                # request tracing is disabled.
+                if (
+                    agent.api_mode in {"chat_completions", "codex_responses"}
+                    and is_local_endpoint(agent.base_url)
+                ):
+                    actor = str(
+                        (trace_row or {}).get("actor")
+                        or agent._trace_actor_name()
+                    )
+                    request_id = str((trace_row or {}).get("request_id") or "")
+                    if not request_id:
+                        short_turn = str(
+                            getattr(agent, "_trace_turn_id", "") or "turn"
+                        ).replace("turn_", "")
+                        request_id = f"hrq_{short_turn}_{uuid.uuid4().hex[:6]}"
+                    api_kwargs = agent._trace_apply_headers(
+                        api_kwargs,
+                        request_id=request_id,
+                        actor=actor,
+                    )
                 # OpenRouter response caching replays identical successful
                 # responses verbatim, including empty completions. An empty-
                 # response retry must reach the provider instead of replaying
@@ -5294,26 +5314,38 @@ def run_conversation(
                         continue
 
                 # A compatible local Responses server can explicitly reject a
-                # stored parent after an interrupted or poisoned generation.
-                # Rebuild once from the full durable transcript; ordinary
-                # network failures preserve the valid parent and use the normal
-                # retry path.
+                # stored parent after an interrupted/poisoned generation, or
+                # report that its accumulated server-side branch has exceeded
+                # memory capacity before Hermes' smaller canonical transcript
+                # reaches the local compaction threshold. Rebuild once from the
+                # complete local transcript. This lossless rebase precedes
+                # lossy compression; if the fresh prompt is itself too large,
+                # its next failure follows the normal compression path.
+                _stateful_reset_reason = (
+                    agent._stateful_responses_reset_reason_after_error(api_error)
+                )
                 if (
                     not _retry.stateful_responses_fresh_retry_attempted
-                    and agent._should_reset_stateful_responses_after_error(api_error)
+                    and _stateful_reset_reason is not None
                 ):
                     _retry.stateful_responses_fresh_retry_attempted = True
                     blocked_response_id = (
                         agent._active_responses_previous_response_id(api_kwargs)
                     )
                     agent._clear_responses_stateful_chain(
-                        reason="previous_response_id_rejected_or_poisoned",
+                        reason=_stateful_reset_reason,
                         blocked_response_id=blocked_response_id,
                         force_fresh_until_success=True,
                     )
+                    if _stateful_reset_reason == "stateful_branch_capacity_overflow":
+                        agent._buffer_status(
+                            "Stateful server branch reached its memory capacity; "
+                            "rebasing losslessly from the local transcript..."
+                        )
                     logger.info(
                         "Retrying Responses request without previous_response_id "
-                        "after stateful resume rejection/poison: %s",
+                        "after %s: %s",
+                        _stateful_reset_reason,
                         blocked_response_id or "<unknown>",
                     )
                     continue
@@ -7142,6 +7174,7 @@ def run_conversation(
                             "reasoning_details",
                             "codex_reasoning_items",
                             "codex_message_items",
+                            "responses_response_id",
                         ):
                             if _key in interim_msg:
                                 if _key == "codex_reasoning_items":
@@ -8643,10 +8676,11 @@ def run_conversation(
                                 getattr(assistant_message, "responses_response_id", None),
                                 reason="conscience_stop_gate",
                             )
-                            agent._queue_conscience_internal_message(
-                                "STOP-GATE",
-                                verdict.critique_ticket,
-                            )
+                            if not agent._queue_active_conscience_repair_contract():
+                                agent._queue_conscience_internal_message(
+                                    "STOP-GATE",
+                                    verdict.critique_ticket,
+                                )
                             final_response = None
                             continue
 

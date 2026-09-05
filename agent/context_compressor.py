@@ -111,6 +111,7 @@ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
 
 
 HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
+HISTORICAL_STATE_HEADING = "## State At End Of Compacted Region"
 
 
 SUMMARY_PREFIX = (
@@ -881,17 +882,47 @@ _LEAN_RECOVERY_HEADING = "## Context Recovery"
 # tool-group alignment floor keeps ~32K of tool output alive.
 _LEAN_TAIL_KEEP_TOOL_ROUNDS = 6
 _LEAN_TAIL_DEMOTE_MIN_CHARS = 1_500
+_LEAN_EVIDENCE_HEAD_CHARS = 400
+_LEAN_EVIDENCE_TAIL_CHARS = 400
 
 
-def _lean_recovery_stub(tool_name: str, content_len: int, session_id: str) -> str:
-    """One-line replacement for a demoted tail tool result."""
+def _tool_evidence_digest(content: str) -> str:
+    """Stable digest used to prove a compacted tail result is recoverable."""
+    return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _lean_recovery_stub(
+    tool_name: str,
+    content: str,
+    session_id: str,
+    tool_call_id: str = "",
+) -> str:
+    """Bounded, content-bearing replacement for a demoted tail tool result.
+
+    A generic one-line marker only proves that *some* output existed. Keeping
+    neutral head/tail evidence plus a digest preserves corrections and final
+    status lines without asking the compaction model to infer what mattered.
+    The complete result remains available in the persisted session.
+    """
+    content_len = len(content)
+    digest = _tool_evidence_digest(content)
     hint = (
         f" Recover with session_search(query=..., session_id='{session_id}')"
         if session_id else ""
     )
+    call_part = f" tool_call_id={tool_call_id}" if tool_call_id else ""
+    if content_len <= _LEAN_EVIDENCE_HEAD_CHARS + _LEAN_EVIDENCE_TAIL_CHARS:
+        preview = content
+    else:
+        preview = (
+            content[:_LEAN_EVIDENCE_HEAD_CHARS]
+            + "\n...[middle omitted during compaction]...\n"
+            + content[-_LEAN_EVIDENCE_TAIL_CHARS:]
+        )
     return (
-        f"[{tool_name or 'tool'} output demoted at compaction — {content_len:,} "
-        f"chars preserved in session history.{hint}]"
+        f"[{tool_name or 'tool'} output compacted: original_chars={content_len} "
+        f"sha256={digest}{call_part}. Full output remains in session history."
+        f"{hint}]\n{preview}"
     )
 
 
@@ -3732,6 +3763,7 @@ class ContextCompressor(ContextEngine):
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
         min_prune_chars: int = _PRUNE_MIN_CHARS,
+        protect_from_index: int | None = None,
     ) -> tuple[List[Dict[str, Any]], int]:
         """Replace old tool result contents with informative 1-line summaries.
 
@@ -3756,6 +3788,12 @@ class ContextCompressor(ContextEngine):
         (``protect_tail_tokens * 1.5``), a pressure pass demotes large
         completed tool/file outputs *inside* that region while keeping a
         short recent floor verbatim (issue #61932).
+
+        ``protect_from_index`` is the tail boundary calculated from the
+        pristine transcript by ``compress``. Ordinary prune/truncation passes
+        must not rewrite that region before the summary window is fixed.
+        Pressure demotion may still shrink it, but only into a recoverable
+        content-bearing evidence stub.
 
         Returns (pruned_messages, pruned_count).
         """
@@ -3821,6 +3859,10 @@ class ContextCompressor(ContextEngine):
         else:
             prune_boundary = len(result) - protect_tail_count
 
+        if protect_from_index is not None:
+            protect_from_index = max(0, min(len(result), protect_from_index))
+            prune_boundary = min(prune_boundary, protect_from_index)
+
         # Pass 1: Deduplicate identical tool results.
         # When the same file is read multiple times, keep only the most recent
         # full copy and replace older duplicates with a back-reference.
@@ -3841,6 +3883,8 @@ class ContextCompressor(ContextEngine):
                 continue
             h = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:12]
             if h in content_hashes:
+                if protect_from_index is not None and i >= protect_from_index:
+                    continue
                 # This is an older duplicate — replace with back-reference
                 result[i] = {**msg, "content": "[Duplicate tool output — same content as a more recent call]"}
                 pruned += 1
@@ -3854,7 +3898,12 @@ class ContextCompressor(ContextEngine):
         # while the model still believes its instructions are in context.
         protected_skills = _collect_protected_skill_names(result, prune_boundary)
 
-        def _demote_tool_result_at(idx: int, *, spare_protected_skills: bool = True) -> bool:
+        def _demote_tool_result_at(
+            idx: int,
+            *,
+            spare_protected_skills: bool = True,
+            preserve_evidence: bool = False,
+        ) -> bool:
             """Replace a bulky tool result at ``idx`` with a 1-line summary.
 
             Returns True when the message was modified.
@@ -3892,6 +3941,11 @@ class ContextCompressor(ContextEngine):
                 return False
             call_id = msg.get("tool_call_id", "")
             tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+            if preserve_evidence and tool_name == "clarify":
+                # A clarify result is user-authored evidence. It is normally
+                # small, but even an unusually large answer must not become a
+                # head/tail excerpt that changes its meaning.
+                return False
             if spare_protected_skills and tool_name == "skill_view" and protected_skills:
                 # Just-loaded / actively-referenced skills survive verbatim
                 # (#32106). Pass-4 pressure demotion overrides this.
@@ -3902,7 +3956,15 @@ class ContextCompressor(ContextEngine):
                 _skill = _args.get("name", "") if isinstance(_args, dict) else ""
                 if isinstance(_skill, str) and _skill.lower() in protected_skills:
                     return False
-            summary = _summarize_tool_result(tool_name, tool_args, content)
+            if preserve_evidence:
+                summary = _lean_recovery_stub(
+                    tool_name,
+                    content,
+                    getattr(self, "_session_id", "") or "",
+                    str(call_id or ""),
+                )
+            else:
+                summary = _summarize_tool_result(tool_name, tool_args, content)
             result[idx] = {**msg, "content": summary}
             pruned += 1
             return True
@@ -3976,7 +4038,14 @@ class ContextCompressor(ContextEngine):
                     # Pressure passes override the just-loaded-skill guard:
                     # when the protected region itself blows the soft budget,
                     # sparing skill bodies would recreate the #61932 dead-end.
-                    if _demote_tool_result_at(i, spare_protected_skills=False):
+                    if _demote_tool_result_at(
+                        i,
+                        spare_protected_skills=False,
+                        preserve_evidence=(
+                            protect_from_index is not None
+                            and i >= protect_from_index
+                        ),
+                    ):
                         pressure_hits += 1
                     if _truncate_tool_call_args_at(i):
                         pressure_hits += 1
@@ -3996,7 +4065,14 @@ class ContextCompressor(ContextEngine):
                         if last_tool_idx is not None and i == last_tool_idx:
                             continue
                         if result[i].get("role") == "tool":
-                            if _demote_tool_result_at(i, spare_protected_skills=False):
+                            if _demote_tool_result_at(
+                                i,
+                                spare_protected_skills=False,
+                                preserve_evidence=(
+                                    protect_from_index is not None
+                                    and i >= protect_from_index
+                                ),
+                            ):
                                 pressure_hits += 1
                         elif result[i].get("role") == "assistant":
                             if _truncate_tool_call_args_at(i):
@@ -4011,7 +4087,12 @@ class ContextCompressor(ContextEngine):
                         and _protected_region_tokens() > soft_ceiling
                     ):
                         if _demote_tool_result_at(
-                            last_tool_idx, spare_protected_skills=False
+                            last_tool_idx,
+                            spare_protected_skills=False,
+                            preserve_evidence=(
+                                protect_from_index is not None
+                                and last_tool_idx >= protect_from_index
+                            ),
                         ):
                             pressure_hits += 1
                 if pressure_hits and not self.quiet_mode:
@@ -4425,8 +4506,10 @@ Recovered from a deterministic fallback because the LLM context summarizer was u
 ## Completed Actions
 {chr(10).join(completed) if completed else "None recoverable from compacted turns."}
 
-## Active State
-Unknown from deterministic fallback. Inspect current repository/session state if needed.
+{HISTORICAL_STATE_HEADING}
+Unknown at the end of the compacted region. Later retained messages and tool
+results are newer and authoritative; inspect current repository/session state
+if needed.
 
 ## Blocked
 {_bullets(blockers, limit=5)}
@@ -4473,6 +4556,17 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         Returns a new list; untouched messages are shared, demoted ones copied.
         """
         session_id = getattr(self, "_session_id", "") or ""
+        call_names: dict[str, str] = {}
+        for candidate in messages:
+            if candidate.get("role") != "assistant":
+                continue
+            for tool_call in candidate.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                call_id = str(tool_call.get("id") or tool_call.get("call_id") or "")
+                function = tool_call.get("function") or {}
+                if call_id and isinstance(function, dict):
+                    call_names[call_id] = str(function.get("name") or "tool")
         # Identify tool rounds newest-first: a round = consecutive tool rows.
         tool_indices = [
             i for i in range(len(messages) - 1, tail_start - 1, -1)
@@ -4505,7 +4599,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             if content.startswith("[") and " chars)" in content and len(content) < 400:
                 continue  # already a summary stub
             stub = _lean_recovery_stub(
-                msg.get("tool_name") or "", len(content), session_id,
+                call_names.get(str(msg.get("tool_call_id") or ""), "tool"),
+                content,
+                session_id,
+                str(msg.get("tool_call_id") or ""),
             )
             replaced = {**msg, "content": stub}
             drop_stale_api_content(replaced)
@@ -4514,6 +4611,89 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if demoted and not self.quiet_mode:
             logger.info("Lean tail: demoted %d stale tool result(s)", demoted)
         return result
+
+    def _collect_pristine_tail_evidence(
+        self,
+        messages: List[Dict[str, Any]],
+        tail_start: int,
+    ) -> dict[str, tuple[str, str]]:
+        """Capture text tool results that the pristine tail promises to retain."""
+        call_names: dict[str, str] = {}
+        for message in messages:
+            if message.get("role") != "assistant":
+                continue
+            for tool_call in message.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function") or {}
+                name = (
+                    str(function.get("name") or "tool")
+                    if isinstance(function, dict)
+                    else "tool"
+                )
+                for call_id in self._tool_call_id_variants(tool_call):
+                    call_names[str(call_id)] = name
+
+        evidence: dict[str, tuple[str, str]] = {}
+        for message in messages[max(0, tail_start):]:
+            if message.get("role") != "tool":
+                continue
+            call_id = str(message.get("tool_call_id") or "")
+            content = message.get("content")
+            if call_id in call_names and isinstance(content, str):
+                evidence[call_id] = (call_names[call_id], content)
+        return evidence
+
+    def _ensure_pristine_tail_evidence(
+        self,
+        messages: List[Dict[str, Any]],
+        evidence: dict[str, tuple[str, str]],
+    ) -> tuple[List[Dict[str, Any]], list[str], int]:
+        """Enforce exact-or-recoverable coverage for pristine-tail tool results.
+
+        Moderate results are restored verbatim. Large results may stay compact,
+        but their stub must carry the original digest and neutral head/tail
+        evidence. A missing result is reported to the caller, which aborts the
+        compaction rather than committing an incomplete handoff.
+        """
+        if not evidence:
+            return messages, [], 0
+
+        result = list(messages)
+        found: set[str] = set()
+        repaired = 0
+        session_id = getattr(self, "_session_id", "") or ""
+        for idx, message in enumerate(messages):
+            if message.get("role") != "tool":
+                continue
+            call_id = str(message.get("tool_call_id") or "")
+            if call_id not in evidence:
+                continue
+            found.add(call_id)
+            tool_name, original = evidence[call_id]
+            current = message.get("content")
+            digest_marker = f"sha256={_tool_evidence_digest(original)}"
+            if current == original or (
+                isinstance(current, str) and digest_marker in current
+            ):
+                continue
+
+            if tool_name == "clarify" or len(original) < _LEAN_TAIL_DEMOTE_MIN_CHARS:
+                replacement = original
+            else:
+                replacement = _lean_recovery_stub(
+                    tool_name,
+                    original,
+                    session_id,
+                    call_id,
+                )
+            replaced = {**message, "content": replacement}
+            drop_stale_api_content(replaced)
+            result[idx] = replaced
+            repaired += 1
+
+        missing = sorted(set(evidence) - found)
+        return result, missing, repaired
 
     def _build_chunk_digests(self, turns: List[Dict[str, Any]]) -> str:
         """Map-reduce the compacted region into identifier-preserving digests.
@@ -4887,13 +5067,15 @@ Example:
 3. TEST `pytest tests/` — 3/50 failed: test_parse, test_validate, test_edge [tool: terminal]
 Be specific with file paths, commands, line numbers, and results.]
 
-## Active State
-[Current working state — include:
+{HISTORICAL_STATE_HEADING}
+[State as known at the END OF THE COMPACTED REGION — include:
 - Working directory and branch (if applicable)
 - Modified/created files with brief note on each
 - Test status (X/Y passing)
 - Any running processes or servers
-- Environment details that matter]
+- Environment details that matter.
+Later retained messages and tool results are newer and authoritative if they
+conflict with this historical state.]
 
 ## Blocked
 [Any blockers, errors, or issues not yet resolved. Include exact error messages.]
@@ -4946,7 +5128,7 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}{_memory_section}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "{HISTORICAL_STATE_HEADING}" to describe state at the end of the compacted region, never as a claim about newer retained turns. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
 
 {_template_sections}"""
         else:
@@ -5076,6 +5258,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = _redact_compaction_text(content.strip())
+            summary = self._normalize_historical_state_heading(summary)
             # P2 ghost-skill defense (#32106): deterministically restore any
             # [SKILL_PRUNED: ...] marker the summarizer paraphrased away.
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
@@ -5319,8 +5502,21 @@ This compaction should PRIORITISE preserving all information related to the focu
     @classmethod
     def _with_summary_prefix(cls, summary: str) -> str:
         """Normalize summary text to the current compaction handoff format."""
-        text = cls._strip_summary_prefix(summary)
+        text = cls._normalize_historical_state_heading(
+            cls._strip_summary_prefix(summary)
+        )
         return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
+
+    @staticmethod
+    def _normalize_historical_state_heading(summary: str) -> str:
+        """Prevent generated or inherited summaries from claiming live state."""
+        if not isinstance(summary, str):
+            return summary
+        return re.sub(
+            r"(?m)^##\s+Active State\s*$",
+            HISTORICAL_STATE_HEADING,
+            summary,
+        )
 
     @staticmethod
     def _starts_with_summary_prefix(text: str) -> bool:
@@ -7286,9 +7482,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
-          1. Prune old tool results (cheap pre-pass, no LLM call)
-          2. Protect head messages (system prompt + first exchange)
-          3. Find tail boundary by token budget (~20K tokens of recent context)
+          1. Fix the protected tail boundary on the pristine transcript
+          2. Prune old tool results outside that boundary (cheap, no LLM call)
+          3. Protect head messages (system prompt + first exchange)
           4. Summarize middle turns with structured LLM prompt (skipped
              pre-LLM when the middle is below
              ``_FEASIBILITY_SKIP_MIDDLE_FRACTION`` of the threshold after a
@@ -7371,27 +7567,9 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
-        # Lean mode: snapshot pristine tool contents BEFORE Phase-1 pruning so
-        # the chunk digests summarize what actually happened, not the pruned
-        # stubs (#compaction-v2). Bounded per entry to keep memory sane.
-        if getattr(self, "tail_mode", "lean") == "lean":
-            self._lean_pristine_tools = {
-                str(m.get("tool_call_id") or ""): (m.get("content") or "")[:80_000]
-                for m in messages
-                if m.get("role") == "tool" and isinstance(m.get("content"), str)
-                and len(m.get("content") or "") > 400
-            }
-        else:
-            self._lean_pristine_tools = {}
-
-        # Phase 1: Prune old tool results (cheap, no LLM call)
-        messages, pruned_count = self._prune_old_tool_results(
-            messages, protect_tail_count=self.protect_last_n,
-            protect_tail_tokens=self.tail_token_budget,
-        )
-        if pruned_count and not self.quiet_mode:
-            logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
-
+        # Blank transport echoes have no evidence value and would shift every
+        # boundary index if removed after the pristine-tail snapshot. Retire
+        # them first, then calculate every compaction boundary exactly once.
         latest_actionable_idx = self._find_last_user_message_idx(messages, 0)
         blank_echo_indices = self._blank_echo_indices_after(
             messages, latest_actionable_idx
@@ -7405,11 +7583,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             n_messages = len(messages)
         latest_actionable_idx = self._find_last_user_message_idx(messages, 0)
 
-        # Phase 2: Determine boundaries
+        # Phase 1: determine the head and tail on pristine content. The old
+        # ordering pruned results first and only then aligned the tail to tool
+        # groups/user turns, allowing a result to become a generic stub before
+        # the later boundary declared it protected.
         compress_start = self._protect_head_size(messages)
         compress_start = self._align_boundary_forward(messages, compress_start)
-
-        # Use token-budget tail protection instead of fixed message count
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
 
         # A double role collision can merge the summary into the first tail
@@ -7425,6 +7604,32 @@ This compaction should PRIORITISE preserving all information related to the focu
                 bridge_idx = -1
             if bridge_idx > compress_start:
                 compress_end = bridge_idx
+
+        pristine_tail_evidence = self._collect_pristine_tail_evidence(
+            messages, compress_end
+        )
+
+        # Lean mode: snapshot pristine tool contents BEFORE pruning so the
+        # chunk digests summarize what actually happened, not the pruned stubs
+        # (#compaction-v2). Bounded per entry to keep memory sane.
+        if getattr(self, "tail_mode", "lean") == "lean":
+            self._lean_pristine_tools = {
+                str(m.get("tool_call_id") or ""): (m.get("content") or "")[:80_000]
+                for m in messages
+                if m.get("role") == "tool" and isinstance(m.get("content"), str)
+                and len(m.get("content") or "") > 400
+            }
+        else:
+            self._lean_pristine_tools = {}
+
+        # Phase 2: prune old tool results outside the already-fixed tail.
+        messages, pruned_count = self._prune_old_tool_results(
+            messages, protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=self.tail_token_budget,
+            protect_from_index=compress_end,
+        )
+        if pruned_count and not self.quiet_mode:
+            logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
 
         if compress_start >= compress_end:
             self._record_compression_regions(
@@ -8036,9 +8241,38 @@ This compaction should PRIORITISE preserving all information related to the focu
                 _merge_summary_into_tail = False
             compressed.append(msg)
 
-        self.compression_count += 1
-
         compressed = self._sanitize_tool_pairs(compressed)
+
+        compressed, missing_evidence, repaired_evidence = (
+            self._ensure_pristine_tail_evidence(
+                compressed,
+                pristine_tail_evidence,
+            )
+        )
+        if repaired_evidence and not self.quiet_mode:
+            logger.warning(
+                "Compaction evidence gate repaired %d protected tail result(s)",
+                repaired_evidence,
+            )
+        if missing_evidence:
+            # Sanitization should never remove a complete protected tool group.
+            # If it does, preserving the Phase-2-pruned transcript is safer than
+            # committing a summary that silently loses recent evidence.
+            self._previous_summary = _previous_summary_before_scan
+            self._summary_has_user_turn = _summary_has_user_turn_before_scan
+            self._last_summary_dropped_count = 0
+            self._last_summary_fallback_used = False
+            self._last_compress_aborted = True
+            telemetry["failure_class"] = "protected_tail_evidence_missing"
+            logger.error(
+                "Compaction aborted: %d protected tail tool result(s) vanished "
+                "during assembly/sanitization (ids=%s)",
+                len(missing_evidence),
+                ",".join(missing_evidence[:8]),
+            )
+            return messages
+
+        self.compression_count += 1
 
         # Replace image parts in all compressed messages before the newest
         # image-bearing user turn with a short text placeholder. Without

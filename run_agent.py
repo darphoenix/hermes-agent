@@ -168,6 +168,7 @@ from agent.conscience import (
     TOOL_POLICY_CONFLICT,
     TOOL_PROGRESS,
     TOOL_RESULT,
+    ConscienceMemoryPressureError,
     ConscienceMonitor,
     ConscienceVerdict,
     CritiqueTicket,
@@ -236,6 +237,77 @@ from agent.tool_dispatch_helpers import (
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
+
+
+def _conscience_memory_admission_details(exc: BaseException) -> dict[str, Any] | None:
+    codes = {
+        "shared_memory_pressure",
+        "state_compaction_required",
+        "conscience_compaction_required",
+    }
+    payloads: list[Any] = [getattr(exc, "body", None)]
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            payloads.append(response.json())
+        except Exception:
+            pass
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+        code = str(error.get("code") or "").strip().lower()
+        if code in codes:
+            details = error.get("details")
+            normalized = dict(details) if isinstance(details, dict) else {}
+            normalized["code"] = code
+            return normalized
+    return None
+
+
+def _conscience_should_wait_for_main(details: dict[str, Any] | None) -> bool:
+    if not isinstance(details, dict):
+        return False
+    if str(details.get("code") or "").strip().lower() != "shared_memory_pressure":
+        return False
+    return str(details.get("reason") or "").strip().lower() in {
+        "main_prefill_in_progress",
+        "main_request_in_progress",
+        "main_coordinator_unavailable",
+        "main_phase_unavailable",
+    }
+
+
+def _conscience_stateful_chat_fallback_allowed(exc: BaseException) -> bool:
+    """Only protocol incompatibility may turn a stateful audit into chat."""
+    payloads: list[Any] = [getattr(exc, "body", None)]
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            payloads.append(response.json())
+        except Exception:
+            pass
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+        code = str(error.get("code") or "").strip().lower()
+        if code in {
+            "endpoint_not_found",
+            "not_implemented",
+            "unsupported_api",
+            "unsupported_endpoint",
+        }:
+            return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    try:
+        if int(status_code) in {404, 405, 501}:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return isinstance(exc, AttributeError) and "responses" in str(exc).lower()
 
 
 # Internal flags that mark a message as ephemeral empty-response/prefill
@@ -5077,12 +5149,14 @@ class AIAgent:
         messages: List[Dict[str, Any]],
         *,
         drop_codex_reasoning_items: bool = True,
+        preserve_response_anchors: bool = False,
     ) -> List[Dict[str, Any]]:
         """Forwarder — see ``agent.agent_runtime_helpers.drop_thinking_only_and_merge_users``."""
         from agent.agent_runtime_helpers import drop_thinking_only_and_merge_users
         return drop_thinking_only_and_merge_users(
             messages,
             drop_codex_reasoning_items=drop_codex_reasoning_items,
+            preserve_response_anchors=preserve_response_anchors,
         )
 
     @staticmethod
@@ -7731,6 +7805,13 @@ class AIAgent:
 
         return should_reset_after_error(self, exc)
 
+    def _stateful_responses_reset_reason_after_error(
+        self, exc: Exception
+    ) -> Optional[str]:
+        from agent.stateful_responses import reset_reason_after_error
+
+        return reset_reason_after_error(self, exc)
+
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
 
@@ -8579,8 +8660,61 @@ class AIAgent:
         headers.setdefault("X-Hermes-Turn-Id", str(getattr(self, "_trace_turn_id", "") or ""))
         headers.setdefault("X-Hermes-Session-Id", str(self.session_id or ""))
         headers.setdefault("X-Hermes-Task-Id", str(getattr(self, "_trace_task_id", "") or getattr(self, "_current_task_id", "") or ""))
+        cache_lease = str(getattr(self, "_foreground_cache_lease_id", "") or "")
+        if (
+            actor == "main"
+            and cache_lease
+            and getattr(self, "api_mode", "") == "codex_responses"
+            and is_local_endpoint(self.base_url)
+        ):
+            headers.setdefault("X-Hermes-Cache-Lease", cache_lease)
+            self._foreground_cache_lease_emitted = True
         api_kwargs["extra_headers"] = headers
         return api_kwargs
+
+    def _release_foreground_cache_lease(self) -> bool:
+        """Best-effort release of this outer turn's local cache lease."""
+        lease = str(getattr(self, "_foreground_cache_lease_id", "") or "")
+        emitted = bool(getattr(self, "_foreground_cache_lease_emitted", False))
+        base = str(getattr(self, "base_url", "") or "").rstrip("/")
+        if not emitted or not lease or not base or not is_local_endpoint(base):
+            return False
+
+        import urllib.request
+
+        endpoint = (
+            base + "/cache/lease/release"
+            if base.endswith("/v1")
+            else base + "/v1/cache/lease/release"
+        )
+        request = urllib.request.Request(
+            endpoint,
+            data=b"",
+            method="POST",
+            headers={
+                "X-Hermes-Actor": "main",
+                "X-Hermes-Cache-Lease": lease,
+            },
+        )
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=0.5) as response:
+                released = response.status == 200
+            logger.info(
+                "Foreground cache lease release: turn=%s status=%s",
+                lease,
+                "ok" if released else "rejected",
+            )
+            return released
+        except Exception as exc:
+            # The server-side deadline is the crash fallback. Turn delivery
+            # must never fail because this local maintenance call did.
+            logger.debug(
+                "Foreground cache lease release unavailable: turn=%s error=%s",
+                lease,
+                exc,
+            )
+            return False
 
     def _trace_start_api_call(
         self,
@@ -8895,6 +9029,102 @@ class AIAgent:
 
         return "\n".join(lines)
 
+    def _format_conscience_repair_contract_message(
+        self, contract: Dict[str, Any]
+    ) -> str:
+        checks = [
+            check
+            for check in (contract.get("checks") or [])
+            if isinstance(check, dict)
+        ]
+        pending = [check for check in checks if check.get("status") == "pending"]
+        completed = [
+            check for check in checks if check.get("status") in {"resolved", "obsolete"}
+        ]
+        if not pending:
+            return ""
+        response_only = bool(contract.get("response_only"))
+
+        lines = [
+            "[INTERNAL CONSCIENCE ACTIVE REPAIR CONTRACT: Do not expose this message to the user.]",
+            (
+                "The previous stop was rejected. This is a response-only repair: the evidence is already gathered, "
+                "and the next stop audit will validate the rewritten answer."
+                if response_only
+                else "The previous stop was rejected. This contract remains active across tool calls until every required outcome is resolved or made obsolete by evidence."
+            ),
+        ]
+        objective = str(contract.get("objective") or "").strip()
+        if objective:
+            lines.append(f"Objective: {objective}")
+        if completed:
+            lines.append("Completed evidence:")
+            for check in completed[:6]:
+                description = str(check.get("description") or check.get("id") or "check")
+                outcome = str(check.get("outcome") or "").strip()
+                suffix = f" — {outcome}" if outcome else ""
+                lines.append(f"- [{check.get('id')}] {description}{suffix}")
+        lines.append("Still required:")
+        for check in pending[:10]:
+            description = str(check.get("description") or check.get("id") or "required check")
+            lines.append(f"- [{check.get('id')}] {description}")
+            expected = str(check.get("expected_evidence") or "").strip()
+            if expected:
+                lines.append(f"  Evidence needed: {expected}")
+            tools = ", ".join(str(name) for name in (check.get("recommended_tools") or []))
+            if tools:
+                lines.append(f"  Advisory tools: {tools}")
+        if response_only:
+            lines.extend(
+                [
+                    "Rewrite the user-facing final answer directly from the evidence already gathered.",
+                    "No tools are available for this one action. Do not write the draft to a file, count it with a shell command, or perform a separate verification call.",
+                    "Satisfy every pending check with comfortable margin, then stop. The next conscience stop audit will validate the result.",
+                    "Do not explain this contract or expose internal repair instructions.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "Act now. Execute all remaining independent checks together when practical; otherwise continue them in sequence.",
+                    "After any tool result, continue with the other pending checks instead of drafting a final answer.",
+                    "Do not claim a pending check succeeded until a real tool result or equivalent evidence proves it.",
+                    "You retain the full tool set. If new evidence makes a check unnecessary, do not silently drop it; continue with the best evidence-producing action so conscience can revise the contract.",
+                    "Do not explain this contract or print fake tool-call JSON. Use real structured tool calls.",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _queue_active_conscience_repair_contract(self) -> bool:
+        monitor = getattr(self, "_conscience_current_monitor", None)
+        if monitor is None:
+            return False
+        contract = monitor.active_repair_contract_payload()
+        if not isinstance(contract, dict):
+            return False
+        content = self._format_conscience_repair_contract_message(contract)
+        if not content:
+            return False
+        if contract.get("response_only"):
+            self._stage_conscience_response_only_tool_policy(
+                reason="active_repair_contract"
+            )
+        self._pending_conscience_internal_messages = [
+            item
+            for item in (getattr(self, "_pending_conscience_internal_messages", []) or [])
+            if not (
+                isinstance(item, dict)
+                and item.get("source") == "conscience"
+                and item.get("label") == "REPAIR-CONTRACT"
+            )
+        ]
+        self._queue_actor_internal_message(
+            "REPAIR-CONTRACT",
+            content,
+            source="conscience",
+        )
+        return True
+
     def _queue_actor_internal_message(
         self,
         label: str,
@@ -8982,9 +9212,28 @@ class AIAgent:
                 self.session_id or "-",
             )
 
+    def _stage_conscience_response_only_tool_policy(self, *, reason: str) -> None:
+        """Disable tools for exactly one actor action that must only synthesize."""
+        self._conscience_pending_tool_policy = {
+            "mode": "allowlist",
+            "tools": [],
+            "response_only": True,
+            "reason": reason,
+        }
+        logger.info(
+            "Staged one-action response-only conscience policy (reason=%s session=%s)",
+            reason,
+            self.session_id or "-",
+        )
+
     def _prepare_conscience_tool_policy(self, ticket: CritiqueTicket) -> None:
         """Stage an explicit strict policy for exactly one actor action."""
         self._conscience_pending_tool_policy = None
+        if getattr(ticket, "recommended_tools", None) == []:
+            self._stage_conscience_response_only_tool_policy(
+                reason="recommended_tools_empty"
+            )
+            return
         if not self.tools or not self.valid_tool_names:
             return
 
@@ -9043,6 +9292,17 @@ class AIAgent:
     def _apply_conscience_repair_overrides(self, api_kwargs: Dict[str, Any]) -> Dict[str, Any]:
         if not getattr(self, "_conscience_repair_override_active", False):
             return api_kwargs
+        active_policy = getattr(self, "_conscience_inflight_tool_policy", None)
+        response_only = (
+            isinstance(active_policy, dict)
+            and active_policy.get("mode") == "allowlist"
+            and active_policy.get("tools") == []
+            and bool(active_policy.get("response_only"))
+        )
+        if response_only and self.api_mode == "codex_responses":
+            api_kwargs["tools"] = []
+            api_kwargs["tool_choice"] = "none"
+            api_kwargs["parallel_tool_calls"] = False
         if self.provider != "custom":
             return api_kwargs
         if self.conscience_repair_temperature is not None:
@@ -9191,6 +9451,8 @@ class AIAgent:
 
         trace_row = None
         trace_started = time.perf_counter()
+        coordination_retry_count = 0
+        coordination_wait_seconds = 0.0
         if self._request_trace_enabled():
             short_turn = str(getattr(self, "_trace_turn_id", "") or "turn").replace("turn_", "")
             trace_row = self._trace_base_event(
@@ -9251,12 +9513,29 @@ class AIAgent:
                         request_kwargs["temperature"] = temperature
                     if isinstance(previous_response_id, str) and previous_response_id.strip():
                         request_kwargs["previous_response_id"] = previous_response_id.strip()
-                    if trace_row is not None:
-                        request_kwargs = self._trace_apply_headers(
-                            request_kwargs,
-                            request_id=str(trace_row.get("request_id") or ""),
-                            actor="conscience",
-                        )
+                    extra_headers = dict(request_kwargs.get("extra_headers") or {})
+                    review_type = (
+                        str((input_payload or {}).get("review_type") or "")
+                        if isinstance(input_payload, dict)
+                        else ""
+                    )
+                    if review_type:
+                        extra_headers["X-Hermes-Conscience-Review-Type"] = review_type
+                    retire_response_id = str(
+                        stateful_payload.get("retire_previous_response_id") or ""
+                    ).strip()
+                    if retire_response_id:
+                        extra_headers["X-Hermes-Retire-Response-Id"] = retire_response_id
+                    if extra_headers:
+                        request_kwargs["extra_headers"] = extra_headers
+                    request_kwargs = self._trace_apply_headers(
+                        request_kwargs,
+                        request_id=str(
+                            (trace_row or {}).get("request_id")
+                            or f"hrq_conscience_{uuid.uuid4().hex[:10]}"
+                        ),
+                        actor="conscience",
+                    )
                     logger.info(
                         "Conscience stateful audit call: provider=%s model=%s prev=%s mode=%s",
                         provider,
@@ -9264,7 +9543,32 @@ class AIAgent:
                         previous_response_id or None,
                         (input_payload or {}).get("stateful_mode") if isinstance(input_payload, dict) else None,
                     )
-                    response = real_client.responses.create(**request_kwargs)
+                    while True:
+                        try:
+                            response = real_client.responses.create(**request_kwargs)
+                            break
+                        except Exception as create_exc:
+                            admission = _conscience_memory_admission_details(create_exc)
+                            if not _conscience_should_wait_for_main(admission):
+                                raise
+                            retry_after = min(
+                                5.0,
+                                max(
+                                    0.1,
+                                    float((admission or {}).get("retry_after_seconds") or 1.0),
+                                ),
+                            )
+                            coordination_retry_count += 1
+                            coordination_wait_seconds += retry_after
+                            if coordination_retry_count == 1 or coordination_retry_count % 30 == 0:
+                                logger.info(
+                                    "Conscience waiting for main inference phase: reason=%s retries=%d waited_seconds=%.1f prev=%s",
+                                    (admission or {}).get("reason"),
+                                    coordination_retry_count,
+                                    coordination_wait_seconds,
+                                    previous_response_id or None,
+                                )
+                            time.sleep(retry_after)
                     response_id = str(getattr(response, "id", "") or "").strip() or None
                     response_status = str(getattr(response, "status", "") or "").strip()
                     response_finish_reason = "length" if response_status == "incomplete" else "stop"
@@ -9280,6 +9584,8 @@ class AIAgent:
                             "previous_response_id": previous_response_id or "",
                             "responses_status": response_status,
                             "finish_reason": response_finish_reason,
+                            "coordination_retries": coordination_retry_count,
+                            "coordination_wait_seconds": round(coordination_wait_seconds, 3),
                         }
                         if usage is not None:
                             trace_fields.update({
@@ -9308,18 +9614,43 @@ class AIAgent:
                         conscience_response_status=response_status,
                     )
             except Exception as exc:
+                memory_admission = _conscience_memory_admission_details(exc)
                 if trace_row is not None:
                     self._trace_finish_api_call(
                         trace_row,
-                        status="error",
+                        status="memory_pressure" if memory_admission else "error",
                         api_duration_s=round(time.perf_counter() - trace_started, 6),
                         error_type=type(exc).__name__,
                         error=str(exc)[:500],
                         stateful_used=False,
+                        memory_admission=memory_admission,
+                        coordination_retries=coordination_retry_count,
+                        coordination_wait_seconds=round(coordination_wait_seconds, 3),
                     )
                     trace_row = None
+                memory_code = str((memory_admission or {}).get("code") or "")
+                if memory_code in {
+                    "state_compaction_required",
+                    "conscience_compaction_required",
+                }:
+                    raise ConscienceMemoryPressureError(
+                        "Local conscience sidecar requested memory compaction",
+                        details=memory_admission,
+                    ) from exc
+                if memory_admission is not None:
+                    logger.warning(
+                        "Conscience stateful audit rejected by shared memory pressure; preserving its live chain: %s",
+                        memory_admission,
+                    )
+                    raise
+                if not _conscience_stateful_chat_fallback_allowed(exc):
+                    logger.warning(
+                        "Conscience stateful audit failed without a protocol-compatible fallback: %s",
+                        exc,
+                    )
+                    raise
                 logger.warning(
-                    "Conscience stateful audit failed; falling back to stateless chat audit: %s",
+                    "Conscience Responses endpoint unavailable; falling back to stateless chat audit: %s",
                     exc,
                 )
 
@@ -9341,6 +9672,16 @@ class AIAgent:
             )
             fallback_started = time.perf_counter()
         try:
+            short_turn = str(
+                getattr(self, "_trace_turn_id", "") or "turn"
+            ).replace("turn_", "")
+            fallback_request_id = str(
+                (fallback_trace_row or {}).get("request_id")
+                or f"hrq_{short_turn}_conscience_{uuid.uuid4().hex[:6]}"
+            )
+            fallback_headers = self._trace_apply_headers(
+                {}, request_id=fallback_request_id, actor="conscience"
+            ).get("extra_headers")
             response = _call_llm(
                 provider=provider,
                 model=model,
@@ -9349,6 +9690,7 @@ class AIAgent:
                 max_tokens=max_tokens,
                 timeout="none",
                 extra_body=extra_body,
+                extra_headers=fallback_headers,
             )
             if fallback_trace_row is not None:
                 usage = getattr(response, "usage", None)
@@ -9388,6 +9730,10 @@ class AIAgent:
             atomic_json_write(conscience_dir / "completion-ledger.json", artifacts.get("completion_ledger", {}))
             atomic_json_write(conscience_dir / "conscience-events.json", artifacts.get("events", []))
             atomic_json_write(conscience_dir / "intervention-ledger.json", artifacts.get("intervention_ledger", []))
+            atomic_json_write(
+                conscience_dir / "active-repair-contract.json",
+                artifacts.get("active_repair_contract") or {},
+            )
             atomic_json_write(conscience_dir / "llm-audits.json", artifacts.get("llm_audits", []))
             tickets = list(artifacts.get("critique_tickets") or [])
             if self._conscience_last_ticket:
@@ -9416,6 +9762,7 @@ class AIAgent:
             )
         except Exception as exc:
             logger.debug("Mid-task conscience audit failed: %s", exc)
+            self._queue_active_conscience_repair_contract()
             return False
         latest_audit = monitor.state.llm_audits[-1] if getattr(monitor.state, "llm_audits", None) else None
         self._conscience_last_review = {
@@ -9433,6 +9780,7 @@ class AIAgent:
         }
         self._conscience_last_review_payload = latest_audit.get("payload") if isinstance(latest_audit, dict) else None
         if not verdict.should_intervene or verdict.critique_ticket is None:
+            self._queue_active_conscience_repair_contract()
             return False
 
         self._conscience_last_ticket = verdict.critique_ticket
@@ -9452,6 +9800,7 @@ class AIAgent:
         if self.conscience_mode in {"enforce_stop_gate", "enforce_observe"}:
             self._prepare_conscience_tool_policy(verdict.critique_ticket)
             self._queue_conscience_internal_message("MIDTASK", verdict.critique_ticket)
+            self._queue_active_conscience_repair_contract()
         return True
 
     def _conscience_review_running_tool(
@@ -10020,6 +10369,17 @@ class AIAgent:
                     # the inner stop and this join. Must run AFTER join so a
                     # late interrupt does not survive into the next turn.
                     _clear_durable_turn_lease_interrupt()
+                    try:
+                        try:
+                            self._release_foreground_cache_lease()
+                        except Exception:
+                            logger.debug(
+                                "Foreground cache lease finalizer failed",
+                                exc_info=True,
+                            )
+                    finally:
+                        self._foreground_cache_lease_id = None
+                        self._foreground_cache_lease_emitted = False
                     if durable_turn_lease is not None:
                         try:
                             _turn_db.release_session_turn_lease(

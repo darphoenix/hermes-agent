@@ -217,6 +217,84 @@ def test_stateful_custom_poisoned_parent_forces_full_prompt_retry(monkeypatch):
     assert len(retry_kwargs["input"]) == 3
 
 
+def test_stateful_capacity_overflow_rebases_before_compression(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._disable_streaming = True
+    agent._responses_previous_response_id = "resp_large_branch"
+    history = [
+        {"role": "user", "content": "First"},
+        {
+            "role": "assistant",
+            "content": "Ack",
+            "responses_response_id": "resp_large_branch",
+        },
+    ]
+    capacity_error = RuntimeError("Error code: 400")
+    capacity_error.status_code = 400
+    capacity_error.body = {
+        "error": {
+            "message": "Admission refused",
+            "type": "context_overflow_error",
+            "code": "context_overflow",
+            "reason": "memory_capacity",
+            "prompt_tokens": 162_140,
+            "required_memory_bytes": 12_760_227_840,
+            "available_memory_bytes": 12_352_421_900,
+            "retryable": True,
+        }
+    }
+    recovered = _codex_message_response("Recovered")
+    recovered.id = "resp_rebased"
+    sent_kwargs = []
+
+    def _next_response(api_kwargs):
+        sent_kwargs.append(api_kwargs)
+        if len(sent_kwargs) == 1:
+            raise capacity_error
+        return recovered
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _next_response)
+    monkeypatch.setattr(
+        agent,
+        "_compress_context",
+        lambda *_args, **_kwargs: pytest.fail(
+            "lossless stateful rebase must run before compression"
+        ),
+    )
+
+    result = agent.run_conversation(
+        "Second",
+        conversation_history=history,
+    )
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Recovered"
+    assert len(sent_kwargs) == 2
+    assert sent_kwargs[0]["previous_response_id"] == "resp_large_branch"
+    assert len(sent_kwargs[0]["input"]) == 1
+    assert "previous_response_id" not in sent_kwargs[1]
+    assert [item["role"] for item in sent_kwargs[1]["input"]] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert agent._responses_previous_response_id == "resp_rebased"
+
+
+def test_stateful_capacity_overflow_without_parent_uses_normal_recovery(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    capacity_error = RuntimeError("Error code: 400")
+    capacity_error.body = {
+        "error": {
+            "type": "context_overflow_error",
+            "code": "context_overflow",
+            "reason": "memory_capacity",
+        }
+    }
+
+    assert agent._stateful_responses_reset_reason_after_error(capacity_error) is None
+
+
 def test_preflight_and_normalization_keep_stateful_response_identity(monkeypatch):
     agent = _build_stateful_custom_agent(monkeypatch)
     kwargs = agent._build_api_kwargs([{"role": "user", "content": "Hello"}])
@@ -263,6 +341,38 @@ def test_build_api_kwargs_uses_inflight_one_action_tool_policy(monkeypatch):
     )
 
     assert [tool["name"] for tool in narrowed["tools"]] == ["terminal"]
+
+
+def test_response_only_conscience_policy_disables_tools_for_one_action(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    ticket = run_agent.CritiqueTicket(
+        verdict="block_stop",
+        reason="Rewrite the answer within the requested limit.",
+        evidence=["The draft is too long."],
+        next_best_action="Rewrite the final answer directly.",
+        recommended_tools=[],
+    )
+
+    agent._prepare_conscience_tool_policy(ticket)
+    assert agent._conscience_pending_tool_policy["response_only"] is True
+
+    agent._activate_conscience_tool_policy_for_actor_action()
+    tools_for_api = agent._tools_for_next_api_call()
+    kwargs = agent._build_api_kwargs(
+        [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": "Rewrite it."},
+        ],
+        tools_for_api=tools_for_api,
+    )
+
+    assert tools_for_api == []
+    assert kwargs["tools"] == []
+    assert kwargs["tool_choice"] == "none"
+    assert kwargs["parallel_tool_calls"] is False
+
+    agent._activate_conscience_tool_policy_for_actor_action()
+    assert agent._tools_for_next_api_call() == agent.tools
 
 
 def test_structured_tool_policy_conflict_uses_transient_parent(monkeypatch):
@@ -1313,6 +1423,7 @@ def test_run_conversation_records_main_stateful_request_trace(monkeypatch):
     agent = _build_stateful_custom_agent(monkeypatch)
     agent._disable_streaming = True
     captured = {}
+    releases = []
 
     def _capture(api_kwargs):
         captured.update(api_kwargs)
@@ -1321,6 +1432,11 @@ def test_run_conversation_records_main_stateful_request_trace(monkeypatch):
         return response
 
     monkeypatch.setattr(agent, "_interruptible_api_call", _capture)
+    monkeypatch.setattr(
+        agent,
+        "_release_foreground_cache_lease",
+        lambda: releases.append(agent._foreground_cache_lease_id) or True,
+    )
 
     result = agent.run_conversation("Say OK")
 
@@ -1337,6 +1453,39 @@ def test_run_conversation_records_main_stateful_request_trace(monkeypatch):
     assert row["completion_tokens"] == 3
     assert captured["extra_headers"]["X-Hermes-Request-Id"] == row["request_id"]
     assert captured["extra_headers"]["X-Hermes-Actor"] == "main"
+    assert captured["extra_headers"]["X-Hermes-Cache-Lease"] == row["turn_id"]
+    assert releases == [row["turn_id"]]
+    assert agent._foreground_cache_lease_id is None
+
+
+def test_local_main_cache_lease_does_not_depend_on_request_tracing(monkeypatch):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._disable_streaming = True
+    captured = {}
+    releases = []
+
+    def _capture(api_kwargs):
+        captured.update(api_kwargs)
+        response = _codex_message_response("OK")
+        response.id = "resp_untraced_1"
+        return response
+
+    monkeypatch.setenv("HERMES_REQUEST_TRACE", "0")
+    monkeypatch.setattr(agent, "_interruptible_api_call", _capture)
+    monkeypatch.setattr(
+        agent,
+        "_release_foreground_cache_lease",
+        lambda: releases.append(agent._foreground_cache_lease_id) or True,
+    )
+
+    result = agent.run_conversation("Say OK")
+
+    assert result["completed"] is True
+    lease = captured["extra_headers"]["X-Hermes-Cache-Lease"]
+    assert lease.startswith("turn_")
+    assert captured["extra_headers"]["X-Hermes-Actor"] == "main"
+    assert releases == [lease]
+    assert result["request_trace"] == []
 
 
 def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monkeypatch):
@@ -2087,10 +2236,15 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
     )
 
 
-def _codex_incomplete_with_reasoning(text: str, reasoning_id: str = "rs_default"):
+def _codex_incomplete_with_reasoning(
+    text: str,
+    reasoning_id: str = "rs_default",
+    response_id: str | None = None,
+):
     """Incomplete response with a reasoning item whose id/encrypted_content
     can vary independently of the visible message text."""
     return SimpleNamespace(
+        id=response_id,
         output=[
             SimpleNamespace(
                 type="reasoning",
@@ -2169,6 +2323,67 @@ def test_codex_incomplete_opaque_state_updated_in_place(monkeypatch):
             (i.get("id") if isinstance(i, dict) else getattr(i, "id", None)) == "rs_2"
             for i in items
         )
+
+
+def test_stateful_incomplete_dedup_moves_local_anchor_to_latest_response(monkeypatch):
+    """A deduped thinking continuation must still anchor its newest server ID."""
+    agent = _build_stateful_custom_agent(monkeypatch)
+    responses = [
+        _codex_incomplete_with_reasoning(
+            "Working on it...", "rs_1", response_id="resp_thinking_1"
+        ),
+        _codex_incomplete_with_reasoning(
+            "Working on it...", "rs_2", response_id="resp_thinking_2"
+        ),
+        _codex_message_response("Done."),
+    ]
+    responses[-1].id = "resp_final"
+    sent_kwargs: list[dict] = []
+
+    def _next_response(api_kwargs):
+        sent_kwargs.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _next_response)
+
+    result = agent.run_conversation("test stateful thinking dedup")
+
+    assert result["completed"] is True
+    assert sent_kwargs[1]["previous_response_id"] == "resp_thinking_1"
+    assert sent_kwargs[2]["previous_response_id"] == "resp_thinking_2"
+    incompletes = [
+        message
+        for message in result["messages"]
+        if message.get("role") == "assistant"
+        and message.get("finish_reason") == "incomplete"
+    ]
+    assert len(incompletes) == 1
+    assert incompletes[0]["responses_response_id"] == "resp_thinking_2"
+
+
+def test_stateful_completed_reasoning_only_prefill_keeps_local_anchor(monkeypatch):
+    """A completed local reasoning-only response remains the next delta parent."""
+    agent = _build_stateful_custom_agent(monkeypatch)
+    reasoning_only = _codex_reasoning_only_response()
+    reasoning_only.id = "resp_thinking_1"
+    final = _codex_message_response("Done.")
+    final.id = "resp_final"
+    responses = [reasoning_only, final]
+    sent_kwargs: list[dict] = []
+
+    def _next_response(api_kwargs):
+        sent_kwargs.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _next_response)
+
+    result = agent.run_conversation("test completed reasoning-only continuation")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Done."
+    assert len(sent_kwargs) == 2
+    assert sent_kwargs[1]["previous_response_id"] == "resp_thinking_1"
+    assert sent_kwargs[1]["input"] == []
 
 
 def test_normalize_codex_response_marks_commentary_only_message_as_incomplete(monkeypatch):

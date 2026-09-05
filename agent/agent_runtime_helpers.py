@@ -1412,6 +1412,7 @@ def drop_thinking_only_and_merge_users(
     messages: List[Dict[str, Any]],
     *,
     drop_codex_reasoning_items: bool = True,
+    preserve_response_anchors: bool = False,
 ) -> List[Dict[str, Any]]:
     """Drop thinking-only assistant turns; merge any adjacent user messages left behind.
 
@@ -1432,10 +1433,21 @@ def drop_thinking_only_and_merge_users(
     if not messages:
         return messages
 
-    # Pass 1: drop thinking-only assistant turns.
+    # Pass 1: drop thinking-only assistant turns. A stateful Responses
+    # assistant row carrying the current server response ID is a transport
+    # boundary, even when its only visible payload is reasoning. Keeping it
+    # lets the delta builder cut after the row and send previous_response_id;
+    # the reasoning payload itself is not replayed on the wire.
     kept = [
         m for m in messages
-        if not _ra().AIAgent._is_thinking_only_assistant(
+        if (
+            preserve_response_anchors
+            and isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and isinstance(m.get("responses_response_id"), str)
+            and bool(m["responses_response_id"].strip())
+        )
+        or not _ra().AIAgent._is_thinking_only_assistant(
             m,
             drop_codex_reasoning_items=drop_codex_reasoning_items,
         )

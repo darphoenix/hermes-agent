@@ -177,6 +177,29 @@ class TestDropThinkingOnlyAndMergeUsers:
         assert [m["role"] for m in out] == ["system", "user"]
         assert out[-1]["role"] != "assistant"
 
+    def test_stateful_response_anchor_can_preserve_thinking_prefill(self):
+        anchor = {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "Working out the final answer.",
+            "_thinking_prefill": True,
+            "responses_response_id": "resp_thinking_1",
+        }
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "do the thing"},
+            anchor,
+        ]
+
+        out = AIAgent._drop_thinking_only_and_merge_users(
+            msgs,
+            drop_codex_reasoning_items=False,
+            preserve_response_anchors=True,
+        )
+
+        assert out is msgs
+        assert out[-1] is anchor
+
     def test_system_messages_ignored_by_pass(self):
         msgs = [
             {"role": "system", "content": "sys prompt"},

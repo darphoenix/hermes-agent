@@ -79,6 +79,37 @@ _IMAGE_URL_RE = re.compile(
 )
 
 
+def native_image_delivery_summary(content: Any) -> Optional[Dict[str, Any]]:
+    """Describe images present in the API-bound actor message.
+
+    This is structured evidence for observers such as conscience: an image
+    content part here means the actor received the original image in its
+    multimodal model input. A second vision tool call is not required merely
+    to prove that the actor inspected it.
+    """
+    if not isinstance(content, list):
+        return None
+
+    image_count = 0
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if str(part.get("type") or "").strip().lower() in {
+            "image",
+            "image_url",
+            "input_image",
+        }:
+            image_count += 1
+
+    if not image_count:
+        return None
+    return {
+        "delivered_to_actor": True,
+        "delivery": "native_multimodal_model_input",
+        "image_count": image_count,
+    }
+
+
 def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
     """Scan free-form text for image references the model should see.
 
@@ -483,7 +514,8 @@ def _lookup_supports_vision(
 
     Consults the user's ``supports_vision`` override in config.yaml first
     (so custom/local models declared as vision-capable don't fall through to
-    text routing in ``auto`` mode), then falls back to models.dev.
+    text routing in ``auto`` mode), then models.dev, then explicit capability
+    metadata advertised by the configured OpenAI-compatible endpoint.
     """
     # Named custom providers are canonicalized to ``provider="custom"`` by
     # runtime resolution.  The original CLI/config name is carried in the
@@ -540,6 +572,25 @@ def _lookup_supports_vision(
     # Resolve the provider's API key so probe requests at keyed endpoints
     # carry Authorization and don't spray 401s (issue #89863).
     resolved_api_key = _resolve_inference_api_key(cfg, provider)
+
+    if base_url:
+        try:
+            from agent.model_metadata import query_endpoint_supports_vision
+
+            endpoint_vision = query_endpoint_supports_vision(
+                model,
+                base_url,
+                api_key=resolved_api_key,
+            )
+            if endpoint_vision is not None:
+                return endpoint_vision
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(
+                "image_routing: endpoint vision probe failed for %s:%s - %s",
+                provider,
+                model,
+                exc,
+            )
 
     if _should_probe_ollama_vision(provider, base_url, api_key=resolved_api_key):
         try:

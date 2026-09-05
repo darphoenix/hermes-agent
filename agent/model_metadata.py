@@ -1275,6 +1275,47 @@ def _add_model_aliases(cache: Dict[str, Dict[str, Any]], model_id: str, entry: D
         cache.setdefault(bare_model, entry)
 
 
+def _extract_endpoint_supports_vision(payload: Dict[str, Any]) -> Optional[bool]:
+    """Read an explicit vision capability from a live model-catalog row.
+
+    OpenAI-compatible servers do not share one capability schema. Keep the
+    interpretation deliberately narrow: accept explicit booleans, advertised
+    image input modalities, or a positive ``vision`` capability. An absent
+    ``vision`` item in a partial capability list is not evidence that the
+    model is text-only.
+    """
+    for key in ("supports_vision", "vision"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            return value
+
+    modality_lists: List[Any] = [payload.get("input_modalities")]
+    modalities = payload.get("modalities")
+    if isinstance(modalities, dict):
+        modality_lists.append(modalities.get("input"))
+    architecture = payload.get("architecture")
+    if isinstance(architecture, dict):
+        modality_lists.append(architecture.get("input_modalities"))
+
+    for raw_modalities in modality_lists:
+        if isinstance(raw_modalities, (list, tuple, set)):
+            normalized = {str(item).strip().lower() for item in raw_modalities}
+            return bool(normalized & {"image", "images", "vision"})
+
+    capabilities = payload.get("capabilities")
+    if isinstance(capabilities, dict):
+        for key in ("vision", "image", "images"):
+            value = capabilities.get(key)
+            if isinstance(value, bool):
+                return value
+    elif isinstance(capabilities, (list, tuple, set)):
+        normalized = {str(item).strip().lower() for item in capabilities}
+        if normalized & {"vision", "image", "images"}:
+            return True
+
+    return None
+
+
 def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
     """Fetch model metadata from OpenRouter (cached for 1 hour)."""
     global _model_metadata_cache, _model_metadata_cache_time
@@ -1415,6 +1456,10 @@ def fetch_endpoint_model_metadata(
                     if pricing:
                         entry["pricing"] = pricing
 
+                    supports_vision = _extract_endpoint_supports_vision(model)
+                    if supports_vision is not None:
+                        entry["supports_vision"] = supports_vision
+
                     _add_model_aliases(cache, model_id, entry)
                     alt_id = model.get("id")
                     if isinstance(alt_id, str) and alt_id and alt_id != model_id:
@@ -1474,6 +1519,9 @@ def fetch_endpoint_model_metadata(
                 pricing = _extract_pricing(model)
                 if pricing:
                     entry["pricing"] = pricing
+                supports_vision = _extract_endpoint_supports_vision(model)
+                if supports_vision is not None:
+                    entry["supports_vision"] = supports_vision
                 _add_model_aliases(cache, model_id, entry)
 
             # If this is a llama.cpp server, query /props for actual allocated context
@@ -1515,6 +1563,47 @@ def fetch_endpoint_model_metadata(
     _endpoint_model_metadata_cache[normalized] = {}
     _endpoint_model_metadata_cache_time[normalized] = time.time()
     return {}
+
+
+def query_endpoint_supports_vision(
+    model: str,
+    base_url: str,
+    api_key: str = "",
+) -> Optional[bool]:
+    """Return a live OpenAI-compatible endpoint's vision verdict.
+
+    Local single-model servers commonly advertise a short model id while
+    Hermes is configured with an absolute model path. Match both exact ids
+    and path basenames, then use a sole catalog entry as the same safe
+    fallback already used by local context-length discovery.
+    """
+    metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
+    if not metadata:
+        return None
+
+    configured = str(model or "").strip()
+    configured_basename = configured.rsplit("/", 1)[-1]
+    matched = metadata.get(configured)
+    if matched is None and configured_basename:
+        matched = metadata.get(configured_basename)
+
+    if matched is None and configured:
+        for model_id, entry in metadata.items():
+            advertised_basename = str(model_id).rsplit("/", 1)[-1]
+            if advertised_basename == configured_basename:
+                matched = entry
+                break
+
+    if matched is None:
+        unique_entries = {id(entry): entry for entry in metadata.values()}
+        if len(unique_entries) == 1:
+            matched = next(iter(unique_entries.values()))
+
+    if isinstance(matched, dict):
+        supports_vision = matched.get("supports_vision")
+        if isinstance(supports_vision, bool):
+            return supports_vision
+    return None
 
 
 def _resolve_endpoint_context_length(

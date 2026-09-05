@@ -466,6 +466,29 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
 
+    def test_structured_wrapper_context_overflow_requests_compression(self):
+        error = MockAPIError(
+            "capacity preflight rejected",
+            status_code=400,
+            body={
+                "error": {
+                    "code": "context_overflow",
+                    "reason": "memory_capacity",
+                    "retryable": True,
+                }
+            },
+        )
+
+        result = classify_api_error(
+            error,
+            provider="custom",
+            approx_tokens=155_395,
+        )
+
+        assert result.reason == FailoverReason.context_overflow
+        assert result.retryable is True
+        assert result.should_compress is True
+
     def test_message_only_overloaded_without_status_is_overloaded(self):
         """Some Anthropic-compatible proxies surface 'overloaded' in the
         message with no 503/529 status_code. It must classify as overloaded
@@ -1399,6 +1422,81 @@ class TestThrottleVsOverflowDisambiguation:
 class TestExpandedOverflowPatterns:
     """New provider overflow wordings route into compression recovery."""
 
+    def test_structured_local_memory_capacity_error_triggers_compression(self):
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={
+                "error": {
+                    "message": (
+                        "Prompt (201369 tokens) requires ~13318MB GPU memory "
+                        "but only ~13192MB is available. Compact or reduce the "
+                        "prompt and retry."
+                    ),
+                    "type": "context_overflow_error",
+                    "code": "context_overflow",
+                    "reason": "memory_capacity",
+                    "prompt_tokens": 201369,
+                    "required_memory_bytes": 13964935168,
+                    "available_memory_bytes": 13832814592,
+                    "retryable": True,
+                }
+            },
+        )
+        result = classify_api_error(
+            e,
+            provider="custom",
+            model="local-qwen",
+            approx_tokens=190000,
+            context_length=262144,
+        )
+        assert result.reason == FailoverReason.context_overflow
+        assert result.retryable is True
+        assert result.should_compress is True
+        assert result.should_fallback is False
+
+    def test_structured_capacity_code_does_not_depend_on_message_wording(self):
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={
+                "error": {
+                    "message": "Admission refused",
+                    "type": "context_overflow_error",
+                    "code": "context_overflow",
+                }
+            },
+        )
+        result = classify_api_error(e, provider="custom", model="local-qwen")
+        assert result.reason == FailoverReason.context_overflow
+        assert result.should_compress is True
+
+    def test_legacy_local_memory_wording_still_triggers_compression(self):
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={
+                "error": {
+                    "message": (
+                        "Prompt (201369 tokens) requires ~13318MB GPU memory "
+                        "but only ~13192MB available. Reduce prompt size or use "
+                        "a smaller model."
+                    ),
+                    "type": "invalid_request_error",
+                    "code": 400,
+                }
+            },
+        )
+        result = classify_api_error(
+            e,
+            provider="custom",
+            model="local-qwen",
+            approx_tokens=190000,
+            context_length=262144,
+        )
+        assert result.reason == FailoverReason.context_overflow
+        assert result.should_compress is True
+
     def test_maximum_allowed_input_length_is_overflow(self):
         # Together/Fireworks-style wording — matched no pattern before.
         e = Exception(
@@ -1577,5 +1675,3 @@ class TestServerInjectedParameterRejection:
         result = classify_api_error(e, provider="custom", model="m")
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
-
-
