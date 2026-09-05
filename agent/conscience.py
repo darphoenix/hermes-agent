@@ -85,6 +85,14 @@ class ConscienceVerdict:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+class ConscienceStateCompactionRequired(RuntimeError):
+    """The sidecar rejected a stateful audit until its live KV is compacted."""
+
+    def __init__(self, details: Optional[Dict[str, Any]] = None):
+        super().__init__("Stateful conscience compaction required")
+        self.details = dict(details or {})
+
+
 @dataclass
 class ConscienceState:
     contract: TaskContract
@@ -1143,8 +1151,41 @@ class ConscienceMonitor:
                 "instructions": self._stateful_review_system_prompt(),
                 "input_payload": stateful_payload,
             }
-        response = llm_callable(**call_kwargs)
         active_stateful_payload = stateful_payload
+        try:
+            response = llm_callable(**call_kwargs)
+        except ConscienceStateCompactionRequired as exc:
+            retire_response_id = self.state.stateful_previous_response_id
+            self._reset_stateful_session("wrapper_live_byte_budget_exceeded")
+            active_stateful_payload = self._stateful_full_payload(
+                review_type,
+                draft_answer,
+                event_count=len(self.state.events),
+                restart_reason=self.state.stateful_next_init_reason,
+            )
+            compaction = active_stateful_payload.get("stateful_compaction")
+            if isinstance(compaction, dict):
+                compaction["wrapper_memory"] = {
+                    key: exc.details.get(key)
+                    for key in (
+                        "current_session_bytes",
+                        "projected_session_bytes",
+                        "conscience_session_max_bytes",
+                        "available_bytes",
+                        "required_bytes",
+                    )
+                    if exc.details.get(key) is not None
+                }
+            retry_stateful_payload = {
+                "thread_id": f"conscience:{self.state.contract.task_id}",
+                "previous_response_id": None,
+                "instructions": self._stateful_review_system_prompt(),
+                "input_payload": active_stateful_payload,
+            }
+            if retire_response_id:
+                retry_stateful_payload["retire_response_id"] = retire_response_id
+            call_kwargs["stateful_payload"] = retry_stateful_payload
+            response = llm_callable(**call_kwargs)
         stateful_used = bool(getattr(response, "conscience_stateful_used", False))
 
         def append_audit_record(response_obj: Any, sent_payload: Dict[str, Any], *, fallback_reason: str = "") -> tuple[str, Optional[Dict[str, Any]], Optional[str], bool]:

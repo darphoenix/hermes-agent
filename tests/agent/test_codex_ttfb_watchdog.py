@@ -188,6 +188,50 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     assert "codex_ttfb_kill" not in closes
 
 
+def test_nonstream_wall_clock_does_not_kill_active_responses_stream(
+    tmp_path, monkeypatch
+):
+    """SSE activity hands liveness ownership to the event-idle watchdog."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        agent, "_compute_non_stream_stale_timeout", lambda *_args: 0.4
+    )
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **_k: dummy_client)
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda _client, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda _client, reason=None: closes.append(reason),
+    )
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        deadline = time.time() + 0.9
+        while time.time() < deadline:
+            agent._codex_stream_last_event_ts = time.time()
+            time.sleep(0.05)
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    response = h.interruptible_api_call(
+        agent, {"model": "gpt-5.5", "input": "hi"}
+    )
+
+    assert response is sentinel
+    assert "stale_call_kill" not in closes
+
+
 
 
 
@@ -385,6 +429,5 @@ def test_large_codex_request_hard_ceiling_reclaims_silent_stall(tmp_path, monkey
         assert "with no response" in str(excinfo.value)
     finally:
         stop["flag"] = True
-
 
 

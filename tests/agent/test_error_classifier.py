@@ -75,6 +75,26 @@ class TestFailoverReason:
         assert expected == actual
 
 
+def test_structured_wrapper_context_overflow_requests_compression():
+    error = MockAPIError(
+        "capacity preflight rejected",
+        status_code=400,
+        body={
+            "error": {
+                "code": "context_overflow",
+                "reason": "memory_capacity",
+                "retryable": True,
+            }
+        },
+    )
+
+    result = classify_api_error(error, provider="custom", approx_tokens=155_395)
+
+    assert result.reason == FailoverReason.context_overflow
+    assert result.retryable is True
+    assert result.should_compress is True
+
+
 # ── Test: ClassifiedError ──────────────────────────────────────────────
 
 class TestClassifiedError:
@@ -1577,5 +1597,4 @@ class TestServerInjectedParameterRejection:
         result = classify_api_error(e, provider="custom", model="m")
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
-
 

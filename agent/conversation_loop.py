@@ -24,6 +24,7 @@ import re
 import ssl
 import sys
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -3059,18 +3060,25 @@ def run_conversation(
                     trace_row["request_tool_count"] = len(
                         api_kwargs.get("tools") or []
                     )
-                    if (
-                        agent.api_mode in {"chat_completions", "codex_responses"}
-                        and is_local_endpoint(agent.base_url)
-                    ):
-                        api_kwargs = agent._trace_apply_headers(
-                            api_kwargs,
-                            request_id=str(trace_row.get("request_id") or ""),
-                            actor=str(
-                                trace_row.get("actor")
-                                or agent._trace_actor_name()
-                            ),
-                        )
+                if (
+                    agent.api_mode in {"chat_completions", "codex_responses"}
+                    and is_local_endpoint(agent.base_url)
+                ):
+                    actor = str(
+                        (trace_row or {}).get("actor")
+                        or agent._trace_actor_name()
+                    )
+                    request_id = str((trace_row or {}).get("request_id") or "")
+                    if not request_id:
+                        short_turn = str(
+                            getattr(agent, "_trace_turn_id", "") or "turn"
+                        ).replace("turn_", "")
+                        request_id = f"hrq_{short_turn}_{uuid.uuid4().hex[:6]}"
+                    api_kwargs = agent._trace_apply_headers(
+                        api_kwargs,
+                        request_id=request_id,
+                        actor=actor,
+                    )
                 # OpenRouter response caching replays identical successful
                 # responses verbatim, including empty completions. An empty-
                 # response retry must reach the provider instead of replaying

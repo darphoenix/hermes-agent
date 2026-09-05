@@ -1601,6 +1601,12 @@ def _classify_400(
     # verified") which could otherwise trip the context_overflow heuristics.
     # ``error_msg`` is lowercased upstream — match accordingly.
     error_code_lower = (error_code or "").lower()
+    if error_code_lower == "context_overflow":
+        return result_fn(
+            FailoverReason.context_overflow,
+            retryable=True,
+            should_compress=True,
+        )
     if (
         error_code_lower == "invalid_encrypted_content"
         or "invalid_encrypted_content" in error_msg
@@ -1833,7 +1839,11 @@ def _classify_by_error_code(
             should_fallback=True,
         )
 
-    if code_lower in {"context_length_exceeded", "max_tokens_exceeded"}:
+    if code_lower in {
+        "context_length_exceeded",
+        "context_overflow",
+        "max_tokens_exceeded",
+    }:
         return result_fn(
             FailoverReason.context_overflow,
             retryable=True,

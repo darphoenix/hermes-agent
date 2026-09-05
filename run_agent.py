@@ -169,6 +169,7 @@ from agent.conscience import (
     TOOL_PROGRESS,
     TOOL_RESULT,
     ConscienceMonitor,
+    ConscienceStateCompactionRequired,
     ConscienceVerdict,
     CritiqueTicket,
     asdict_safe,
@@ -8579,8 +8580,61 @@ class AIAgent:
         headers.setdefault("X-Hermes-Turn-Id", str(getattr(self, "_trace_turn_id", "") or ""))
         headers.setdefault("X-Hermes-Session-Id", str(self.session_id or ""))
         headers.setdefault("X-Hermes-Task-Id", str(getattr(self, "_trace_task_id", "") or getattr(self, "_current_task_id", "") or ""))
+        cache_lease = str(getattr(self, "_foreground_cache_lease_id", "") or "")
+        if (
+            actor == "main"
+            and cache_lease
+            and getattr(self, "api_mode", "") == "codex_responses"
+            and is_local_endpoint(self.base_url)
+        ):
+            headers.setdefault("X-Hermes-Cache-Lease", cache_lease)
+            self._foreground_cache_lease_emitted = True
         api_kwargs["extra_headers"] = headers
         return api_kwargs
+
+    def _release_foreground_cache_lease(self) -> bool:
+        """Best-effort release of this outer turn's local cache lease."""
+        lease = str(getattr(self, "_foreground_cache_lease_id", "") or "")
+        emitted = bool(getattr(self, "_foreground_cache_lease_emitted", False))
+        base = str(getattr(self, "base_url", "") or "").rstrip("/")
+        if not emitted or not lease or not base or not is_local_endpoint(base):
+            return False
+
+        import urllib.request
+
+        endpoint = (
+            base + "/cache/lease/release"
+            if base.endswith("/v1")
+            else base + "/v1/cache/lease/release"
+        )
+        request = urllib.request.Request(
+            endpoint,
+            data=b"",
+            method="POST",
+            headers={
+                "X-Hermes-Actor": "main",
+                "X-Hermes-Cache-Lease": lease,
+            },
+        )
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=0.5) as response:
+                released = response.status == 200
+            logger.info(
+                "Foreground cache lease release: turn=%s status=%s",
+                lease,
+                "ok" if released else "rejected",
+            )
+            return released
+        except Exception as exc:
+            # The server-side deadline is the crash fallback. Turn delivery
+            # must never fail because this local maintenance call did.
+            logger.debug(
+                "Foreground cache lease release unavailable: turn=%s error=%s",
+                lease,
+                exc,
+            )
+            return False
 
     def _trace_start_api_call(
         self,
@@ -9168,6 +9222,51 @@ class AIAgent:
             total_tokens=total_tokens,
         )
 
+    @staticmethod
+    def _conscience_api_error(error: BaseException) -> tuple[str, dict[str, Any], int | None]:
+        """Extract a structured OpenAI-compatible error without matching prose."""
+        body = getattr(error, "body", None)
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except (TypeError, ValueError):
+                body = None
+        response = getattr(error, "response", None)
+        if not isinstance(body, dict) and response is not None:
+            try:
+                body = response.json()
+            except Exception:
+                body = None
+        error_obj: dict[str, Any] = {}
+        if isinstance(body, dict):
+            nested = body.get("error")
+            error_obj = nested if isinstance(nested, dict) else body
+        code = str(error_obj.get("code") or "").strip().lower()
+        details = error_obj.get("details")
+        status_code = getattr(error, "status_code", None)
+        if status_code is None and response is not None:
+            status_code = getattr(response, "status_code", None)
+        try:
+            normalized_status = int(status_code) if status_code is not None else None
+        except (TypeError, ValueError):
+            normalized_status = None
+        return code, dict(details) if isinstance(details, dict) else {}, normalized_status
+
+    @classmethod
+    def _conscience_stateful_chat_fallback_allowed(cls, error: BaseException) -> bool:
+        """Only protocol incompatibility may change a stateful audit into chat."""
+        code, _details, status_code = cls._conscience_api_error(error)
+        if code in {
+            "endpoint_not_found",
+            "not_implemented",
+            "unsupported_api",
+            "unsupported_endpoint",
+        }:
+            return True
+        if status_code in {404, 405, 501}:
+            return True
+        return isinstance(error, AttributeError) and "responses" in str(error).lower()
+
     def _conscience_call_llm(
         self,
         *,
@@ -9251,12 +9350,34 @@ class AIAgent:
                         request_kwargs["temperature"] = temperature
                     if isinstance(previous_response_id, str) and previous_response_id.strip():
                         request_kwargs["previous_response_id"] = previous_response_id.strip()
-                    if trace_row is not None:
-                        request_kwargs = self._trace_apply_headers(
-                            request_kwargs,
-                            request_id=str(trace_row.get("request_id") or ""),
-                            actor="conscience",
-                        )
+                    request_id = (
+                        str(trace_row.get("request_id") or "")
+                        if trace_row is not None
+                        else f"hrq_conscience_{uuid.uuid4().hex[:8]}"
+                    )
+                    request_kwargs = self._trace_apply_headers(
+                        request_kwargs,
+                        request_id=request_id,
+                        actor="conscience",
+                    )
+                    request_headers = request_kwargs.get("extra_headers")
+                    if isinstance(request_headers, dict):
+                        review_type = str(
+                            (input_payload or {}).get("review_type")
+                            if isinstance(input_payload, dict)
+                            else ""
+                        ).strip()
+                        if review_type:
+                            request_headers.setdefault(
+                                "X-Hermes-Conscience-Review-Type", review_type
+                            )
+                        retire_response_id = str(
+                            stateful_payload.get("retire_response_id") or ""
+                        ).strip()
+                        if retire_response_id:
+                            request_headers.setdefault(
+                                "X-Hermes-Retire-Response-Id", retire_response_id
+                            )
                     logger.info(
                         "Conscience stateful audit call: provider=%s model=%s prev=%s mode=%s",
                         provider,
@@ -9308,6 +9429,7 @@ class AIAgent:
                         conscience_response_status=response_status,
                     )
             except Exception as exc:
+                error_code, error_details, error_status = self._conscience_api_error(exc)
                 if trace_row is not None:
                     self._trace_finish_api_call(
                         trace_row,
@@ -9315,11 +9437,28 @@ class AIAgent:
                         api_duration_s=round(time.perf_counter() - trace_started, 6),
                         error_type=type(exc).__name__,
                         error=str(exc)[:500],
+                        error_code=error_code,
+                        error_status=error_status,
                         stateful_used=False,
                     )
                     trace_row = None
+                if error_code in {
+                    "state_compaction_required",
+                    "conscience_compaction_required",
+                }:
+                    logger.info(
+                        "Conscience sidecar requested semantic compaction before retry: %s",
+                        error_details,
+                    )
+                    raise ConscienceStateCompactionRequired(error_details) from exc
+                if not self._conscience_stateful_chat_fallback_allowed(exc):
+                    logger.warning(
+                        "Conscience stateful audit failed without a protocol-compatible fallback: %s",
+                        exc,
+                    )
+                    raise
                 logger.warning(
-                    "Conscience stateful audit failed; falling back to stateless chat audit: %s",
+                    "Conscience Responses endpoint unavailable; falling back to stateless chat audit: %s",
                     exc,
                 )
 
@@ -9341,6 +9480,15 @@ class AIAgent:
             )
             fallback_started = time.perf_counter()
         try:
+            short_turn = str(getattr(self, "_trace_turn_id", "") or "turn").replace("turn_", "")
+            fallback_request_id = (
+                str(fallback_trace_row.get("request_id") or "")
+                if fallback_trace_row is not None
+                else f"hrq_{short_turn}_conscience_{uuid.uuid4().hex[:6]}"
+            )
+            fallback_headers = self._trace_apply_headers(
+                {}, request_id=fallback_request_id, actor="conscience"
+            ).get("extra_headers")
             response = _call_llm(
                 provider=provider,
                 model=model,
@@ -9349,6 +9497,7 @@ class AIAgent:
                 max_tokens=max_tokens,
                 timeout="none",
                 extra_body=extra_body,
+                extra_headers=fallback_headers,
             )
             if fallback_trace_row is not None:
                 usage = getattr(response, "usage", None)
@@ -10020,6 +10169,17 @@ class AIAgent:
                     # the inner stop and this join. Must run AFTER join so a
                     # late interrupt does not survive into the next turn.
                     _clear_durable_turn_lease_interrupt()
+                    try:
+                        try:
+                            self._release_foreground_cache_lease()
+                        except Exception:
+                            logger.debug(
+                                "Foreground cache lease finalizer failed",
+                                exc_info=True,
+                            )
+                    finally:
+                        self._foreground_cache_lease_id = None
+                        self._foreground_cache_lease_emitted = False
                     if durable_turn_lease is not None:
                         try:
                             _turn_db.release_session_turn_lease(

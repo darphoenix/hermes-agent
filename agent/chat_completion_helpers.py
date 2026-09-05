@@ -1767,9 +1767,16 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             break
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
-        if _elapsed > _stale_timeout:
+        # Stale-call detector: this is a no-response wall-clock guard. Once a
+        # Responses stream has emitted a valid SSE event, liveness belongs to
+        # the event-idle detector above; applying this older non-streaming
+        # ceiling as well would kill healthy long prefills even while
+        # ``response.in_progress`` heartbeats are arriving.
+        _codex_stream_has_started = (
+            _codex_watchdog_enabled
+            and getattr(agent, "_codex_stream_last_event_ts", None) is not None
+        )
+        if _elapsed > _stale_timeout and not _codex_stream_has_started:
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
             if callable(_hint_fn):

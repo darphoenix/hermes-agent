@@ -135,6 +135,22 @@ def _exit_after_oneshot(rc: object) -> None:
 _oneshot_cleanup_done = False
 
 
+def _validate_oneshot_session_flags(args, parser) -> None:
+    """Reject session-resume flags that one-shot mode cannot honor."""
+    if not getattr(args, "oneshot", None):
+        return
+    if not (
+        getattr(args, "resume", None)
+        or getattr(args, "continue_last", None)
+    ):
+        return
+    parser.error(
+        "-z/--oneshot always starts a new session and cannot be combined with "
+        "--resume/-r or --continue/-c; use "
+        "'hermes chat -Q --resume SESSION_ID -q PROMPT' to continue a session"
+    )
+
+
 def _cleanup_oneshot_runtime() -> None:
     """Best-effort process-global cleanup before one-shot hard exit.
 
@@ -12679,6 +12695,8 @@ def _try_fast_chat_launch() -> bool:
     if getattr(args, "command", None) not in {None, "chat"}:
         return False
 
+    _validate_oneshot_session_flags(args, parser)
+
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
     if getattr(args, "oneshot", None):
@@ -12737,6 +12755,8 @@ def _try_termux_fast_cli_launch() -> bool:
     parser, _subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
     args = parser.parse_args(_coalesce_session_name_args(argv))
+
+    _validate_oneshot_session_flags(args, parser)
 
     if getattr(args, "version", False):
         _print_version_info(check_updates=True)
@@ -14849,6 +14869,8 @@ def main():
     else:
         subparsers.required = False
         args = parser.parse_args(_processed_argv)
+
+    _validate_oneshot_session_flags(args, parser)
 
     # Handle --version flag
     if args.version:

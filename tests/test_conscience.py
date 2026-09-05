@@ -12,6 +12,7 @@ from agent.conscience import (
     DRAFT_ANSWER,
     INTENT_TO_STOP,
     ConscienceMonitor,
+    ConscienceStateCompactionRequired,
     extract_task_contract,
 )
 
@@ -306,6 +307,69 @@ def test_stateful_conscience_compacts_after_prompt_token_limit():
     assert "trajectory_memory" in calls[1]["input_payload"]
     assert monitor.state.stateful_previous_response_id == "resp_2"
     assert monitor.state.stateful_initialized is True
+
+
+def test_stateful_conscience_compacts_and_retries_on_wrapper_byte_budget():
+    monitor = ConscienceMonitor("task-wrapper-byte-budget", "Check current setup")
+    monitor.record_event(TASK_START, {"available_tools": ["terminal"]})
+    monitor.state.stateful_initialized = True
+    monitor.state.stateful_previous_response_id = "resp_old"
+    monitor.state.stateful_last_event_index = len(monitor.state.events)
+    monitor.state.stateful_last_prompt_tokens = 34_000
+    monitor.record_event(TOOL_RESULT, {"tool_name": "terminal", "success": True})
+    calls = []
+
+    def fake_llm(*, provider, model, messages, temperature, max_tokens, stateful_payload=None):
+        calls.append(stateful_payload)
+        if len(calls) == 1:
+            raise ConscienceStateCompactionRequired(
+                {
+                    "current_session_bytes": 3_600_000_000,
+                    "projected_session_bytes": 4_100_000_000,
+                    "conscience_session_max_bytes": 3_758_096_384,
+                }
+            )
+        return SimpleNamespace(
+            response_id="resp_new",
+            conscience_response_id="resp_new",
+            conscience_previous_response_id=None,
+            conscience_stateful_used=True,
+            usage=SimpleNamespace(
+                prompt_tokens=5000,
+                completion_tokens=10,
+                total_tokens=5010,
+            ),
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {"should_intervene": False, "verdict": "observe"}
+                        )
+                    ),
+                )
+            ],
+        )
+
+    monitor.audit_midtask_progress(
+        llm_callable=fake_llm,
+        provider="custom:conscience-local",
+        model="local-model",
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["previous_response_id"] == "resp_old"
+    assert calls[1]["previous_response_id"] is None
+    assert calls[1]["retire_response_id"] == "resp_old"
+    assert calls[1]["input_payload"]["stateful_mode"] == "compact_restart"
+    assert calls[1]["input_payload"]["stateful_compaction"]["reason"] == (
+        "wrapper_live_byte_budget_exceeded"
+    )
+    assert calls[1]["input_payload"]["stateful_compaction"]["wrapper_memory"][
+        "current_session_bytes"
+    ] == 3_600_000_000
+    assert monitor.state.stateful_previous_response_id == "resp_new"
+    assert monitor.state.stateful_reset_count == 1
 
 
 def test_stateful_conscience_compacts_before_projected_delta_exceeds_limit():

@@ -1279,6 +1279,7 @@ def test_run_conversation_records_main_stateful_request_trace(monkeypatch):
     agent = _build_stateful_custom_agent(monkeypatch)
     agent._disable_streaming = True
     captured = {}
+    releases = []
 
     def _capture(api_kwargs):
         captured.update(api_kwargs)
@@ -1287,6 +1288,11 @@ def test_run_conversation_records_main_stateful_request_trace(monkeypatch):
         return response
 
     monkeypatch.setattr(agent, "_interruptible_api_call", _capture)
+    monkeypatch.setattr(
+        agent,
+        "_release_foreground_cache_lease",
+        lambda: releases.append(agent._foreground_cache_lease_id) or True,
+    )
 
     result = agent.run_conversation("Say OK")
 
@@ -1303,6 +1309,41 @@ def test_run_conversation_records_main_stateful_request_trace(monkeypatch):
     assert row["completion_tokens"] == 3
     assert captured["extra_headers"]["X-Hermes-Request-Id"] == row["request_id"]
     assert captured["extra_headers"]["X-Hermes-Actor"] == "main"
+    assert captured["extra_headers"]["X-Hermes-Cache-Lease"] == row["turn_id"]
+    assert releases == [row["turn_id"]]
+    assert agent._foreground_cache_lease_id is None
+
+
+def test_local_main_cache_lease_does_not_depend_on_request_tracing(
+    monkeypatch,
+):
+    agent = _build_stateful_custom_agent(monkeypatch)
+    agent._disable_streaming = True
+    captured = {}
+    releases = []
+
+    def _capture(api_kwargs):
+        captured.update(api_kwargs)
+        response = _codex_message_response("OK")
+        response.id = "resp_untraced_1"
+        return response
+
+    monkeypatch.setenv("HERMES_REQUEST_TRACE", "0")
+    monkeypatch.setattr(agent, "_interruptible_api_call", _capture)
+    monkeypatch.setattr(
+        agent,
+        "_release_foreground_cache_lease",
+        lambda: releases.append(agent._foreground_cache_lease_id) or True,
+    )
+
+    result = agent.run_conversation("Say OK")
+
+    assert result["completed"] is True
+    lease = captured["extra_headers"]["X-Hermes-Cache-Lease"]
+    assert lease.startswith("turn_")
+    assert captured["extra_headers"]["X-Hermes-Actor"] == "main"
+    assert releases == [lease]
+    assert result["request_trace"] == []
 
 
 def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monkeypatch):

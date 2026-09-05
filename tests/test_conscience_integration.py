@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.conscience import ConscienceStateCompactionRequired
 from run_agent import AIAgent
 
 
@@ -193,6 +194,112 @@ def test_conscience_call_llm_uses_stateful_responses_for_local_custom(tmp_path):
     assert response.conscience_response_id == "resp_stateful_1"
     assert response.choices[0].message.content == '{"should_intervene": false}'
     assert response.usage.prompt_tokens == 12
+
+
+def test_conscience_stateful_byte_budget_error_never_falls_back_to_chat(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    agent.conscience_stateful = True
+
+    class ByteBudgetError(Exception):
+        status_code = 409
+        body = {
+            "error": {
+                "code": "state_compaction_required",
+                "details": {
+                    "current_session_bytes": 3_600_000_000,
+                    "projected_session_bytes": 4_100_000_000,
+                },
+            }
+        }
+
+    fake_create = MagicMock(side_effect=ByteBudgetError("compact state"))
+    fake_client = SimpleNamespace(
+        base_url="http://127.0.0.1:1237/v1/",
+        responses=SimpleNamespace(create=fake_create),
+    )
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "local-model", None, None, None),
+        ),
+        patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(fake_client, "local-model"),
+        ),
+        patch("agent.auxiliary_client.call_llm") as fallback,
+        pytest.raises(ConscienceStateCompactionRequired) as raised,
+    ):
+        agent._conscience_call_llm(
+            provider="custom:conscience-local",
+            model="local-model",
+            messages=[{"role": "system", "content": "s"}],
+            temperature=0,
+            max_tokens=1200,
+            stateful_payload={
+                "previous_response_id": "resp_old",
+                "instructions": "You are a stateful conscience.",
+                "input_payload": {"review_type": "midtask", "stateful_mode": "delta"},
+            },
+        )
+
+    fallback.assert_not_called()
+    assert raised.value.details["current_session_bytes"] == 3_600_000_000
+
+
+def test_conscience_compact_restart_sends_retirement_header(tmp_path):
+    agent = _make_agent(tmp_path, conscience_mode="enforce_observe")
+    agent.conscience_stateful = True
+    fake_response = SimpleNamespace(
+        id="resp_new",
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[
+                    SimpleNamespace(type="output_text", text='{"should_intervene": false}')
+                ],
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=5000, output_tokens=10, total_tokens=5010),
+    )
+    fake_create = MagicMock(return_value=fake_response)
+    fake_client = SimpleNamespace(
+        base_url="http://127.0.0.1:1237/v1/",
+        responses=SimpleNamespace(create=fake_create),
+    )
+
+    with (
+        patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "local-model", None, None, None),
+        ),
+        patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(fake_client, "local-model"),
+        ),
+    ):
+        agent._conscience_call_llm(
+            provider="custom:conscience-local",
+            model="local-model",
+            messages=[{"role": "system", "content": "s"}],
+            temperature=0,
+            max_tokens=1200,
+            stateful_payload={
+                "previous_response_id": None,
+                "retire_response_id": "resp_old",
+                "instructions": "You are a stateful conscience.",
+                "input_payload": {
+                    "review_type": "midtask",
+                    "stateful_mode": "compact_restart",
+                },
+            },
+        )
+
+    headers = fake_create.call_args.kwargs["extra_headers"]
+    assert headers["X-Hermes-Actor"] == "conscience"
+    assert headers["X-Hermes-Conscience-Review-Type"] == "midtask"
+    assert headers["X-Hermes-Retire-Response-Id"] == "resp_old"
 
 
 def test_conscience_stateful_responses_propagates_incomplete_status(tmp_path):

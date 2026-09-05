@@ -583,6 +583,11 @@ def build_turn_context(
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
     agent._trace_turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+    # Stable for every main-model request in this outer turn. The local
+    # inference server uses it to protect one foreground KV branch while
+    # nested replay/auxiliary requests rotate through the remaining slots.
+    agent._foreground_cache_lease_id = agent._trace_turn_id
+    agent._foreground_cache_lease_emitted = False
     agent._trace_task_id = effective_task_id
     agent._trace_turn_started_at = time.time()
     trace_lock = getattr(agent, "_trace_lock", None)
