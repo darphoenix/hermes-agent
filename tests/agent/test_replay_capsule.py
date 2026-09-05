@@ -7,6 +7,7 @@ chaining — no real model, no network beyond loopback.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -155,25 +156,54 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
+TERMINAL_TOOL_SCHEMA = {
+    "type": "function", "name": "terminal",
+    "description": "Run a shell command and return its output.",
+    "parameters": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+    },
+}
+
+
 class FakeWrapper:
     """Minimal /v1/responses server with previous_response_id chaining.
 
     ``script``: per-turn canned outputs, each {text?, tool_calls?}.
     ``fail_unknown_parent``: 404 on unknown previous_response_id (like a
     wrapper whose response store rotated the entry out).
+    GET /v1/responses/<id> echoes the stored model-facing request fields
+    (instructions + tools) for seeded ids, like the mlx-serve response
+    store; unseeded ids 404 (rotated out). ``seed_store`` entries are ids
+    (global defaults) or dicts {id, instructions?, tools?} so different
+    responses can carry DIFFERENT per-call evidence — the whole point of
+    per-turn hydration. POST-generated responses store whatever evidence
+    the request carried (absent field = faithful absence).
     Logs mlx-serve-format continuation/usage lines to ``log_path``.
     """
 
     def __init__(self, script, log_path: Path, *, fail_unknown_parent=True,
-                 instructions="You are Hermes.", seed_store=(), diverge=False):
+                 instructions="You are Hermes.", seed_store=(), diverge=False,
+                 tools=None):
         self.script = list(script)
         self.log_path = log_path
         self.fail_unknown_parent = fail_unknown_parent
         self.instructions = instructions
+        self.tools = [TERMINAL_TOOL_SCHEMA] if tools is None else tools
         self.diverge = diverge
-        self.store = {}
-        for sid in seed_store:
-            self.store[sid] = {"id": sid, "instructions": instructions}
+        self.store: dict[str, dict] = {}
+        for item in seed_store:
+            if isinstance(item, dict):
+                rec = {
+                    "id": item["id"],
+                    "instructions": item.get("instructions", self.instructions),
+                    "tools": item.get("tools", self.tools),
+                }
+            else:
+                rec = {"id": item, "instructions": self.instructions,
+                       "tools": self.tools}
+            self.store[rec["id"]] = rec
         self.posts: list[dict] = []
         self.gets: list[str] = []
         self._n = 0
@@ -225,17 +255,19 @@ class FakeWrapper:
                  "output_tokens_details": {"reasoning_tokens": 0}}
         obj = {"id": new_id, "object": "response", "status": "completed",
                "output": output, "usage": usage}
-        self.store[new_id] = obj
+        # Store the evidence THIS request carried, so a later GET for this
+        # id returns exactly what was sent (absent field = sent without it).
+        self.store[new_id] = {
+            "id": new_id,
+            "instructions": body.get("instructions"),
+            "tools": body.get("tools"),
+        }
         self._log(
             f'{new_id} "usage": {{"input_tokens": 120, "output_tokens": 10, '
             f'"total_tokens": 130, "input_tokens_details": {{"cached_tokens": 100}}}} '
             f'"prompt_ms": 10.0, "predicted_ms": 20.0'
         )
         self._log("[mtp-round] off0=1 t1=2 drafts={7 8 9} accepted=2")
-        step_idx = 1 if any(
-            i.get("type") == "function_call_output" for i in body.get("input", [])
-        ) else 0
-        step = self.script[step_idx if len(self.script) > 1 else 0]
         payload = json.dumps(obj).encode()
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")
@@ -246,16 +278,21 @@ class FakeWrapper:
     def handle_get(self, handler):
         rid_ = handler.path.rsplit("/", 1)[-1]
         self.gets.append(rid_)
-        stored = self.store.get(rid_)
-        if stored is None:
+        rec = self.store.get(rid_)
+        if rec is None:
             payload = json.dumps({"error": "not found"}).encode()
-            handler.send_response(404)
+            status = 404
         else:
-            payload = json.dumps({
-                "id": rid_, "instructions": self.instructions,
-                "status": "completed", "output": [],
-            }).encode()
-        handler.send_response(200 if stored is not None else 404)
+            out = {"id": rid_, "status": "completed", "output": []}
+            # Omit absent fields entirely: a store record without the field
+            # is positive evidence the original request omitted it.
+            if rec.get("instructions") is not None:
+                out["instructions"] = rec["instructions"]
+            if rec.get("tools") is not None:
+                out["tools"] = rec["tools"]
+            payload = json.dumps(out).encode()
+            status = 200
+        handler.send_response(status)
         handler.send_header("Content-Type", "application/json")
         handler.send_header("Content-Length", str(len(payload)))
         handler.end_headers()
@@ -391,16 +428,269 @@ def test_load_capsule_tamper_warning(state_db, session_log, capsule_dir):
     assert any("does not match the manifest hash" in w for w in cap["manifest"]["warnings"])
 
 
-def test_hydrate_instructions_from_wrapper(state_db, session_log, capsule_dir, fake_wrapper):
+def test_hydrates_each_turn_from_its_own_response(state_db, session_log,
+                                                  capsule_dir, fake_wrapper):
+    """Per-turn hydration: each turn is fetched from its OWN recorded
+    response id. Turn 1's response has rotated out (404) — its evidence
+    stays an explicit gap and is NOT backfilled from turn 0's response."""
     make_two_turn_session(state_db)
     _srv, url, _log = fake_wrapper(script=[{"text": "x"}], seed_store=[rid(0)])
     manifest = rc.create_capsule(
         "sess1", db_path=state_db, capsules_dir=capsule_dir,
         main_log_files=[session_log], hydrate_endpoint=url,
     )
-    assert manifest["instructions_captured"] is True
+    assert manifest["instructions_captured"] is True  # any turn has it
+    assert manifest["evidence_coverage"] == {
+        "turns_total": 2, "instructions_turns": 1, "tools_turns": 1,
+        "complete_turns": 1,
+    }
     cap = rc.load_capsule("sess1", capsules_dir=capsule_dir)
-    assert cap["trajectory"]["instructions"] == "You are Hermes."
+    t0, t1 = cap["trajectory"]["turns"]
+    blobs = cap["trajectory"]["evidence_blobs"]
+    assert blobs[t0["evidence"]["instructions_ref"]]["value"] == "You are Hermes."
+    assert blobs[t0["evidence"]["tools_ref"]]["value"] == [TERMINAL_TOOL_SCHEMA]
+    assert t0["evidence"]["instructions_source"] == f"wrapper-hydrated:{rid(0)}"
+    assert t0["evidence"]["fetch"] == "ok" and t0["evidence"]["status"] == "complete"
+    assert t1["evidence"]["instructions_ref"] is None
+    assert t1["evidence"]["tools_ref"] is None
+    assert t1["evidence"]["fetch"] == "rotated"
+    assert t1["evidence"]["instructions_evidence"] == "gap"
+    assert any("rotated out of the wrapper store" in w for w in manifest["warnings"])
+    assert any("NOT backfilled from another turn's evidence" in w
+               for w in manifest["warnings"])
+    # each turn fetched its own id, in turn order — no newest-first shortcut
+    assert _srv.wrapper.gets == [rid(0), rid(1)]
+
+
+def test_per_turn_evidence_differs_between_turns(state_db, session_log,
+                                                 capsule_dir, fake_wrapper):
+    """Instructions and tool sets genuinely differ between calls (e.g.
+    conscience-driven tool narrowing): each turn must capture ITS OWN."""
+    make_two_turn_session(state_db)
+    read_tool = {"type": "function", "name": "read_file",
+                 "description": "Read a file.", "parameters": {"type": "object"}}
+    _srv, url, _log = fake_wrapper(script=[{"text": "x"}], seed_store=[
+        {"id": rid(0), "instructions": "INST-A", "tools": [TERMINAL_TOOL_SCHEMA]},
+        {"id": rid(1), "instructions": "INST-B",
+         "tools": [TERMINAL_TOOL_SCHEMA, read_tool]},
+    ])
+    rc.create_capsule("sess1", db_path=state_db, capsules_dir=capsule_dir,
+                      main_log_files=[session_log], hydrate_endpoint=url)
+    cap = rc.load_capsule("sess1", capsules_dir=capsule_dir)
+    t0, t1 = cap["trajectory"]["turns"]
+    blobs = cap["trajectory"]["evidence_blobs"]
+    assert blobs[t0["evidence"]["instructions_ref"]]["value"] == "INST-A"
+    assert blobs[t1["evidence"]["instructions_ref"]]["value"] == "INST-B"
+    assert blobs[t0["evidence"]["tools_ref"]]["value"] == [TERMINAL_TOOL_SCHEMA]
+    assert blobs[t1["evidence"]["tools_ref"]]["value"] == [
+        TERMINAL_TOOL_SCHEMA, read_tool]
+    assert t0["evidence"]["tools_source"] == f"wrapper-hydrated:{rid(0)}"
+    assert t1["evidence"]["tools_source"] == f"wrapper-hydrated:{rid(1)}"
+
+
+def test_evidence_blobs_content_addressed_dedup(state_db, session_log,
+                                                capsule_dir, fake_wrapper):
+    """Identical instructions across turns share one blob; differing tool
+    sets get separate blobs (95KB prompts x N turns must not bloat)."""
+    make_two_turn_session(state_db)
+    read_tool = {"type": "function", "name": "read_file",
+                 "description": "Read a file.", "parameters": {"type": "object"}}
+    _srv, url, _log = fake_wrapper(script=[{"text": "x"}], seed_store=[
+        {"id": rid(0), "instructions": "SAME", "tools": [TERMINAL_TOOL_SCHEMA]},
+        {"id": rid(1), "instructions": "SAME",
+         "tools": [TERMINAL_TOOL_SCHEMA, read_tool]},
+    ])
+    rc.create_capsule("sess1", db_path=state_db, capsules_dir=capsule_dir,
+                      main_log_files=[session_log], hydrate_endpoint=url)
+    cap = rc.load_capsule("sess1", capsules_dir=capsule_dir)
+    t0, t1 = cap["trajectory"]["turns"]
+    blobs = cap["trajectory"]["evidence_blobs"]
+    assert t0["evidence"]["instructions_ref"] == t1["evidence"]["instructions_ref"]
+    assert t0["evidence"]["tools_ref"] != t1["evidence"]["tools_ref"]
+    instr_blobs = [b for b in blobs.values() if b["kind"] == "instructions"]
+    tool_blobs = [b for b in blobs.values() if b["kind"] == "tools"]
+    assert len(instr_blobs) == 1 and len(tool_blobs) == 2
+
+
+def test_instructions_file_wins_for_every_turn(state_db, session_log,
+                                              capsule_dir, fake_wrapper,
+                                              tmp_path):
+    """A manual --instructions-file applies to all turns (source 'file');
+    tool definitions are still hydrated per turn."""
+    make_two_turn_session(state_db)
+    f = tmp_path / "sysprompt.txt"
+    f.write_text("MANUAL PROMPT", encoding="utf-8")
+    _srv, url, _log = fake_wrapper(script=[{"text": "x"}], seed_store=[
+        {"id": rid(0), "instructions": "INST-A", "tools": [TERMINAL_TOOL_SCHEMA]},
+        {"id": rid(1), "instructions": "INST-B", "tools": [TERMINAL_TOOL_SCHEMA]},
+    ])
+    rc.create_capsule("sess1", db_path=state_db, capsules_dir=capsule_dir,
+                      main_log_files=[session_log], hydrate_endpoint=url,
+                      instructions_file=f)
+    cap = rc.load_capsule("sess1", capsules_dir=capsule_dir)
+    t0, t1 = cap["trajectory"]["turns"]
+    blobs = cap["trajectory"]["evidence_blobs"]
+    assert blobs[t0["evidence"]["instructions_ref"]]["value"] == "MANUAL PROMPT"
+    assert blobs[t1["evidence"]["instructions_ref"]]["value"] == "MANUAL PROMPT"
+    assert t0["evidence"]["instructions_source"] == "file"
+    # tools still per-turn
+    assert blobs[t0["evidence"]["tools_ref"]]["value"] == [TERMINAL_TOOL_SCHEMA]
+    assert t0["evidence"]["tools_source"] == f"wrapper-hydrated:{rid(0)}"
+
+
+def test_auto_hydrates_from_session_billing_url(state_db, session_log, capsule_dir,
+                                                fake_wrapper):
+    """No --hydrate-endpoint and no instructions file: the capsule finds the
+    wrapper the session actually used (recorded on the session row)."""
+    make_two_turn_session(state_db)
+    _srv, url, _log = fake_wrapper(script=[{"text": "x"}], seed_store=[rid(1)],
+                                   log_path=tmp_log(session_log, "hydrate"))
+    conn = sqlite3.connect(state_db)
+    conn.execute("UPDATE sessions SET billing_base_url = ?", (url,))
+    conn.commit()
+    conn.close()
+    manifest = rc.create_capsule("sess1", db_path=state_db, capsules_dir=capsule_dir,
+                                 main_log_files=[session_log])
+    assert manifest["instructions_captured"] is True
+    assert manifest["tools_captured"] is True
+    # every turn probes its own response id (turn 0's has rotated out)
+    assert _srv.wrapper.gets == [rid(0), rid(1)]
+    assert manifest["evidence_coverage"]["instructions_turns"] == 1
+
+
+def tmp_log(session_log, name):
+    return session_log.parent / f"{name}.log"
+
+
+def test_auto_hydration_skips_non_loopback_billing_url(state_db, session_log,
+                                                        capsule_dir, fake_wrapper):
+    make_two_turn_session(state_db)
+    _srv, _url, _log = fake_wrapper(script=[{"text": "x"}], seed_store=[rid(0)])
+    conn = sqlite3.connect(state_db)
+    conn.execute("UPDATE sessions SET billing_base_url = 'https://api.example.com/v1'")
+    conn.commit()
+    conn.close()
+    manifest = rc.create_capsule("sess1", db_path=state_db, capsules_dir=capsule_dir,
+                                 main_log_files=[session_log])
+    assert manifest["instructions_captured"] is False
+    assert manifest["tools_captured"] is False
+    assert _srv.wrapper.gets == []  # nothing fetched — content never left the box
+    assert not any("hydration" in w for w in manifest["warnings"])
+
+
+def test_replay_sends_each_turns_own_evidence(state_db, session_log,
+                                              capsule_dir, fake_wrapper):
+    """Replay must send each turn the evidence THAT turn was recorded with,
+    not one global set — the recorded tool sets differ between turns."""
+    make_two_turn_session(state_db)
+    read_tool = {"type": "function", "name": "read_file",
+                 "description": "Read a file.", "parameters": {"type": "object"}}
+    _h, hurl, _hlog = fake_wrapper(script=[{"text": "x"}], seed_store=[
+        {"id": rid(0), "instructions": "INST-A", "tools": [TERMINAL_TOOL_SCHEMA]},
+        {"id": rid(1), "instructions": "INST-B",
+         "tools": [TERMINAL_TOOL_SCHEMA, read_tool]},
+    ], log_path=tmp_log(session_log, "hydrate"))
+    rc.create_capsule("sess1", db_path=state_db, capsules_dir=capsule_dir,
+                      main_log_files=[session_log], hydrate_endpoint=hurl)
+    _srv, url, log = fake_wrapper(script=_golden_script(), seed_store=[rid(0)])
+    run = rc.replay_capsule("sess1", capsules_dir=capsule_dir, endpoint=url,
+                            chain="golden", main_log_files=[log])
+    assert run["turns_completed"] == 2
+    p0, p1 = _srv.wrapper.posts
+    assert p0["instructions"] == "INST-A"
+    assert p0["tools"] == [TERMINAL_TOOL_SCHEMA]
+    assert p1["instructions"] == "INST-B"
+    assert p1["tools"] == [TERMINAL_TOOL_SCHEMA, read_tool]
+    # the run records which evidence each turn actually used
+    e0, e1 = run["turns"]
+    assert e0["evidence"]["mode"] == "per-turn"
+    assert e0["evidence"]["instructions_source"] == f"wrapper-hydrated:{rid(0)}"
+    assert e1["evidence"]["instructions_source"] == f"wrapper-hydrated:{rid(1)}"
+
+
+def test_rotated_turn_evidence_replays_without_it(state_db, session_log,
+                                                  capsule_dir, fake_wrapper):
+    """Turn 1's evidence rotated out at capture: replay sends NO
+    instructions/tools for that turn (never turn 0's), compare reports the
+    gap per turn, and the verdict is capped below 'exact'."""
+    make_two_turn_session(state_db)
+    _h, hurl, _hlog = fake_wrapper(script=[{"text": "x"}], seed_store=[
+        {"id": rid(0), "instructions": "INST-A", "tools": [TERMINAL_TOOL_SCHEMA]},
+    ], log_path=tmp_log(session_log, "hydrate"))
+    rc.create_capsule("sess1", db_path=state_db, capsules_dir=capsule_dir,
+                      main_log_files=[session_log], hydrate_endpoint=hurl)
+    _srv, url, log = fake_wrapper(script=_golden_script(), seed_store=[rid(0)])
+    run = rc.replay_capsule("sess1", capsules_dir=capsule_dir, endpoint=url,
+                            chain="full", main_log_files=[log])
+    p0, p1 = _srv.wrapper.posts
+    assert p0["instructions"] == "INST-A" and p0["tools"] == [TERMINAL_TOOL_SCHEMA]
+    assert "instructions" not in p1 and "tools" not in p1  # no backfill
+    assert run["turns"][1]["evidence"]["instructions"] == "none"
+    assert run["turns"][1]["evidence"]["tools"] == "none"
+    cmp = rc.compare_run("sess1", capsules_dir=capsule_dir, run_id=run["run_id"])
+    assert any("turn 1: instructions (system prompt) for this call were not captured"
+               in r for r in cmp["reasons"])
+    assert any("turn 1: tool definitions for this call were not captured"
+               in r for r in cmp["reasons"])
+    # behaviour may match, but evidence gaps cap the verdict
+    assert cmp["verdict"] != "exact"
+    assert "ev=i+t+" in rc.format_run(run)   # turn 0: own evidence replayed
+    assert "ev=i-t-" in rc.format_run(run)   # turn 1: gap, nothing invented
+
+
+def test_v1_capsule_global_evidence_compat(state_db, session_log, capsule_dir,
+                                           fake_wrapper):
+    """Legacy schema-v1 capsules (one global evidence set, no per-turn
+    evidence keys) keep replaying with that global evidence, unchanged."""
+    make_two_turn_session(state_db)
+    rc.create_capsule("sess1", db_path=state_db, capsules_dir=capsule_dir,
+                      main_log_files=[session_log])
+    # downgrade the capsule to the v1 on-disk shape
+    cap_dir = capsule_dir / "sess1"
+    traj_path = cap_dir / rc.TRAJECTORY_NAME
+    traj = json.loads(traj_path.read_text(encoding="utf-8"))
+    for t in traj["turns"]:
+        t.pop("evidence", None)
+    traj.pop("evidence_blobs", None)
+    traj["schema_version"] = 1
+    traj["instructions"] = "GLOBAL INST"
+    traj["instructions_source"] = "file"
+    traj["tools"] = [TERMINAL_TOOL_SCHEMA]
+    traj["tools_source"] = "file"
+    traj_bytes = json.dumps(traj, ensure_ascii=False).encode("utf-8")
+    traj_path.write_bytes(traj_bytes)
+    mf_path = cap_dir / rc.MANIFEST_NAME
+    manifest = json.loads(mf_path.read_text(encoding="utf-8"))
+    manifest["trajectory_sha256"] = __import__("hashlib").sha256(traj_bytes).hexdigest()
+    manifest.pop("evidence_coverage", None)
+    mf_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    _srv, url, log = fake_wrapper(script=_golden_script(), seed_store=[rid(0)])
+    run = rc.replay_capsule("sess1", capsules_dir=capsule_dir, endpoint=url,
+                            chain="full", main_log_files=[log])
+    for post in _srv.wrapper.posts:
+        assert post["instructions"] == "GLOBAL INST"
+        assert post["tools"] == [TERMINAL_TOOL_SCHEMA]
+    assert all(e["evidence"]["mode"] == "global" for e in run["turns"])
+    assert "ev=global" in rc.format_run(run)
+    # legacy global reasons still render for v1 capsules
+    cmp = rc.compare_run("sess1", capsules_dir=capsule_dir, run_id=run["run_id"])
+    assert all(r.get("evidence", {}).get("mode") == "global" for r in cmp["turns"])
+
+
+def test_missing_tool_definitions_explained_not_fabricated(state_db, session_log,
+                                                           capsule_dir, fake_wrapper):
+    make_two_turn_session(state_db)
+    rc.create_capsule("sess1", db_path=state_db, capsules_dir=capsule_dir,
+                      main_log_files=[session_log])  # no hydration source at all
+    cap = rc.load_capsule("sess1", capsules_dir=capsule_dir)
+    assert cap["trajectory"]["tools"] is None  # absent, never invented
+    _srv, url, log = fake_wrapper(script=_golden_script(), seed_store=[rid(0)])
+    run = rc.replay_capsule("sess1", capsules_dir=capsule_dir, endpoint=url,
+                            chain="full", main_log_files=[log])
+    assert all("tools" not in post for post in _srv.wrapper.posts)
+    cmp = rc.compare_run("sess1", capsules_dir=capsule_dir, run_id=run["run_id"])
+    assert any("tool definitions were not captured" in r for r in cmp["reasons"])
 
 
 def test_hydration_failure_tolerated(state_db, session_log, capsule_dir):
@@ -429,9 +719,13 @@ def _golden_script():
 
 def test_replay_golden_exact(state_db, session_log, capsule_dir, fake_wrapper):
     make_two_turn_session(state_db)
+    # spawn the wrapper FIRST and hydrate per-turn evidence from it: the
+    # 'exact' verdict now requires each turn to replay with its own
+    # captured instructions/tool definitions (see the cap tests below)
+    _srv, url, log = fake_wrapper(script=_golden_script(),
+                                  seed_store=[rid(0), rid(1)])
     rc.create_capsule("sess1", db_path=state_db, capsules_dir=capsule_dir,
-                      main_log_files=[session_log])
-    _srv, url, log = fake_wrapper(script=_golden_script(), seed_store=[rid(0)])
+                      main_log_files=[session_log], hydrate_endpoint=url)
     run = rc.replay_capsule(
         "sess1", capsules_dir=capsule_dir, endpoint=url, chain="golden",
         main_log_files=[log],
@@ -454,6 +748,13 @@ def test_replay_golden_exact(state_db, session_log, capsule_dir, fake_wrapper):
     assert cmp["verdict"] == "exact"
     assert cmp["behavior"]["identical"] == 2
     assert cmp["chain_continuity"]["exact_continuations"] == 1
+    # every turn replayed with its own captured evidence
+    assert all(
+        e["evidence"]["mode"] == "per-turn"
+        and e["evidence"]["instructions"] == "per-turn"
+        and e["evidence"]["tools"] == "per-turn"
+        for e in run["turns"]
+    )
 
 
 def test_replay_chain_break_falls_back_to_full(state_db, session_log, capsule_dir, fake_wrapper):

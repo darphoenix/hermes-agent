@@ -37,14 +37,27 @@ turn AND the wrapper confirmed an exact continuation. Missing lineage,
 rotated logs, or a chain break downgrade the verdict explicitly — the
 capsule never silently claims an exact replay.
 
-Known fidelity gaps (recorded as warnings, never silently ignored):
-* The system prompt is not persisted in the state DB (only its hash), so
-  full-rebuild fallbacks replay without instructions unless the capsule
-  was created with ``--instructions-file`` or hydrated from a live
-  wrapper that still stores the original response.
-* Tool schemas are not persisted, so full-rebuild prompts lack tool
-  definitions; golden/replay chains carry them implicitly in the stored
-  server-side history.
+Model-facing instructions and tool definitions are not persisted in the
+state DB, but the wrapper's response store keeps them per response. They
+are NOT stable across calls within one conversation: available tools and
+transient internal policy can change per model call (e.g. conscience-
+driven tool narrowing), so a single global evidence set would silently
+replay most calls with the wrong request fields. The capsule therefore
+hydrates evidence PER TURN: each turn is fetched from its OWN recorded
+response id at creation, with provenance recorded per turn
+(``turns[].evidence``). Values are content-addressed into
+``evidence_blobs`` so byte-identical instructions across turns share one
+copy. A manual ``--instructions-file`` still wins (applied to every turn,
+source ``file``). A turn whose response has rotated out keeps an
+explicit gap — its evidence is NEVER backfilled from a neighbouring
+turn's response, because "close" evidence is exactly the fabrication
+this module exists to prevent. Such turns replay without instructions
+and/or tool definitions, compare reports the gap per turn, and the
+verdict is capped below ``exact`` on the strength of evidence that no
+longer exists. Legacy schema-version-1 capsules (one global evidence set
+for all turns) still replay with that global evidence, unchanged.
+
+Remaining fidelity gap (recorded as warnings, never silently ignored):
 * Baseline telemetry is attributed from wrapper logs by response-id
   anchor; rotated logs or truncated lines yield partial baselines.
 
@@ -66,7 +79,7 @@ from typing import Any
 
 from agent import session_observatory as obs
 
-CAPSULE_SCHEMA_VERSION = 1
+CAPSULE_SCHEMA_VERSION = 2
 RUN_SCHEMA_VERSION = 1
 
 MANIFEST_NAME = "manifest.json"
@@ -424,6 +437,84 @@ def _attribute_baseline(
 
 
 # ---------------------------------------------------------------------------
+# Per-turn model-facing evidence
+# ---------------------------------------------------------------------------
+
+
+def _blob_key(value: Any) -> str:
+    """Content address for an evidence value (instructions str / tools list)."""
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _blob_value(blobs: dict[str, Any], ref: str | None) -> Any:
+    if not ref:
+        return None
+    blob = blobs.get(ref)
+    return blob.get("value") if isinstance(blob, dict) else None
+
+
+def _resolve_turn_evidence(
+    trajectory: dict[str, Any], turn: dict[str, Any]
+) -> tuple[str | None, list[dict] | None, dict[str, Any]]:
+    """Resolve (instructions, tools, meta) for replaying ONE recorded call.
+
+    Schema v2 capsules carry per-turn evidence: each turn's instructions
+    and tool definitions are exactly what that model call was sent (or
+    explicitly absent if its response rotated out before capture). There
+    is no cross-turn fallback — using turn 0's tool list for turn 3 would
+    be a fabrication, and tool availability genuinely changes between
+    calls (conscience-driven narrowing).
+
+    Legacy schema v1 capsules have one global evidence set and no
+    per-turn ``evidence`` key; they keep replaying with it (meta mode
+    ``global``) so existing capsules stay usable.
+    """
+    ev = turn.get("evidence")
+    if ev is None:  # legacy v1 capsule
+        instr = trajectory.get("instructions") or None
+        tools = trajectory.get("tools") or None
+        return instr, tools, {
+            "mode": "global",
+            "instructions": "global" if instr else "none",
+            "tools": "global" if tools else "none",
+            "instructions_source": trajectory.get("instructions_source"),
+            "tools_source": trajectory.get("tools_source"),
+        }
+    blobs = trajectory.get("evidence_blobs") or {}
+    instr = _blob_value(blobs, ev.get("instructions_ref"))
+    tools = _blob_value(blobs, ev.get("tools_ref"))
+    # When missing, distinguish a capture GAP ("none") from faithful absence
+    # the store itself proves ("absent-by-evidence": the wrapper answered
+    # for this exact call and its record carries no such field, i.e. the
+    # original request omitted it — replaying without it is correct).
+    instr_state = (
+        "per-turn" if instr
+        else "absent-by-evidence" if ev.get("instructions_evidence") == "absent-in-store"
+        else "none"
+    )
+    tools_state = (
+        "per-turn" if tools
+        else "absent-by-evidence" if ev.get("tools_evidence") == "absent-in-store"
+        else "none"
+    )
+    return instr, tools, {
+        "mode": "per-turn",
+        "instructions": instr_state,
+        "tools": tools_state,
+        "instructions_source": ev.get("instructions_source"),
+        "tools_source": ev.get("tools_source"),
+        "evidence_response_id": ev.get("evidence_response_id"),
+    }
+
+
+def _fmt_idx(idxs: list[int]) -> str:
+    head = ", ".join(str(i) for i in idxs[:5])
+    return head + (f" (+{len(idxs) - 5} more)" if len(idxs) > 5 else "")
+
+
+# ---------------------------------------------------------------------------
 # Capsule creation
 # ---------------------------------------------------------------------------
 
@@ -535,40 +626,158 @@ def create_capsule(
             "can only run in 'full' (stateless) mode"
         )
 
-    # ---- instructions ----------------------------------------------------
-    instructions: str | None = None
-    instructions_source = "unavailable"
+    # ---- per-turn model-facing evidence -----------------------------------
+    # The wrapper's response store keeps the exact instructions and tool
+    # definitions each model call was sent. They are NOT byte-stable across
+    # calls (tool availability and transient policy change per call — e.g.
+    # conscience-driven tool narrowing), so hydrate EACH turn from its OWN
+    # recorded response id. Values are content-addressed into
+    # ``evidence_blobs``; turns whose response has rotated out keep an
+    # explicit gap and are never backfilled from a neighbour's evidence.
+    file_instructions: str | None = None
     if instructions_file:
         try:
-            instructions = Path(instructions_file).read_text(encoding="utf-8")
-            instructions_source = "file"
+            file_instructions = Path(instructions_file).read_text(encoding="utf-8")
         except OSError as exc:
             warnings.append(f"instructions file unreadable: {exc}")
-    if instructions is None and hydrate_endpoint:
-        first_id = next(
-            (t["recorded"]["response_id"] for t in turns if t["recorded"]["response_id"]),
-            None,
-        )
-        if first_id:
+
+    evidence_blobs: dict[str, dict[str, Any]] = {}
+
+    def _put_blob(kind: str, value: Any) -> str:
+        key = _blob_key(value)
+        evidence_blobs.setdefault(key, {"kind": kind, "value": value})
+        return key
+
+    # Default the hydration source to the endpoint the session actually
+    # used (loopback only; an explicit --hydrate-endpoint is the user's own
+    # call). A manual --instructions-file still wins for instructions.
+    hydrate_base = (hydrate_endpoint or "").strip().rstrip("/")
+    if not hydrate_base:
+        recorded = str(
+            (srow["billing_base_url"] if "billing_base_url" in srow.keys() else "")
+            or ""
+        ).strip().rstrip("/")
+        if recorded and _endpoint_is_loopback(recorded):
+            hydrate_base = recorded
+    if hydrate_base and not hydrate_base.endswith("/v1"):
+        hydrate_base += "/v1"
+    hydrate_key = (
+        hydrate_api_key or os.environ.get("HERMES_REPLAY_API_KEY") or None
+    )
+
+    endpoint_dead = False
+    last_error: Exception | None = None
+    for t in turns:
+        own_rid = t["recorded"]["response_id"]
+        ev: dict[str, Any] = {
+            "instructions_ref": None, "instructions_source": None,
+            "tools_ref": None, "tools_source": None,
+            "instructions_evidence": "gap", "tools_evidence": "gap",
+            "evidence_response_id": None, "fetch": None, "status": None,
+        }
+        if file_instructions is not None:
+            ev["instructions_ref"] = _put_blob("instructions", file_instructions)
+            ev["instructions_source"] = "file"
+            ev["instructions_evidence"] = "captured"
+        if not hydrate_base:
+            ev["fetch"] = "no-source"
+        elif not own_rid:
+            ev["fetch"] = "no-response-id"
+        elif endpoint_dead:
+            ev["fetch"] = "endpoint-unreachable"
+        else:
             try:
                 body = _http_get_json(
-                    f"{hydrate_endpoint.rstrip('/')}/v1/responses/{first_id}",
-                    hydrate_api_key,
-                    timeout=5.0,
+                    f"{hydrate_base}/responses/{own_rid}", hydrate_key, timeout=5.0
                 )
-                if isinstance(body.get("instructions"), str) and body["instructions"]:
-                    instructions = body["instructions"]
-                    instructions_source = f"wrapper-hydrated:{first_id}"
-                else:
-                    warnings.append(
-                        f"wrapper response {first_id} has no stored instructions "
-                        "— full-rebuild replays will lack the system prompt"
+                ev["evidence_response_id"] = own_rid
+                if (
+                    ev["instructions_ref"] is None
+                    and isinstance(body.get("instructions"), str)
+                    and body["instructions"]
+                ):
+                    ev["instructions_ref"] = _put_blob(
+                        "instructions", body["instructions"]
                     )
-            except (CapsuleError, OSError, urllib.error.URLError) as exc:
-                warnings.append(
-                    f"instruction hydration failed ({exc.__class__.__name__}) — "
-                    "full-rebuild replays will lack the system prompt"
+                    ev["instructions_source"] = f"wrapper-hydrated:{own_rid}"
+                if isinstance(body.get("tools"), list) and body["tools"]:
+                    ev["tools_ref"] = _put_blob("tools", body["tools"])
+                    ev["tools_source"] = f"wrapper-hydrated:{own_rid}"
+                ev["fetch"] = "ok"
+                # The store ANSWERED for this exact call: a field it doesn't
+                # carry is positive evidence the original request omitted it
+                # (faithful absence), not a capture gap.
+                if ev["instructions_evidence"] != "captured":
+                    ev["instructions_evidence"] = (
+                        "absent-in-store"
+                        if "instructions" not in body or not body["instructions"]
+                        else "captured"
+                    )
+                ev["tools_evidence"] = (
+                    "captured" if ev["tools_ref"] else "absent-in-store"
                 )
+            except urllib.error.HTTPError as exc:
+                # 404 = the store rotated this response out; other codes =
+                # the store answered but failed. Both leave an explicit gap.
+                ev["fetch"] = "rotated" if exc.code == 404 else "store-error"
+            except (CapsuleError, OSError, urllib.error.URLError) as exc:
+                last_error = exc
+                ev["fetch"] = "endpoint-unreachable"
+                endpoint_dead = True  # don't re-probe a dead endpoint per turn
+        ev["status"] = (
+            "complete" if (ev["instructions_ref"] and ev["tools_ref"])
+            else "partial" if (ev["instructions_ref"] or ev["tools_ref"])
+            else "missing"
+        )
+        t["evidence"] = ev
+
+    n_instr_turns = sum(1 for t in turns if t["evidence"]["instructions_ref"])
+    n_tools_turns = sum(1 for t in turns if t["evidence"]["tools_ref"])
+    if turns:
+        if (
+            hydrate_base
+            and all(t["evidence"]["fetch"] == "endpoint-unreachable" for t in turns)
+            and last_error is not None
+        ):
+            warnings.append(
+                f"instruction/tool hydration failed ({last_error.__class__.__name__}) — "
+                "no turn has model-facing evidence; full-rebuild replays will lack "
+                "the system prompt and tool definitions"
+            )
+        else:
+            rotated = [t["index"] for t in turns if t["evidence"]["fetch"] == "rotated"]
+            if rotated:
+                warnings.append(
+                    f"turn(s) {_fmt_idx(rotated)}: response rotated out of the wrapper "
+                    "store — that call's instructions/tool definitions are unavailable "
+                    "and are NOT backfilled from another turn's evidence"
+                )
+            store_err = [t["index"] for t in turns if t["evidence"]["fetch"] == "store-error"]
+            if store_err:
+                warnings.append(
+                    f"turn(s) {_fmt_idx(store_err)}: wrapper store errored on fetch — "
+                    "per-turn evidence unavailable for those calls"
+                )
+            noid = [
+                t["index"] for t in turns
+                if t["evidence"]["fetch"] == "no-response-id"
+            ]
+            if noid and hydrate_base:
+                warnings.append(
+                    f"turn(s) {_fmt_idx(noid)}: no recorded response id — per-turn "
+                    "evidence impossible for those calls"
+                )
+        tc_gap = [
+            t["index"] for t in turns
+            if t["recorded"]["tool_calls"]
+            and t["evidence"]["tools_evidence"] == "gap"
+        ]
+        if tc_gap:
+            warnings.append(
+                f"turn(s) {_fmt_idx(tc_gap)} recorded tool calls but their tool "
+                "definitions were not captured — replays of those turns may diverge "
+                "without them"
+            )
 
     # ---- baseline telemetry ---------------------------------------------
     started = srow["started_at"] if "started_at" in srow.keys() else None
@@ -607,8 +816,18 @@ def create_capsule(
     trajectory = {
         "schema_version": CAPSULE_SCHEMA_VERSION,
         "session_id": session_id,
-        "instructions": instructions,
-        "instructions_source": instructions_source,
+        # Legacy compat view: global fields are only meaningful for a
+        # manual --instructions-file; per-turn evidence lives in
+        # turns[].evidence + evidence_blobs.
+        "instructions": file_instructions,
+        "instructions_source": (
+            "file" if file_instructions is not None
+            else "per-turn" if n_instr_turns
+            else "unavailable"
+        ),
+        "tools": None,
+        "tools_source": "per-turn" if n_tools_turns else "unavailable",
+        "evidence_blobs": evidence_blobs,
         "turns": turns,
     }
     traj_bytes = json.dumps(trajectory, ensure_ascii=False).encode("utf-8")
@@ -631,8 +850,18 @@ def create_capsule(
             "coverage": round(lineage_present / lineage_total, 4) if lineage_total else None,
             "compaction_rebases": sum(1 for t in turns if t["rebase"]),
         },
-        "instructions_captured": instructions is not None,
-        "instructions_source": instructions_source,
+        "instructions_captured": bool(n_instr_turns),
+        "instructions_source": trajectory["instructions_source"],
+        "tools_captured": bool(n_tools_turns),
+        "tools_source": trajectory["tools_source"],
+        "evidence_coverage": {
+            "turns_total": len(turns),
+            "instructions_turns": n_instr_turns,
+            "tools_turns": n_tools_turns,
+            "complete_turns": sum(
+                1 for t in turns if t["evidence"]["status"] == "complete"
+            ),
+        },
         "baseline_turns_covered": baseline_coverage,
         "trajectory_sha256": hashlib.sha256(traj_bytes).hexdigest(),
         "privacy": {
@@ -678,12 +907,18 @@ def load_capsule(name_or_path: str, capsules_dir: Path | None = None) -> dict[st
 # ---------------------------------------------------------------------------
 
 
-def _require_loopback(endpoint: str, allow_remote: bool) -> None:
+def _endpoint_is_loopback(endpoint: str) -> bool:
     m = re.match(r"https?://([^:/]+)", endpoint)
     host = m.group(1).lower() if m else ""
-    if host in {"127.0.0.1", "localhost", "::1", "[::1]"}:
+    return host in {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+def _require_loopback(endpoint: str, allow_remote: bool) -> None:
+    if _endpoint_is_loopback(endpoint):
         return
     if not allow_remote:
+        m = re.match(r"https?://([^:/]+)", endpoint)
+        host = m.group(1).lower() if m else ""
         raise NonLoopbackEndpoint(
             f"endpoint host '{host}' is not loopback — capsule content would "
             "leave this machine; pass --allow-remote to accept"
@@ -796,13 +1031,26 @@ def replay_capsule(
             use_full = True
 
         input_msgs = t["full"] if use_full else t["delta"]
+        # Per-turn model-facing evidence: exactly what THIS recorded call was
+        # sent (schema v2), or the capsule's global set (legacy v1 compat).
+        # No cross-turn fallback — tool availability genuinely changes
+        # between calls, so a neighbour's evidence would be a fabrication.
+        turn_instructions, turn_tools, ev_meta = _resolve_turn_evidence(
+            trajectory, t
+        )
         body: dict[str, Any] = {
             "model": manifest.get("model"),
             "stream": False,
             "input": chat_messages_to_input_items(input_msgs),
         }
-        if trajectory.get("instructions"):
-            body["instructions"] = trajectory["instructions"]
+        if turn_instructions:
+            body["instructions"] = turn_instructions
+        if turn_tools:
+            # Golden/replay chains already carry the evidence server-side
+            # (resending what the original request sent is what the original
+            # did); full-rebuild fallbacks NEED it — without tool
+            # declarations the model cannot reproduce a recorded tool call.
+            body["tools"] = turn_tools
         if parent:
             body["previous_response_id"] = parent
         if temperature is not None:
@@ -816,6 +1064,7 @@ def replay_capsule(
             "mode": "full" if use_full else "chain",
             "degraded_full": False,
             "chain_break": False,
+            "evidence": ev_meta,
         }
         t0 = time.monotonic()
         try:
@@ -1094,6 +1343,30 @@ def compare_run(
             missing_evidence.append(
                 f"turn {e['index']}: no wrapper-log continuation telemetry for this replay"
             )
+        # Per-turn model-facing evidence gaps (schema v2 capsules only —
+        # legacy v1 capsules get one global reason below, preserving their
+        # existing verdict behaviour). 'absent-by-evidence' is NOT a gap:
+        # the wrapper store proved that call was sent without the field.
+        ev_meta = e.get("evidence") or {}
+        row["evidence"] = ev_meta or None
+        if ev_meta.get("mode") == "per-turn":
+            if ev_meta.get("instructions") == "none":
+                missing_evidence.append(
+                    f"turn {e['index']}: instructions (system prompt) for this call "
+                    "were not captured — replayed without them (never backfilled "
+                    "from another turn's evidence)"
+                )
+            if ev_meta.get("tools") == "none":
+                if rec.get("tool_calls"):
+                    missing_evidence.append(
+                        f"turn {e['index']}: tool definitions were not captured for "
+                        "this call — the recorded tool call replayed without them"
+                    )
+                else:
+                    missing_evidence.append(
+                        f"turn {e['index']}: tool definitions for this call were not "
+                        "captured"
+                    )
         per_turn.append(row)
 
     # Chain continuity summary (turn-0 / rebase turns have no parent to
@@ -1113,6 +1386,14 @@ def compare_run(
         verdict = "diverged"
     elif n_similar:
         verdict = "similar"
+    elif run.get("chain_mode") == "full":
+        # Behaviour matches, but lineage/continuity was never exercised.
+        # Checked before missing_evidence so its explanation always lands.
+        verdict = "equivalent-unverified"
+        reasons.append(
+            "stateless full replay: cache continuity and response lineage "
+            "were not exercised, so 'exact' cannot be claimed"
+        )
     elif missing_evidence:
         verdict = "equivalent-unverified"
     elif chained and exact < len(chained):
@@ -1120,13 +1401,6 @@ def compare_run(
     elif run.get("chain_breaks"):
         # Original parents were gone: continuity was NOT preserved.
         verdict = "equivalent-rebuilt"
-    elif run.get("chain_mode") == "full":
-        # Behaviour matches, but lineage/continuity was never exercised.
-        verdict = "equivalent-unverified"
-        reasons.append(
-            "stateless full replay: cache continuity and response lineage "
-            "were not exercised, so 'exact' cannot be claimed"
-        )
     else:
         verdict = "exact"
 
@@ -1141,11 +1415,21 @@ def compare_run(
             f"{len(rebuilds)} chained turn(s) took a full-rebuild path "
             "(cache-continuity regression vs the recording)"
         )
-    if not cap["trajectory"].get("instructions"):
-        reasons.append(
-            "instructions (system prompt) were not captured — full-rebuild "
-            "turns ran without them, behaviour may legitimately differ"
-        )
+    evidence_modes = {(e.get("evidence") or {}).get("mode") for e in run["turns"]}
+    if evidence_modes == {"global"}:
+        # Legacy v1 capsule (one global evidence set for all turns): keep the
+        # original global reasons and their verdict semantics. Schema v2
+        # capsules report evidence gaps per turn instead, via missing_evidence.
+        if not cap["trajectory"].get("instructions"):
+            reasons.append(
+                "instructions (system prompt) were not captured — full-rebuild "
+                "turns ran without them, behaviour may legitimately differ")
+        if not cap["trajectory"].get("tools") and any(
+            (t.get("recorded") or {}).get("tool_calls") for t in cap["trajectory"]["turns"]
+        ):
+            reasons.append(
+                "tool definitions were not captured — turns that recorded tool "
+                "calls replay without them on full-rebuild fallbacks")
     if missing_evidence:
         reasons.extend(missing_evidence[:10])
 
@@ -1259,8 +1543,18 @@ def format_manifest(manifest: dict[str, Any]) -> str:
     L.append(f"  lineage coverage {_fmt(lin.get('coverage'))} "
              f"({_fmt(lin.get('with_response_id'))}/{_fmt(lin.get('assistant_turns'))} assistant turns)"
              f"  compaction rebases {_fmt(lin.get('compaction_rebases'))}")
-    L.append(f"  instructions captured: {manifest.get('instructions_captured')} "
-             f"({manifest.get('instructions_source')})")
+    cov = manifest.get("evidence_coverage")
+    if cov:
+        L.append(
+            f"  model-facing evidence (per call, from the wrapper response store): "
+            f"instructions {cov['instructions_turns']}/{cov['turns_total']} turns, "
+            f"tool definitions {cov['tools_turns']}/{cov['turns_total']} turns, "
+            f"both {cov['complete_turns']}/{cov['turns_total']}")
+    else:  # legacy v1 manifest: one global evidence set
+        L.append(f"  instructions captured: {manifest.get('instructions_captured')} "
+                 f"({manifest.get('instructions_source')})")
+        L.append(f"  tool definitions captured: {manifest.get('tools_captured')} "
+                 f"({manifest.get('tools_source')})")
     L.append(f"  baseline telemetry covers "
              f"{_fmt(manifest.get('baseline_turns_covered'))}/{_fmt(manifest.get('turns'))} turns")
     L.append(f"  trajectory sha256 {manifest.get('trajectory_sha256')}")
@@ -1274,6 +1568,25 @@ def format_manifest(manifest: dict[str, Any]) -> str:
         if len(warns) > 10:
             L.append(f"    ! ... {len(warns) - 10} more")
     return "\n".join(L)
+
+
+def _ev_tag(ev: dict[str, Any]) -> str:
+    """Compact per-turn evidence tag for format_run.
+
+    ``ev=i+t+`` both replayed with this call's own captured evidence;
+    ``i-``/``t-`` evidence gap (rotated/unreachable — replayed without);
+    ``i0``/``t0`` the store proved that call was sent without the field;
+    ``ev=global`` legacy v1 capsule using its single global evidence set.
+    """
+    if not ev:
+        return "ev=?"
+    if ev.get("mode") == "global":
+        return "ev=global"
+
+    def _s(v: Any) -> str:
+        return {"per-turn": "+", "absent-by-evidence": "0", "none": "-"}.get(v, "?")
+
+    return f"ev=i{_s(ev.get('instructions'))}t{_s(ev.get('tools'))}"
 
 
 def format_run(run: dict[str, Any]) -> str:
@@ -1296,6 +1609,7 @@ def format_run(run: dict[str, Any]) -> str:
             f"finish={e.get('finish_reason') or 'ERR':<10} "
             f"cont={tel.get('continuation') or '-':<8} "
             f"in={_fmt(usage.get('input_tokens'))} cached={_fmt(usage.get('cached_tokens'))}"
+            f"  {_ev_tag(e.get('evidence') or {})}"
             f"{flag}"
         )
         if e.get("error"):

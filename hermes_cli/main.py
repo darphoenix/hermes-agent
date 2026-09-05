@@ -14503,10 +14503,13 @@ def main():
             "replay their model-facing trajectory against a local wrapper. "
             "Recorded tool results are supplied during replay — tools are "
             "never re-executed and no external side effects occur. "
-            "Limitations: the system prompt and tool schemas are not stored "
-            "in the session DB (only the prompt hash), so stateless "
-            "full-replay turns run without them unless hydrated; baseline "
-            "performance telemetry depends on wrapper logs still covering "
+            "Model-facing instructions and tool definitions are captured "
+            "per recorded call from the wrapper's response store (they can "
+            "change between calls), so each replayed turn is sent exactly "
+            "the evidence that turn originally had; turns whose responses "
+            "already rotated out replay without them and the comparison "
+            "says so explicitly. Limitations: baseline performance telemetry "
+            "depends on wrapper logs still covering "
             "the session window (rotated logs degrade comparisons, and the "
             "verdict is then 'unverified', never 'exact')."
         ),
@@ -14528,8 +14531,9 @@ def main():
     cap_create.add_argument("--name", help="Capsule name (default: session id)")
     cap_create.add_argument(
         "--hydrate-endpoint", metavar="URL",
-        help="Wrapper base URL (e.g. http://127.0.0.1:1236/v1) to fetch the "
-             "original instructions from; failures are tolerated",
+        help="Wrapper base URL to fetch each recorded call's own "
+             "instructions and tool definitions from (default: the loopback "
+             "URL the session used); failures are tolerated",
     )
     cap_create.add_argument("--api-key", help="Bearer key for --hydrate-endpoint")
     cap_create.add_argument(
