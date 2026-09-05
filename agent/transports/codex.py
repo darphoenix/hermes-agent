@@ -601,6 +601,9 @@ class ResponsesApiTransport(ProviderTransport):
             ),
             "store": stateful_responses,
         }
+        metadata = params.get("metadata")
+        if isinstance(metadata, dict) and metadata:
+            kwargs["metadata"] = dict(metadata)
         if response_tools:
             kwargs["tools"] = response_tools
             kwargs["tool_choice"] = "auto"

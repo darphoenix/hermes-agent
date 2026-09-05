@@ -112,6 +112,7 @@ def test_build_api_kwargs_stateful_custom_initial_and_followup(monkeypatch):
     assert "previous_response_id" not in first_kwargs
     assert first_kwargs["instructions"] == "Stable local system prompt"
     assert first_kwargs["input"][-1]["role"] == "user"
+    assert first_kwargs["metadata"]["hermes_cache_role"] == "actor"
 
     agent._responses_previous_response_id = "resp_prev"
     followup = [
@@ -130,6 +131,7 @@ def test_build_api_kwargs_stateful_custom_initial_and_followup(monkeypatch):
     assert followup_kwargs["instructions"] == "Stable local system prompt"
     assert len(followup_kwargs["input"]) == 1
     assert followup_kwargs["input"][0]["role"] == "user"
+    assert followup_kwargs["metadata"]["hermes_cache_role"] == "actor"
 
 
 def test_stateful_custom_runtime_directive_is_transient(monkeypatch):
